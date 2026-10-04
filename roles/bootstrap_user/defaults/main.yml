@@ -1,0 +1,6 @@
+---
+bootstrap_user_name: ansible
+bootstrap_user_home: "/home/{{ bootstrap_user_name }}"
+bootstrap_user_shell: /bin/bash
+bootstrap_user_public_key_path: ""
+bootstrap_user_allow_passwordless_sudo: false
