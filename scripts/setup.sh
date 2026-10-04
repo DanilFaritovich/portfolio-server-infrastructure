@@ -41,7 +41,7 @@ else
     "$uv" --no-config venv --python "$runtime" .venv
 fi
 "$uv" --no-config pip install --python "$project_dir/.venv/bin/python" -r requirements-dev.txt
-.venv/bin/ansible-galaxy collection install -r requirements.yml -p .ansible/collections
+.venv/bin/ansible-galaxy collection install -r collections.yml -p .ansible/collections
 sh scripts/install-actionlint.sh
 
 if [ "$mode" = setup ]; then

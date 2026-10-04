@@ -43,6 +43,11 @@ sources, но никогда не подключается к VPS. В станд
 и текущий SSH-порт; `ansible_user` по умолчанию — `root`. Сохраните структуру
 `bootstrap` с одним хостом; не записывайте пароли или содержимое ключей в inventory.
 
+Версии collections закреплены в `collections.yml`; setup/deps устанавливают их явно.
+Это имя исключает автоматическое обнаружение requirements в ansible-lint;
+`make check` сохраняет `--offline` и сообщает об отсутствующих collections. Make
+ставит проектный `.venv/bin` первым в PATH, чтобы Ansible subprocesses использовали тот же toolchain.
+
 **First-use trust выполняется внутри `make bootstrap`.** Сохраните доступ к
 recovery console и рабочую административную сессию. Если запись уже есть в
 `~/.ssh/known_hosts`, bootstrap использует её без повторного сканирования или

@@ -25,7 +25,7 @@ class SetupTests(unittest.TestCase):
         for name in ('setup.sh', 'install-uv.sh', 'install-actionlint.sh', 'access.py'):
             shutil.copy(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         shutil.copy(ROOT / 'inventories/production.example.yml', self.root / 'inventories/production.example.yml')
-        for name in ('requirements-dev.txt', 'requirements.yml'):
+        for name in ('requirements-dev.txt', 'collections.yml'):
             shutil.copy(ROOT / name, self.root / name)
         self.log = self.root / 'calls'
         self.env = dict(os.environ, PATH=str(self.bin), CALL_LOG=str(self.log),
@@ -111,6 +111,7 @@ exec "$FIXTURE_PYTHON" "$@"''')
         self.assertIn('--system --managed-python --no-python-downloads', calls)
         self.assertIn(f'uv --no-config venv --python {self.root}/.tools/python/', calls)
         self.assertIn(f'pip install --python {self.root}/.venv/bin/python -r requirements-dev.txt', calls)
+        self.assertIn('galaxy collection install -r collections.yml -p .ansible/collections', calls)
         self.assertRegex((self.root / 'requirements-dev.txt').read_text(), r'(?m)^paramiko==\d+\.\d+\.\d+$')
         self.assertNotIn('bootstrap', calls)
         self.assertFalse((self.root / '.ssh').exists())

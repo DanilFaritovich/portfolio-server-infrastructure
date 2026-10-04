@@ -1,10 +1,12 @@
 VENV := .venv
 ACTIONLINT := .tools/bin/actionlint
-YAML_FILES := .yamllint.yml .ansible-lint requirements.yml inventories/production.example.yml playbooks roles .github/workflows
+YAML_FILES := .yamllint.yml .ansible-lint collections.yml inventories/production.example.yml playbooks roles .github/workflows
 INVENTORY ?= inventories/production.yml
 AUTOMATION_KEY ?= $(HOME)/.ssh/portfolio-server-infrastructure/ansible_ed25519
 export INVENTORY AUTOMATION_KEY
 export ANSIBLE_HOME := $(CURDIR)/.ansible
+# Subprocesses must find the same pinned Ansible tools as the invoking interpreter.
+export PATH := $(abspath $(VENV))/bin:$(PATH)
 
 .PHONY: deps setup bootstrap verify check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
 

@@ -41,6 +41,11 @@ installation reconciles the pinned requirements, and existing collections and
 compatible actionlint are reused. Setup needs network access to dependency
 sources; it never contacts a VPS.
 
+Collection versions are pinned in `collections.yml` and installed explicitly by
+setup/deps. This filename avoids ansible-lint's automatic requirements discovery;
+`make check` keeps `--offline` and still reports missing collections. Make places
+the project `.venv/bin` first in PATH so Ansible subprocesses use the same toolchain.
+
 Edit only the hostname/address and existing SSH port for the standard path; `ansible_user` defaults to `root`. Keep the one-host `bootstrap` structure
 and never store passwords or key bytes in inventory.
 
