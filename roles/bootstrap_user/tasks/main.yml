@@ -1,0 +1,142 @@
+---
+- name: Validate and load the public key on the controller
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    ansible_become: false
+  tags:
+    - bootstrap_user_controller_key
+  block:
+    - name: Validate bootstrap inputs before contacting the host
+      ansible.builtin.assert:
+        that:
+          - bootstrap_user_name is string
+          - bootstrap_user_name is match('^[a-z_][a-z0-9_-]{0,30}$')
+          - bootstrap_user_name != 'root'
+          - bootstrap_user_name != (hostvars[inventory_hostname].ansible_user | default(''))
+          - bootstrap_user_home is string
+          - bootstrap_user_home == '/home/' ~ bootstrap_user_name
+          - bootstrap_user_shell == '/bin/bash'
+          - bootstrap_user_public_key_path is string
+          - bootstrap_user_public_key_path is match('^/.+\.pub$')
+          - bootstrap_user_allow_passwordless_sudo is boolean
+          - bootstrap_user_allow_passwordless_sudo
+        fail_msg: >-
+          Use a separate non-root managed username, a /home/<user> home,
+          an absolute local .pub path and explicit boolean consent for
+          root-equivalent NOPASSWD sudo.
+        quiet: true
+
+    - name: Check the public key file on the controller without reading it
+      ansible.builtin.stat:
+        path: "{{ bootstrap_user_public_key_path }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+      register: bootstrap_user_key_file
+
+    - name: Require a readable regular public key file without symlinks
+      ansible.builtin.assert:
+        that:
+          - bootstrap_user_key_file.stat.exists
+          - bootstrap_user_key_file.stat.isreg | default(false)
+          - bootstrap_user_key_file.stat.readable | default(false)
+        fail_msg: The controller public key must be a readable regular .pub file.
+        quiet: true
+
+    - name: Read the public key on the controller
+      ansible.builtin.set_fact:
+        bootstrap_user_public_key: >-
+          {{ lookup('ansible.builtin.file', bootstrap_user_public_key_path) | trim }}
+      no_log: true
+
+    - name: Require a single OpenSSH public key
+      ansible.builtin.assert:
+        that:
+          - >-
+            bootstrap_user_public_key is match(
+            '^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,3}( [^\r\n]*)?$')
+          - bootstrap_user_public_key.splitlines() | length == 1
+        fail_msg: The selected .pub file must contain one OpenSSH public key.
+        quiet: true
+      no_log: true
+
+- name: Inspect required sudo paths before changing the account
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+    get_mime: false
+  loop:
+    - /usr/sbin/visudo
+    - /etc/sudoers.d
+  register: bootstrap_user_sudo_paths
+  become: true
+
+- name: Require sudo and its include directory to already exist
+  ansible.builtin.assert:
+    that:
+      - bootstrap_user_sudo_paths.results[0].stat.isreg | default(false)
+      - bootstrap_user_sudo_paths.results[0].stat.executable | default(false)
+      - bootstrap_user_sudo_paths.results[1].stat.isdir | default(false)
+    fail_msg: Install/configure sudo and enable /etc/sudoers.d before bootstrap.
+    quiet: true
+
+- name: Create the managed primary group
+  ansible.builtin.group:
+    name: "{{ bootstrap_user_name }}"
+    state: present
+  become: true
+
+- name: Create the managed automation user
+  ansible.builtin.user:
+    name: "{{ bootstrap_user_name }}"
+    group: "{{ bootstrap_user_name }}"
+    home: "{{ bootstrap_user_home }}"
+    shell: "{{ bootstrap_user_shell }}"
+    create_home: true
+    state: present
+  become: true
+
+- name: Protect the managed home directory
+  ansible.builtin.file:
+    path: "{{ bootstrap_user_home }}"
+    state: directory
+    owner: "{{ bootstrap_user_name }}"
+    group: "{{ bootstrap_user_name }}"
+    mode: "0750"
+  become: true
+
+- name: Add the controller public key while preserving other authorized keys
+  ansible.posix.authorized_key:
+    user: "{{ bootstrap_user_name }}"
+    key: "{{ bootstrap_user_public_key }}"
+    state: present
+    exclusive: false
+    manage_dir: true
+  become: true
+  no_log: true
+
+- name: Protect the managed SSH directory and authorized keys
+  ansible.builtin.file:
+    path: "{{ bootstrap_user_home }}/{{ item.path }}"
+    owner: "{{ bootstrap_user_name }}"
+    group: "{{ bootstrap_user_name }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - path: .ssh
+      mode: "0700"
+    - path: .ssh/authorized_keys
+      mode: "0600"
+  become: true
+
+- name: Install a validated sudo policy for the managed user
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/{{ bootstrap_user_name }}"
+    content: "{{ bootstrap_user_name }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+  become: true

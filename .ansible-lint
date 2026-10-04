@@ -1,0 +1,9 @@
+---
+profile: production
+offline: true
+exclude_paths:
+  - .agents/
+  - .ansible/
+  - .venv/
+  - .tools/
+  - inventories/

@@ -1,0 +1,11 @@
+---
+all:
+  children:
+    bootstrap:
+      hosts:
+        portfolio:
+          ansible_host: vps.example.invalid
+          # Set the existing SSH port; bootstrap does not change it.
+          ansible_port: 22
+          ansible_user: root
+          ansible_python_interpreter: /usr/bin/python3

@@ -1,0 +1,25 @@
+---
+name: Offline Ansible validation
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+jobs:
+  offline-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare project-local toolchain and validation dependencies
+        run: make deps
+      - name: Run offline validation without production credentials
+        run: make ci

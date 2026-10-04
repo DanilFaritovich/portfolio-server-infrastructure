@@ -1,0 +1,5 @@
+---
+# Installed explicitly by setup; offline lint must not auto-discover requirements.yml.
+collections:
+  - name: ansible.posix
+    version: "2.0.0"

@@ -40,6 +40,28 @@ inspect branch/worktree
 -> developer review/merge
 ```
 
+## Explicit task stop points
+
+The core workflow is a default end-to-end path, not permission to ignore a narrower user-requested boundary.
+
+If the caller explicitly requests a staged workflow such as:
+
+```text
+implement only
+-> developer reviews/runs checks
+-> later request performs commit/PR
+```
+
+stop at the requested stage. In particular:
+
+- do not run validation commands when the caller reserved validation for manual execution;
+- do not contact external/live systems merely because later validation would normally do so;
+- do not stage, commit, push, open a Pull Request, or wait on CI when delivery was deferred;
+- still prepare the code/configuration/documented commands required for the developer's next manual step;
+- report later workflow stages as pending rather than treating them as failed.
+
+A later explicit request may resume from the verified working tree without restarting completed implementation work.
+
 ## Start safely
 
 Use the repository's configured development branch, normally `develop`.
@@ -130,7 +152,7 @@ Codex must not merge the Pull Request unless the user explicitly requests that s
 
 ## Completion criteria
 
-A task is complete when:
+For a normal end-to-end task, completion means:
 
 - requested scope is implemented;
 - required tests are updated;
@@ -142,5 +164,7 @@ A task is complete when:
 - task changes are committed/pushed;
 - Pull Request is prepared;
 - CI is running or complete.
+
+When the caller defined an earlier explicit stop point, completion is scoped to that boundary: complete the requested stages, preserve the working state for continuation, and clearly list the intentionally pending validation/delivery stages.
 
 Keep the final report concise; report results/status, not a chronological tool log.

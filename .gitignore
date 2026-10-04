@@ -1,0 +1,14 @@
+.venv/
+.tools/
+.cache/
+.ansible/
+__pycache__/
+inventories/*
+!inventories/production.example.yml
+*.retry
+*.log
+*.pem
+*.key
+*.pub
+.env
+.env.*
