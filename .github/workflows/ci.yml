@@ -19,13 +19,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: requirements-dev.txt
-      - name: Install validation dependencies
+      - name: Prepare project-local toolchain and validation dependencies
         run: make deps
       - name: Run offline validation without production credentials
         run: make ci

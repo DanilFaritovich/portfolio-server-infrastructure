@@ -3,7 +3,7 @@
 This repository is for Ansible-based provisioning of a personal portfolio VPS on Ubuntu. The current implementation only bootstraps a managed automation user through existing administrative access. Later provisioning stages require separate tasks.
 
 - `playbooks/bootstrap.yml` calls `roles/bootstrap_user`; `inventories/production.example.yml` is the only committed inventory. Actual inventories remain local and ignored.
-- `make deps` installs pinned controller tooling/collections from registries. `make check` and `make ci` run YAML lint, offline Ansible lint, syntax validation with example inventory, actionlint, and mocked controller-wrapper tests. Neither contacts production. No safe automatic fixer is configured.
+- `make deps` uses `scripts/setup.sh` to prepare checksum-verified pinned local uv, managed Python 3.12 in `.tools/python`, `.venv`, and pinned tooling/collections from registries; no system Python or uv is required. `make check` and `make ci` run YAML lint, offline Ansible lint, syntax validation with example inventory, actionlint, and offline access/setup tests with synthetic fixtures and mocked commands. Neither contacts production. No safe automatic fixer is configured.
 - `make setup` prepares local dependencies and creates missing inventory without overwriting it. `make bootstrap` is LIVE/MUTATING with native password prompting and dedicated local key generation; `make verify` is LIVE verification as `ansible` with key-only login and `sudo -n`. Never run either during offline validation. See `README.md` for prerequisites and the access handoff; a bootstrap recap alone is insufficient.
 
 - Use `develop` as the base for task branches and open Pull Requests into `develop`. Do not merge without an explicit request.

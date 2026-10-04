@@ -10,14 +10,11 @@ export ANSIBLE_HOME := $(CURDIR)/.ansible
 
 # Dependency setup uses registries; checks below use installed dependencies offline.
 deps:
-	@python3.12 -m venv $(VENV)
-	@$(VENV)/bin/python -m pip install -r requirements-dev.txt
-	@$(VENV)/bin/ansible-galaxy collection install -r requirements.yml -p .ansible/collections
-	@sh scripts/install-actionlint.sh
+	@sh scripts/setup.sh deps
 
-# Local setup uses registries, creates inventory exclusively, and never contacts a VPS.
-setup: deps
-	@$(VENV)/bin/python scripts/access.py setup --inventory "$$INVENTORY"
+# Local setup prepares toolchain/dependencies and creates only missing inventory.
+setup:
+	@sh scripts/setup.sh setup
 
 # LIVE / MUTATING: invoking this target consents to root-equivalent NOPASSWD sudo.
 bootstrap:

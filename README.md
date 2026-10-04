@@ -9,10 +9,12 @@ Caddy and application deployment are outside this PR's scope.
 
 ## Quick Start
 
-Use a Linux controller with Make, Python 3.12 (`python3.12`, venv and pip),
-OpenSSH clients (`ssh`, `ssh-keygen`, `scp`, `sftp`), **sshpass**, curl, tar/gzip
-and coreutils. Install missing controller prerequisites yourself; for example,
-on Ubuntu `sudo apt install sshpass`. No target installs system packages silently.
+Use a Linux x86_64 or arm64 controller (glibc, such as Ubuntu) with Make, a POSIX
+shell, curl, tar/gzip, coreutils (including sha256sum) and OpenSSH clients
+(`ssh`, `ssh-keygen`, `scp`, `sftp`). **Neither Python 3.12 nor uv needs to be
+installed beforehand.** Bootstrap additionally needs system **sshpass**; on
+Ubuntu install it yourself with `sudo apt install sshpass`. Setup itself requires
+no sudo and installs no system packages.
 The VPS must already allow root SSH password login and have `/usr/bin/python3`,
 `/bin/bash`, sudo, `/usr/sbin/visudo` and an active `/etc/sudoers.d` include.
 
@@ -23,17 +25,24 @@ make setup
 
 # Edit inventories/production.yml: ansible_host and ansible_port.
 # Before live execution, complete the fingerprint/recovery preparation below.
-make check
 make bootstrap
 # Ansible requests the root SSH password interactively.
 make verify
 ```
 
-`make setup` downloads pinned project-local dependencies and copies the example
+`make setup` verifies minimal system tools, installs checksum-verified pinned
+uv **0.12.23** into `.tools/bin/uv`, downloads managed Python **3.12** into
+`.tools/python`, creates `.venv` from that managed interpreter, installs the
+pinned dependencies/Ansible collections and actionlint, then copies the example
 inventory **only if production.yml does not exist**. Existing inventory is never
-read or overwritten by setup. `make deps` installs dependencies without creating
-inventory. Edit only the hostname/address and existing SSH port for the standard
-path; `ansible_user` defaults to `root`. Keep the one-host `bootstrap` structure
+read or overwritten by setup. `make deps` uses the same toolchain/dependency
+mechanism without creating inventory. Repeated setup reuses the pinned uv, compatible managed Python and
+`.venv`; it does not destroy them or reinstall Python unnecessarily. Package
+installation reconciles the pinned requirements, and existing collections and
+compatible actionlint are reused. Setup needs network access to dependency
+sources; it never contacts a VPS.
+
+Edit only the hostname/address and existing SSH port for the standard path; `ansible_user` defaults to `root`. Keep the one-host `bootstrap` structure
 and never store passwords or key bytes in inventory.
 
 **Before the first live bootstrap:** independently verify host, port and host-key
@@ -88,6 +97,9 @@ passed internally over a pipe; our wrapper never handles it. It is not passed in
 command arguments, environment variables or files, and is never saved in
 inventory, `.env`, configuration or shell history. Use a normal interactive
 terminal; do not record secret input or supply passwords through shell commands.
+We retain OpenSSH rather than add Paramiko: it preserves the existing SSH options
+and known-host behavior, while Ansible's Paramiko plugin is deprecated and slated
+for removal in 2.21. See [Paramiko plugin status](https://docs.ansible.com/projects/ansible-core/2.20/collections/ansible/builtin/paramiko_ssh_connection.html).
 See [Ansible SSH transport documentation](https://docs.ansible.com/projects/ansible-core/2.18/collections/ansible/builtin/ssh_connection.html).
 
 ## Commands and boundaries
@@ -117,7 +129,10 @@ fails. A successful bootstrap recap alone is insufficient proof of the handoff.
 
 Checks always use `inventories/production.example.yml`, never production
 inventory, keys, passwords or VPS connections. Wrapper tests use temporary
-synthetic fixtures and mocked processes, including mocked key generation.
+synthetic fixtures and mocked processes, including mocked key generation. Setup
+tests run the shell scripts with an isolated PATH without system Python/uv and
+fake downloads, checking fresh/repeated setup, inventory preservation, reuse,
+arm64, prerequisite failures and checksum/version failures.
 GitHub Actions downloads dependencies and runs only `make ci`, with no production
 credentials. Offline success does not prove live access or runtime idempotency.
 No safe automatic formatter (`make fix`) is configured. For targeted diagnosis:
@@ -148,25 +163,22 @@ user for these Make targets remains `ansible`. Inventory supports only one host
 and the example's host, port, initial user and Python-interpreter fields;
 credentials and extra runtime variables are rejected.
 
-Dependency tooling remains in ignored `.venv`, `.ansible` and `.tools` directories:
-Python/Ansible versions and `ansible.posix` are pinned in the requirements files;
-actionlint's version and archive checksums are pinned in its installer. Linux
-x86_64 and arm64 are supported; Go is not required. If Python 3.12 is unavailable,
-prepare a local runtime with uv (optional):
+All generated runtimes/tooling stay in ignored `.tools`, `.venv`, `.ansible`
+and `.cache` directories. uv release archives and SHA256 values are pinned in
+`scripts/install-uv.sh` ([official release](https://github.com/astral-sh/uv/releases/tag/0.12.23)); Python/Ansible dependencies and `ansible.posix` are pinned in
+the requirements files. actionlint's version and checksums remain pinned in its
+installer. Python's patch version is selected by pinned uv within the 3.12 series;
+an existing compatible managed 3.12 runtime is reused. `UV_PYTHON_INSTALL_DIR`
+and `UV_CACHE_DIR` are set to project-local paths by setup. No global PATH or
+system Python is modified, and neither preinstalled uv nor Go is required.
 
-```bash
-export UV_PYTHON_INSTALL_DIR="$PWD/.tools/python"
-export UV_CACHE_DIR="$PWD/.cache/uv"
-uv python install 3.12 --no-bin
-mkdir -p .tools/runtime-bin
-ln -sf "$(uv python find --managed-python 3.12)" .tools/runtime-bin/python3.12
-export PATH="$PWD/.tools/runtime-bin:$PATH"
-export PIP_CACHE_DIR="$PWD/.cache/pip"
-make setup
-```
+Checksum/version failures stop setup before inventory creation. An incompatible
+local uv/actionlint or an incomplete/incompatible `.venv` is preserved and
+reported, rather than silently replaced. Inspect it and move/remove only the
+affected local tool/environment before retrying `make setup`. No manual runtime
+installation, shell exports or environment activation are needed.
 
-Expose that PATH again in later terminals. Do not use production `--check` as
-an offline test: it contacts the host and does not verify a newly created login.
+Do not use production `--check` as an offline test: it contacts the host and does not verify a newly created login.
 Deliberately repeating bootstrap to assess `changed=0` is another live, mutating
 operation, requiring separate authorization. This PR has performed no VPS access.
 

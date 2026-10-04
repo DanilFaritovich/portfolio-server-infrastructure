@@ -18,6 +18,15 @@ case "$(uname -s)/$(uname -m)" in
         ;;
 esac
 
+if [ -e .tools/bin/actionlint ]; then
+    installed_version=$(.tools/bin/actionlint -version | head -n 1)
+    if [ "$installed_version" != "$version" ]; then
+        echo "Existing local actionlint must be version $version; inspect/remove it before retrying." >&2
+        exit 1
+    fi
+    exit 0
+fi
+
 mkdir -p .tools/bin
 temp_dir=$(mktemp -d .tools/actionlint.XXXXXX)
 trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM

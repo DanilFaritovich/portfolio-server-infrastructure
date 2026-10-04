@@ -9,11 +9,13 @@ SSH hardening, Caddy и application deployment находятся вне scope �
 
 ## Quick Start
 
-Нужен Linux-контроллер с Make, Python 3.12 (`python3.12`, venv и pip),
-OpenSSH clients (`ssh`, `ssh-keygen`, `scp`, `sftp`), **sshpass**, curl, tar/gzip
-и coreutils. Отсутствующие prerequisites устанавливайте самостоятельно;
-например, на Ubuntu `sudo apt install sshpass`. Targets не устанавливают системные
-пакеты скрыто. На VPS уже должны работать root SSH password login и быть доступны
+Нужен Linux-контроллер x86_64 или arm64 (glibc, например Ubuntu) с Make,
+POSIX shell, curl, tar/gzip, coreutils (включая sha256sum) и OpenSSH clients
+(`ssh`, `ssh-keygen`, `scp`, `sftp`). **Предварительно устанавливать Python 3.12
+и uv не нужно.** Bootstrap дополнительно требует системный **sshpass**;
+на Ubuntu установите его самостоятельно через `sudo apt install sshpass`.
+Сам setup не требует sudo и не устанавливает системные пакеты.
+На VPS уже должны работать root SSH password login и быть доступны
 `/usr/bin/python3`, `/bin/bash`, sudo, `/usr/sbin/visudo` и включение `/etc/sudoers.d`.
 
 ```bash
@@ -23,16 +25,22 @@ make setup
 
 # Измените inventories/production.yml: ansible_host и ansible_port.
 # До live-запуска выполните подготовку fingerprint/recovery, описанную ниже.
-make check
 make bootstrap
 # Ansible интерактивно запросит root SSH password.
 make verify
 ```
 
-`make setup` скачивает pinned project-local dependencies и копирует example
-inventory **только если production.yml ещё не существует**. Существующий inventory
-setup не читает и не перезаписывает. `make deps` устанавливает зависимости без
-создания inventory. В стандартном сценарии измените только hostname/address
+`make setup` проверяет минимальные system tools, устанавливает pinned uv
+**0.12.23** с проверкой checksum в `.tools/bin/uv`, скачивает managed Python
+**3.12** в `.tools/python`, создаёт `.venv` из этого managed interpreter,
+устанавливает pinned dependencies/Ansible collections и actionlint, затем
+копирует example inventory **только если production.yml ещё не существует**. Существующий inventory
+setup не читает и не перезаписывает. `make deps` использует тот же toolchain/dependency mechanism без
+создания inventory. Повторный setup переиспользует pinned uv, совместимые managed
+Python и `.venv`; он не уничтожает их и не переустанавливает Python без причины.
+Установка пакетов согласует pinned requirements, существующие collections и
+совместимый actionlint переиспользуются. Setup требует сеть для dependency
+sources, но никогда не подключается к VPS. В стандартном сценарии измените только hostname/address
 и текущий SSH-порт; `ansible_user` по умолчанию — `root`. Сохраните структуру
 `bootstrap` с одним хостом; не записывайте пароли или содержимое ключей в inventory.
 
@@ -87,6 +95,9 @@ Generated keys создаются **без passphrase** для unattended provis
 command arguments, environment variables или файлы и не сохраняется в inventory,
 `.env`, конфигурации или shell history. Используйте обычный интерактивный терминал;
 не записывайте секретный ввод и не передавайте пароль shell-командами.
+Сохраняем OpenSSH вместо добавления Paramiko: он поддерживает существующие SSH
+options и known-host behavior, а Ansible Paramiko plugin объявлен deprecated
+и запланирован к удалению в 2.21. См. [статус Paramiko plugin](https://docs.ansible.com/projects/ansible-core/2.20/collections/ansible/builtin/paramiko_ssh_connection.html).
 См. [документацию Ansible SSH transport](https://docs.ansible.com/projects/ansible-core/2.18/collections/ansible/builtin/ssh_connection.html).
 
 ## Команды и границы
@@ -117,6 +128,9 @@ read-only: Ansible может создавать и удалять времен�
 Checks всегда используют `inventories/production.example.yml`, никогда —
 production inventory, ключи, пароли или соединения с VPS. Wrapper tests используют
 временные синтетические fixtures и mocked processes, включая генерацию ключей.
+Setup tests запускают shell scripts с изолированным PATH без system Python/uv
+и fake downloads: проверяют fresh/repeated setup, сохранение inventory, reuse,
+arm64, ошибки prerequisites и checksum/version.
 GitHub Actions скачивает зависимости и запускает только `make ci`, без production
 credentials. Offline success не доказывает live access или runtime idempotency.
 Безопасный автоматический formatter (`make fix`) не настроен. Для диагностики:
@@ -148,24 +162,23 @@ targets остаётся `ansible`. Inventory поддерживает один 
 port, initial user и Python interpreter из example; credentials и дополнительные
 runtime variables отклоняются.
 
-Dependency tooling остаётся в игнорируемых `.venv`, `.ansible` и `.tools`:
-версии Python/Ansible tooling и `ansible.posix` закреплены в requirements files;
-версия actionlint и checksums архивов — в installer. Поддерживаются Linux x86_64
-и arm64; Go не нужен. Если Python 3.12 отсутствует, можно подготовить local runtime
-через uv (необязательно):
+Все generated runtimes/tooling находятся в ignored `.tools`, `.venv`, `.ansible`
+и `.cache`. uv release archives и SHA256 закреплены в `scripts/install-uv.sh`
+([официальный release](https://github.com/astral-sh/uv/releases/tag/0.12.23));
+Python/Ansible dependencies и `ansible.posix` — в requirements files.
+Версия actionlint и checksums закреплены в его installer. Patch version Python
+выбирает pinned uv в рамках серии 3.12; существующий совместимый managed runtime
+3.12 переиспользуется. Setup задаёт `UV_PYTHON_INSTALL_DIR` и `UV_CACHE_DIR`
+внутри проекта. Global PATH и system Python не меняются; предварительно
+установленный uv и Go не требуются.
 
-```bash
-export UV_PYTHON_INSTALL_DIR="$PWD/.tools/python"
-export UV_CACHE_DIR="$PWD/.cache/uv"
-uv python install 3.12 --no-bin
-mkdir -p .tools/runtime-bin
-ln -sf "$(uv python find --managed-python 3.12)" .tools/runtime-bin/python3.12
-export PATH="$PWD/.tools/runtime-bin:$PATH"
-export PIP_CACHE_DIR="$PWD/.cache/pip"
-make setup
-```
+Ошибки checksum/version останавливают setup до создания inventory. Несовместимый
+local uv/actionlint или неполная/несовместимая `.venv` сохраняются; setup сообщает
+ошибку вместо скрытой замены. Проверьте и перенесите/удалите только проблемный
+локальный tool/environment перед повтором `make setup`. Ручная установка runtime,
+shell exports и активация environment больше не нужны.
 
-В новых терминалах снова добавьте этот PATH. Не используйте production `--check`
+Не используйте production `--check`
 как offline test: он подключается к хосту и не проверяет новый login.
 Осознанный повтор bootstrap для оценки `changed=0` — ещё одна live mutating
 операция, требующая отдельного разрешения. Этот PR не выполнял доступ к VPS.
