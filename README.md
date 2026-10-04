@@ -92,6 +92,13 @@ the public-key path, reads that public key locally and adds it to
 `/home/ansible/.ssh/authorized_keys`, preserving unrelated authorized keys.
 Keep all SSH keys, real inventories, credentials and logs out of Git.
 
+Public-key validation and reading run in an explicit controller-local block,
+using the playbook's Python interpreter without sudo. Host/port come from the
+local inventory. Runtime connection overrides are scoped only to the VPS alias
+in a temporary inventory overlay (0600, removed after Ansible exits), rather
+than global connection extra-vars; delegated localhost keeps its local context.
+Only role inputs remain in `-e`. The overlay contains no passwords or key contents.
+
 Generated keys have **no passphrase** for unattended provisioning. Possession of
 this private automation key, together with unrestricted `NOPASSWD: ALL`, grants
 **root-equivalent access to the VPS**. Protect the controller and key backups.
@@ -155,6 +162,9 @@ fake downloads, checking fresh/repeated setup, inventory preservation, reuse,
 arm64, prerequisite failures and checksum/version failures.
 GitHub Actions downloads dependencies and runs only `make ci`, with no production
 credentials. Offline success does not prove live access or runtime idempotency.
+The controller-key regression test runs the real role's local preflight with
+synthetic remote host/Paramiko settings and network connections blocked; it checks
+local `.pub` validation and rejects missing files and symlinks.
 No safe automatic formatter (`make fix`) is configured. For targeted diagnosis:
 `make lint-yaml`, `make lint-ansible`, `make syntax-check`, `make lint-workflows`,
 `make test-access`. Configure `offline-validation` as a required branch-protection

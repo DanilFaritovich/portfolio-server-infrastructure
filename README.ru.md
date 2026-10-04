@@ -92,6 +92,13 @@ Wrapper проверяет только metadata private key; private key ост
 `/home/ansible/.ssh/authorized_keys`, сохраняя посторонние authorized keys.
 Не добавляйте SSH keys, реальные inventories, credentials и логи в Git.
 
+Проверка и чтение public key выполняются в явно локальном controller block
+через Python самого playbook, без sudo. Host/port берутся из local inventory.
+Runtime connection overrides действуют только для VPS alias во временном
+inventory overlay (0600, удаляется после завершения Ansible), а не в глобальных
+connection extra-vars; delegated localhost сохраняет локальный context.
+В `-e` остаются только role inputs. Overlay не содержит паролей или содержимого ключей.
+
 Generated keys создаются **без passphrase** для unattended provisioning.
 Обладание этим private automation key вместе с неограниченным `NOPASSWD: ALL`
 фактически даёт **root-equivalent access к VPS**. Защитите контроллер и резервные
@@ -155,6 +162,9 @@ trust, подтверждение, отказ/EOF, ошибки получени
 arm64, ошибки prerequisites и checksum/version.
 GitHub Actions скачивает зависимости и запускает только `make ci`, без production
 credentials. Offline success не доказывает live access или runtime idempotency.
+Controller-key regression test запускает реальный локальный preflight роли
+с синтетическим remote host/Paramiko context и заблокированными network connections;
+проверяет локальный `.pub` и отклоняет отсутствующий файл и symlinks.
 Безопасный автоматический formatter (`make fix`) не настроен. Для диагностики:
 `make lint-yaml`, `make lint-ansible`, `make syntax-check`, `make lint-workflows`,
 `make test-access`. Required branch-protection check `offline-validation`

@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 
 import yaml
 
@@ -54,6 +55,7 @@ def load_host(path):
         alias, values = next(iter(hosts.items()))
         require(isinstance(alias, str) and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]*', alias),
                 'Use a simple host alias such as portfolio.')
+        require(alias != 'localhost', 'Reserve localhost for the controller; use a separate VPS alias.')
         require(isinstance(values, dict) and set(values) <= HOST_FIELDS,
                 'Only host, port, initial user and Python interpreter belong in this inventory.')
         host = values.get('ansible_host')
@@ -193,8 +195,15 @@ def known_host(host, port, allow_trust=False):
 
 
 def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=False):
+    # Connection extra-vars would override even delegated localhost. Scope runtime
+    # settings to the managed host in an additional inventory source instead.
+    connection = {name: value for name, value in variables.items() if name.startswith('ansible_')}
+    inputs = {name: value for name, value in variables.items() if not name.startswith('ansible_')}
+    overlay = {'all': {'hosts': {alias: connection, 'localhost': {
+        'ansible_connection': 'local', 'ansible_python_interpreter': sys.executable, 'ansible_become': False,
+    }}}}
     command = [str(ROOT / '.venv/bin/ansible-playbook'), '-i', str(path),
-               str(ROOT / 'playbooks' / playbook), '--limit', alias, '-e', json.dumps(variables)]
+               str(ROOT / 'playbooks' / playbook), '--limit', alias, '-e', json.dumps(inputs)]
     if ask_pass:
         command.append('--ask-pass')
     if ask_become:
@@ -205,12 +214,18 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
         environment.update(ANSIBLE_PARAMIKO_LOOK_FOR_KEYS='False',
                            ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD='False',
                            ANSIBLE_PARAMIKO_RECORD_HOST_KEYS='False')
-    subprocess.run(command, cwd=ROOT, check=True, env=environment)
+    # Contains only connection settings and paths, never passwords/key contents.
+    # NamedTemporaryFile uses 0600 and removes this overlay after the child exits.
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', prefix='bootstrap-inventory-') as inventory:
+        json.dump(overlay, inventory)
+        inventory.flush()
+        command.extend(['-i', inventory.name])
+        subprocess.run(command, cwd=ROOT, check=True, env=environment)
 
 
 def live(mode, inventory, key):
     prerequisites(mode)
-    alias, host, port, user, interpreter = load_host(inventory)
+    alias, host, port, user, _ = load_host(inventory)
     known_host(host, port, allow_trust=mode == 'bootstrap')
     if mode == 'bootstrap':
         require(sys.stdin.isatty(), 'Bootstrap requires an interactive terminal for the Ansible password prompt.')
@@ -219,7 +234,6 @@ def live(mode, inventory, key):
     else:
         check_key(key)
     variables = {
-        'ansible_host': host, 'ansible_port': port, 'ansible_python_interpreter': interpreter,
         'ansible_connection': 'ssh', 'ansible_host_key_checking': True,
         'ansible_ssh_args': SSH_BASE, 'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
     }

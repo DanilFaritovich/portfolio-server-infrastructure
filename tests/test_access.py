@@ -71,6 +71,11 @@ class AccessTests(unittest.TestCase):
             self.write_inventory()
             with self.assertRaises(ValueError):
                 access.load_host(self.inventory)
+        self.inventory.write_text(yaml.safe_dump({'all': {'children': {'bootstrap': {'hosts': {
+            'localhost': {'ansible_host': 'fixture.example.test', 'ansible_port': 22},
+        }}}}}))
+        with self.assertRaisesRegex(ValueError, 'Reserve localhost'):
+            access.load_host(self.inventory)
 
     def test_port_and_credentials_rejected(self):
         for value in (0, 65536, True, '22'):
@@ -150,10 +155,17 @@ class AccessTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[2]['ansible_user'], 'ansible')
 
     def test_ansible_command_uses_native_prompt_and_no_shell(self):
+        overlays = []
+
+        def capture(command, **kwargs):
+            path = Path(command[-1])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            overlays.append(json.loads(path.read_text()))
+
         with patch.object(access, 'prerequisites'), patch.object(access, 'known_host'), \
                 patch.object(access, 'prepare_key') as prepare, patch.object(access.sys.stdin, 'isatty', return_value=True), \
                 patch.dict(os.environ, {'FIXTURE_MARKER': 'unchanged'}, clear=True), \
-                patch.object(access.subprocess, 'run') as run:
+                patch.object(access.subprocess, 'run', side_effect=capture) as run:
             access.live('bootstrap', self.inventory, self.key)
             prepare.assert_called_once_with(self.key)
             initial, verify = run.call_args_list
@@ -161,6 +173,8 @@ class AccessTests(unittest.TestCase):
             self.assertNotIn('--ask-pass', verify.args[0])
             for call in (initial, verify):
                 variables = json.loads(call.args[0][call.args[0].index('-e') + 1])
+                self.assertFalse(any(name.startswith('ansible_') for name in variables))
+                self.assertFalse(Path(call.args[0][-1]).exists())
                 self.assertFalse(any('password' in name or name.endswith('_pass') for name in variables
                                      if name != 'bootstrap_user_allow_passwordless_sudo'))
                 self.assertNotIn('shell', call.kwargs)
@@ -171,6 +185,77 @@ class AccessTests(unittest.TestCase):
             })
             self.assertEqual(verify.kwargs['env'], {'FIXTURE_MARKER': 'unchanged'})
             self.assertEqual(dict(os.environ), {'FIXTURE_MARKER': 'unchanged'})
+            initial_host = overlays[0]['all']['hosts']['portfolio']
+            verify_host = overlays[1]['all']['hosts']['portfolio']
+            self.assertEqual(initial_host['ansible_connection'], 'ansible.builtin.paramiko_ssh')
+            self.assertEqual(initial_host['ansible_user'], 'root')
+            self.assertEqual(verify_host['ansible_connection'], 'ssh')
+            self.assertEqual(verify_host['ansible_user'], 'ansible')
+            for overlay in overlays:
+                host = overlay['all']['hosts']['portfolio']
+                self.assertNotIn('ansible_host', host)
+                self.assertNotIn('ansible_port', host)
+                self.assertNotIn('ansible_python_interpreter', host)
+                local = overlay['all']['hosts']['localhost']
+                self.assertEqual(local['ansible_connection'], 'local')
+                self.assertEqual(local['ansible_python_interpreter'], access.sys.executable)
+                self.assertFalse(local['ansible_become'])
+
+    def test_controller_public_key_preflight_with_real_ansible_and_remote_paramiko(self):
+        # Run only the role's controller block; deny every network connection in
+        # Ansible and its module subprocesses as an independent offline guard.
+        (self.directory / 'sitecustomize.py').write_text(
+            'import socket\n'
+            'def deny(*args, **kwargs):\n'
+            '    raise RuntimeError("Network is forbidden in the controller preflight test")\n'
+            'socket.socket.connect = deny\n'
+            'socket.socket.connect_ex = deny\n'
+            'socket.create_connection = deny\n')
+        public = Path(str(self.key) + '.pub')
+        environment = dict(os.environ, PYTHONPATH=str(self.directory),
+                           ANSIBLE_HOME=str(self.directory / 'ansible-home'),
+                           ANSIBLE_LOCAL_TEMP=str(self.directory / 'ansible-tmp'),
+                           ANSIBLE_REMOTE_TEMP=str(self.directory / 'module-tmp'),
+                           ANSIBLE_NOCOLOR='1')
+        original_run = subprocess.run
+        results = []
+
+        def run(command, **kwargs):
+            env = kwargs.pop('env')
+            env.update(environment)
+            result = original_run(command + ['--tags', 'bootstrap_user_controller_key', '-vvv'],
+                                  cwd=kwargs['cwd'], env=env, capture_output=True, text=True, timeout=30)
+            results.append(result)
+
+        variables = {
+            'ansible_connection': 'ansible.builtin.paramiko_ssh', 'ansible_user': 'root',
+            'ansible_paramiko_host_key_checking': True,
+            'bootstrap_user_name': 'ansible', 'bootstrap_user_public_key_path': str(public),
+            'bootstrap_user_allow_passwordless_sudo': True,
+        }
+        for state in ('regular', 'missing', 'symlink'):
+            with self.subTest(state=state):
+                public.unlink(missing_ok=True)
+                if state == 'regular':
+                    public.write_text('ssh-ed25519 ' + HostTrustTests.BLOB + ' synthetic-controller\n')
+                elif state == 'symlink':
+                    target = self.directory / 'public-target'
+                    target.write_text('ssh-ed25519 ' + HostTrustTests.BLOB + '\n')
+                    public.symlink_to(target)
+                with patch.object(access.subprocess, 'run', side_effect=run):
+                    access.run_playbook(self.inventory, 'portfolio', variables, 'bootstrap.yml')
+                result = results[-1]
+                output = result.stdout + result.stderr
+                self.assertIn('ESTABLISH LOCAL CONNECTION', output)
+                self.assertNotIn('ESTABLISH PARAMIKO SSH CONNECTION', output)
+                self.assertNotIn('Network is forbidden', output)
+                self.assertNotIn('Create the managed automation user', output)
+                if state == 'regular':
+                    self.assertEqual(result.returncode, 0, output)
+                    self.assertIn('ok=5', output)
+                else:
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertIn('controller public key must be a readable regular', output)
 
     def test_pinned_paramiko_plugin_password_and_host_key_behavior(self):
         # Simulate Ansible's in-memory prompt result; never use a real credential or network.
