@@ -1,12 +1,19 @@
 """Offline regression tests: synthetic inventories and mocked SSH/Ansible processes."""
 
 import importlib.util
+import io
+import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
+from ansible.errors import AnsibleConnectionFailure
+from ansible.playbook.play_context import PlayContext
+from ansible.plugins.loader import connection_loader, init_plugin_loader
+import paramiko
 import yaml
 
 SPEC = importlib.util.spec_from_file_location('access', Path(__file__).parents[1] / 'scripts/access.py')
@@ -42,8 +49,18 @@ class AccessTests(unittest.TestCase):
 
     def test_setup_creates_private_inventory(self):
         self.inventory.unlink()
-        access.setup_inventory(self.inventory)
+        with patch.object(access, 'prepare_key') as prepare, patch.object(access.subprocess, 'run') as run:
+            access.setup_inventory(self.inventory)
+            prepare.assert_not_called()
+            run.assert_not_called()
         self.assertEqual(self.inventory.stat().st_mode & 0o777, 0o600)
+
+    def test_bootstrap_prerequisites_without_sshpass(self):
+        with patch.object(access.shutil, 'which', side_effect=lambda name: None if name == 'sshpass' else '/fixture/' + name) as which, \
+                patch.object(access.Path, 'is_file', return_value=True), \
+                patch.object(access.Path, 'is_dir', return_value=True):
+            access.prerequisites('bootstrap')
+            self.assertNotIn('sshpass', [call.args[0] for call in which.call_args_list])
 
     def test_default_root_and_host_validation(self):
         del self.host['ansible_user']
@@ -101,11 +118,18 @@ class AccessTests(unittest.TestCase):
             access.live('bootstrap', self.inventory, self.key)
             initial, verify = run.call_args_list
             self.assertEqual(initial.args[2]['ansible_user'], 'root')
+            self.assertEqual(initial.args[2]['ansible_connection'], 'ansible.builtin.paramiko_ssh')
+            self.assertTrue(initial.args[2]['ansible_paramiko_host_key_checking'])
+            self.assertEqual(initial.args[2]['ansible_paramiko_private_key_file'], '')
             self.assertTrue(initial.kwargs['ask_pass'])
             self.assertTrue(initial.args[2]['bootstrap_user_allow_passwordless_sudo'])
             self.assertNotIn('ansible_become', initial.args[2])
             self.assertNotIn('ansible_private_key_file', initial.args[2])
             self.assertEqual(verify.args[2]['ansible_user'], 'ansible')
+            self.assertEqual(verify.args[2]['ansible_connection'], 'ssh')
+            self.assertEqual(verify.args[2]['ansible_private_key_file'], str(self.key))
+            self.assertIn('BatchMode=yes', verify.args[2]['ansible_ssh_args'])
+            self.assertIn('PreferredAuthentications=publickey', verify.args[2]['ansible_ssh_args'])
             self.assertIn('PasswordAuthentication=no', verify.args[2]['ansible_ssh_args'])
             self.assertIn('ControlPath=none', verify.args[2]['ansible_ssh_args'])
             self.assertNotIn('ask_pass', verify.kwargs)
@@ -126,12 +150,52 @@ class AccessTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[2]['ansible_user'], 'ansible')
 
     def test_ansible_command_uses_native_prompt_and_no_shell(self):
-        with patch.object(access.subprocess, 'run') as run:
-            access.run_playbook(self.inventory, 'portfolio', {'bootstrap_user_public_key_path': '/synthetic path/key.pub'},
-                                'bootstrap.yml', ask_pass=True)
-            command = run.call_args.args[0]
-            self.assertIn('--ask-pass', command)
-            self.assertNotIn('shell', run.call_args.kwargs)
+        with patch.object(access, 'prerequisites'), patch.object(access, 'known_host'), \
+                patch.object(access, 'prepare_key') as prepare, patch.object(access.sys.stdin, 'isatty', return_value=True), \
+                patch.dict(os.environ, {'FIXTURE_MARKER': 'unchanged'}, clear=True), \
+                patch.object(access.subprocess, 'run') as run:
+            access.live('bootstrap', self.inventory, self.key)
+            prepare.assert_called_once_with(self.key)
+            initial, verify = run.call_args_list
+            self.assertIn('--ask-pass', initial.args[0])
+            self.assertNotIn('--ask-pass', verify.args[0])
+            for call in (initial, verify):
+                variables = json.loads(call.args[0][call.args[0].index('-e') + 1])
+                self.assertFalse(any('password' in name or name.endswith('_pass') for name in variables
+                                     if name != 'bootstrap_user_allow_passwordless_sudo'))
+                self.assertNotIn('shell', call.kwargs)
+                self.assertNotIn('input', call.kwargs)
+            self.assertEqual(initial.kwargs['env'], {
+                'FIXTURE_MARKER': 'unchanged', 'ANSIBLE_PARAMIKO_LOOK_FOR_KEYS': 'False',
+                'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD': 'False', 'ANSIBLE_PARAMIKO_RECORD_HOST_KEYS': 'False',
+            })
+            self.assertEqual(verify.kwargs['env'], {'FIXTURE_MARKER': 'unchanged'})
+            self.assertEqual(dict(os.environ), {'FIXTURE_MARKER': 'unchanged'})
+
+    def test_pinned_paramiko_plugin_password_and_host_key_behavior(self):
+        # Simulate Ansible's in-memory prompt result; never use a real credential or network.
+        init_plugin_loader()
+        with patch.dict(os.environ, {'ANSIBLE_PARAMIKO_LOOK_FOR_KEYS': 'False',
+                                     'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD': 'False'}, clear=True), \
+                patch.object(paramiko, 'SSHClient') as client:
+            connection = connection_loader.get('ansible.builtin.paramiko_ssh', PlayContext(), io.StringIO())
+            connection.set_options(var_options={
+                'ansible_host': 'fixture.example.test', 'ansible_port': 2222, 'ansible_user': 'root',
+                'ansible_password': 'synthetic prompt result', 'ansible_paramiko_private_key_file': '',
+                'ansible_paramiko_host_key_checking': True, 'ansible_paramiko_proxy_command': '',
+            })
+            connection._connect_uncached()
+            arguments = client.return_value.connect.call_args.kwargs
+            self.assertEqual(arguments['password'], 'synthetic prompt result')
+            self.assertFalse(arguments['allow_agent'])
+            self.assertFalse(arguments['look_for_keys'])
+            self.assertIsNone(arguments['key_filename'])
+            self.assertEqual(arguments['port'], 2222)
+            client.return_value.load_system_host_keys.assert_any_call()
+            client.return_value.connect.side_effect = paramiko.ssh_exception.BadHostKeyException(
+                'fixture.example.test', None, None)
+            with self.assertRaisesRegex(AnsibleConnectionFailure, 'host key mismatch'):
+                connection._connect_uncached()
 
 
 if __name__ == '__main__':

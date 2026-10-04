@@ -3,6 +3,7 @@
 
 import argparse
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -113,8 +114,10 @@ def prepare_key(path):
 
 
 def prerequisites(mode):
-    for tool in ('ssh', 'ssh-keygen', 'sftp', 'scp', *(['sshpass'] if mode == 'bootstrap' else [])):
+    for tool in ('ssh', 'ssh-keygen', 'sftp', 'scp'):
         require(shutil.which(tool), f'Missing {tool}. Install the documented controller prerequisite.')
+    if mode == 'bootstrap':
+        require(importlib.util.find_spec('paramiko') is not None, 'Missing local Paramiko. Run make setup or make deps.')
     require((ROOT / '.venv/bin/ansible-playbook').is_file(), 'Run make setup or make deps first.')
     require((ROOT / '.ansible/collections/ansible_collections/ansible/posix').is_dir(),
             'Missing ansible.posix collection. Run make deps.')
@@ -135,7 +138,13 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
         command.append('--ask-pass')
     if ask_become:
         command.append('--ask-become-pass')
-    subprocess.run(command, cwd=ROOT, check=True)
+    environment = os.environ.copy()
+    if variables.get('ansible_connection') == 'ansible.builtin.paramiko_ssh':
+        # These plugin options have no variable equivalents in pinned ansible-core.
+        environment.update(ANSIBLE_PARAMIKO_LOOK_FOR_KEYS='False',
+                           ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD='False',
+                           ANSIBLE_PARAMIKO_RECORD_HOST_KEYS='False')
+    subprocess.run(command, cwd=ROOT, check=True, env=environment)
 
 
 def live(mode, inventory, key):
@@ -156,8 +165,10 @@ def live(mode, inventory, key):
     if mode == 'bootstrap':
         run_playbook(inventory, alias, variables | {
             'ansible_user': user,
-            'ansible_ssh_args': SSH_BASE + ' -o PreferredAuthentications=password -o PubkeyAuthentication=no'
-                                ' -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=no',
+            'ansible_connection': 'ansible.builtin.paramiko_ssh',
+            'ansible_paramiko_host_key_checking': True,
+            'ansible_paramiko_private_key_file': '', 'ansible_paramiko_proxy_command': '',
+            'ansible_paramiko_timeout': 15,
             'bootstrap_user_name': 'ansible', 'bootstrap_user_public_key_path': str(key) + '.pub',
             'bootstrap_user_allow_passwordless_sudo': True,
         }, 'bootstrap.yml', ask_pass=True, ask_become=user != 'root')

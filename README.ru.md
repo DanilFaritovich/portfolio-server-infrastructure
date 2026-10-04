@@ -12,9 +12,8 @@ SSH hardening, Caddy и application deployment находятся вне scope �
 Нужен Linux-контроллер x86_64 или arm64 (glibc, например Ubuntu) с Make,
 POSIX shell, curl, tar/gzip, coreutils (включая sha256sum) и OpenSSH clients
 (`ssh`, `ssh-keygen`, `scp`, `sftp`). **Предварительно устанавливать Python 3.12
-и uv не нужно.** Bootstrap дополнительно требует системный **sshpass**;
-на Ubuntu установите его самостоятельно через `sudo apt install sshpass`.
-Сам setup не требует sudo и не устанавливает системные пакеты.
+и uv не нужно.** Paramiko автоматически устанавливается в project-local
+`.venv`; sshpass не требуется. Setup не требует sudo и не устанавливает системные пакеты.
 На VPS уже должны работать root SSH password login и быть доступны
 `/usr/bin/python3`, `/bin/bash`, sudo, `/usr/sbin/visudo` и включение `/etc/sudoers.d`.
 
@@ -33,7 +32,7 @@ make verify
 `make setup` проверяет минимальные system tools, устанавливает pinned uv
 **0.12.23** с проверкой checksum в `.tools/bin/uv`, скачивает managed Python
 **3.12** в `.tools/python`, создаёт `.venv` из этого managed interpreter,
-устанавливает pinned dependencies/Ansible collections и actionlint, затем
+устанавливает pinned dependencies (включая **Paramiko 5.0.0**)/Ansible collections и actionlint, затем
 копирует example inventory **только если production.yml ещё не существует**. Существующий inventory
 setup не читает и не перезаписывает. `make deps` использует тот же toolchain/dependency mechanism без
 создания inventory. Повторный setup переиспользует pinned uv, совместимые managed
@@ -66,7 +65,8 @@ SSH key + NOPASSWD sudo**. Root используется только для ini
 Дальнейшее provisioning должно использовать `ansible`; `make verify` явно
 переопределяет начальный login из inventory на `ansible` и не использует root password.
 
-`make bootstrap` локально создаёт Ed25519 key, если оба файла пары отсутствуют:
+`make bootstrap` локально создаёт Ed25519 key, если оба файла пары отсутствуют,
+непосредственно перед bootstrap. `make setup` не генерирует SSH keys:
 
 ```text
 ~/.ssh/portfolio-server-infrastructure/ansible_ed25519
@@ -89,16 +89,22 @@ Generated keys создаются **без passphrase** для unattended provis
 роли остаётся `false`. Отдельный `/etc/sudoers.d/ansible` принадлежит root,
 имеет `0440` и проверяется через `visudo -cf`. Login password для `ansible` не задаётся.
 
-Пароль запрашивает штатный Ansible `--ask-pass`, используя OpenSSH и sshpass
-с закреплённой версией Ansible. Пароль находится в памяти процессов и передаётся
-внутренне через pipe; wrapper его не обрабатывает. Пароль не передаётся через
-command arguments, environment variables или файлы и не сохраняется в inventory,
-`.env`, конфигурации или shell history. Используйте обычный интерактивный терминал;
+Initial root connection использует `ansible.builtin.paramiko_ssh` из pinned
+Ansible Core **2.18.6** с project-local Paramiko **5.0.0**. Штатный Ansible
+`--ask-pass` интерактивно запрашивает пароль и держит его в памяти процесса;
+wrapper не читает и не сохраняет пароль. Он не передаётся через command arguments,
+environment variables или файлы и не сохраняется в inventory, `.env`,
+конфигурации или shell history. Используйте обычный интерактивный терминал;
 не записывайте секретный ввод и не передавайте пароль shell-командами.
-Сохраняем OpenSSH вместо добавления Paramiko: он поддерживает существующие SSH
-options и known-host behavior, а Ansible Paramiko plugin объявлен deprecated
-и запланирован к удалению в 2.21. См. [статус Paramiko plugin](https://docs.ansible.com/projects/ansible-core/2.20/collections/ansible/builtin/paramiko_ssh_connection.html).
-См. [документацию Ansible SSH transport](https://docs.ansible.com/projects/ansible-core/2.18/collections/ansible/builtin/ssh_connection.html).
+
+Initial bootstrap отключает SSH agent authentication и поиск private keys,
+проверяет подтверждённую запись `known_hosts`; автоматическое добавление host keys
+отключено. Автоматическая handoff verification и `make verify` используют
+**OpenSSH + dedicated private key + public-key-only authentication**, с отключёнными
+password prompts и agent. Paramiko используется только для initial password bootstrap.
+См. [документацию pinned Ansible Paramiko transport](https://docs.ansible.com/projects/ansible-core/2.18/collections/ansible/builtin/paramiko_ssh_connection.html).
+В новых версиях Ansible plugin deprecated и запланирован к удалению в 2.21;
+перед обновлением Ansible до этой версии нужно пересмотреть initial password transport.
 
 ## Команды и границы
 
@@ -128,7 +134,10 @@ read-only: Ansible может создавать и удалять времен�
 Checks всегда используют `inventories/production.example.yml`, никогда —
 production inventory, ключи, пароли или соединения с VPS. Wrapper tests используют
 временные синтетические fixtures и mocked processes, включая генерацию ключей.
-Setup tests запускают shell scripts с изолированным PATH без system Python/uv
+Access tests также проверяют bootstrap без sshpass, Paramiko password transport,
+OpenSSH key-only verification, отсутствие credentials в arguments/environment,
+генерацию ключа только при bootstrap и pinned plugin с mock SSH client
+(включая отказ при изменённом host key). Setup tests запускают shell scripts с изолированным PATH без system Python/uv
 и fake downloads: проверяют fresh/repeated setup, сохранение inventory, reuse,
 arm64, ошибки prerequisites и checksum/version.
 GitHub Actions скачивает зависимости и запускает только `make ci`, без production
