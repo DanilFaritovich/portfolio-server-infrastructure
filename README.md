@@ -11,7 +11,7 @@ Caddy and application deployment are outside this PR's scope.
 
 Use a Linux x86_64 or arm64 controller (glibc, such as Ubuntu) with Make, a POSIX
 shell, curl, tar/gzip, coreutils (including sha256sum) and OpenSSH clients
-(`ssh`, `ssh-keygen`, `scp`, `sftp`). **Neither Python 3.12 nor uv needs to be
+(`ssh`, `ssh-keygen`, `ssh-keyscan`, `scp`, `sftp`). **Neither Python 3.12 nor uv needs to be
 installed beforehand.** Paramiko is installed automatically in the project-local
 `.venv`; sshpass is not required. Setup requires no sudo and installs no system packages.
 The VPS must already allow root SSH password login and have `/usr/bin/python3`,
@@ -23,9 +23,9 @@ cd portfolio-server-infrastructure
 make setup
 
 # Edit inventories/production.yml: ansible_host and ansible_port.
-# Before live execution, complete the fingerprint/recovery preparation below.
+# Have the provider fingerprint and recovery console available.
 make bootstrap
-# Ansible requests the root SSH password interactively.
+# For a new host, confirm its fingerprint first; then Ansible prompts for the root password.
 make verify
 ```
 
@@ -44,20 +44,29 @@ sources; it never contacts a VPS.
 Edit only the hostname/address and existing SSH port for the standard path; `ansible_user` defaults to `root`. Keep the one-host `bootstrap` structure
 and never store passwords or key bytes in inventory.
 
-**Before the first live bootstrap:** independently verify host, port and host-key
-fingerprint through the provider console; keep recovery console access and a
-working administrative session available. Open SSH once to accept the verified
-fingerprint into the controller's `~/.ssh/known_hosts` (this is **LIVE**):
+**First-use trust is handled inside `make bootstrap`.** Keep recovery console
+access and a working administrative session available. For an existing entry in
+`~/.ssh/known_hosts`, bootstrap uses the stored trust without rescanning or
+replacing it. Changed keys still fail strict checking.
 
-```bash
-ssh -p <verified-port> root@<verified-host>
-```
+For a new host, bootstrap retrieves public host keys with OpenSSH `ssh-keyscan`
+and displays the hostname/IP, port, selected key type and SHA256 fingerprint
+computed by `ssh-keygen`. It selects one key, preferring Ed25519, then ECDSA,
+then RSA. This is **first trust**: the network response does not establish the
+server identity. Compare the displayed fingerprint with the VPS provider panel
+or console before answering `Trust this host? [y/N]`. Only `y` or `yes` saves the
+displayed key to your `~/.ssh/known_hosts`; other input or EOF stops bootstrap
+before automation-key generation, password prompting or VPS configuration changes.
+No separate `ssh` command is needed just to populate `known_hosts`.
 
-Compare the displayed fingerprint before accepting it. Bootstrap requires that
-known-host entry; it never uses unchecked `ssh-keyscan` output or disables
-host-key checking. Unknown/changed keys stop the workflow. Confirm the VPS
-prerequisites and sudoers include before proceeding. Do not select an unrelated
-existing account as the managed `ansible` account.
+Non-default ports use `[host]:port` entries. Retrieval/fingerprint failures and
+absence of an interactive TTY stop first trust. `make verify` never offers first
+trust or retrieves keys; run bootstrap first for a new host. Strict host-key
+checking remains enabled for both Paramiko bootstrap and OpenSSH verification;
+there is no silent trust. See [OpenSSH ssh-keyscan](https://man.openbsd.org/ssh-keyscan)
+and [ssh-keygen](https://man.openbsd.org/ssh-keygen).
+Confirm VPS prerequisites and the sudoers include before proceeding. Do not select
+an unrelated existing account as the managed `ansible` account.
 
 ## Access and security
 
@@ -119,7 +128,8 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make ci` | Same offline checks as `make check` | **OFFLINE** |
 
 Bootstrap validates prerequisites, the local inventory, host/port and known-host
-entry before generating a key or requesting the initial password. It runs the
+trust, with explicit first-use confirmation, before generating a key or requesting
+the initial password. It runs the
 existing bootstrap role with explicit sudo consent, then opens independent
 key-only SSH connections as `ansible`. Verification checks Ansible ping,
 `id -un == ansible` and `sudo -n id -u == 0`; every failed stage returns an error.
@@ -138,7 +148,9 @@ synthetic fixtures and mocked processes, including mocked key generation. Access
 tests cover bootstrap without sshpass, Paramiko password transport, OpenSSH
 key-only verification, credential-free arguments/environment, bootstrap-only
 key generation and the pinned plugin with a mock SSH client, including host-key
-mismatch rejection. Setup tests run shell scripts with an isolated PATH without system Python/uv and
+mismatch rejection. First-trust tests cover existing/new trust, acceptance, rejection/EOF,
+retrieval/fingerprint failures, non-default ports, missing TTY and verification
+without first trust, using mock retrieval and offline OpenSSH on synthetic public keys. Setup tests run shell scripts with an isolated PATH without system Python/uv and
 fake downloads, checking fresh/repeated setup, inventory preservation, reuse,
 arm64, prerequisite failures and checksum/version failures.
 GitHub Actions downloads dependencies and runs only `make ci`, with no production

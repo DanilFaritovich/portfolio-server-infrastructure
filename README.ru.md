@@ -11,7 +11,7 @@ SSH hardening, Caddy и application deployment находятся вне scope �
 
 Нужен Linux-контроллер x86_64 или arm64 (glibc, например Ubuntu) с Make,
 POSIX shell, curl, tar/gzip, coreutils (включая sha256sum) и OpenSSH clients
-(`ssh`, `ssh-keygen`, `scp`, `sftp`). **Предварительно устанавливать Python 3.12
+(`ssh`, `ssh-keygen`, `ssh-keyscan`, `scp`, `sftp`). **Предварительно устанавливать Python 3.12
 и uv не нужно.** Paramiko автоматически устанавливается в project-local
 `.venv`; sshpass не требуется. Setup не требует sudo и не устанавливает системные пакеты.
 На VPS уже должны работать root SSH password login и быть доступны
@@ -23,9 +23,9 @@ cd portfolio-server-infrastructure
 make setup
 
 # Измените inventories/production.yml: ansible_host и ansible_port.
-# До live-запуска выполните подготовку fingerprint/recovery, описанную ниже.
+# Подготовьте fingerprint провайдера и доступ к recovery console.
 make bootstrap
-# Ansible интерактивно запросит root SSH password.
+# Для нового хоста сначала подтвердите fingerprint; затем Ansible запросит root password.
 make verify
 ```
 
@@ -43,18 +43,28 @@ sources, но никогда не подключается к VPS. В станд
 и текущий SSH-порт; `ansible_user` по умолчанию — `root`. Сохраните структуру
 `bootstrap` с одним хостом; не записывайте пароли или содержимое ключей в inventory.
 
-**Перед первым live bootstrap:** независимо проверьте host, port и fingerprint
-через консоль провайдера; сохраните доступ к recovery console и рабочую
-административную сессию. Один раз откройте SSH, чтобы принять проверенный
-fingerprint в `~/.ssh/known_hosts` контроллера (это **LIVE**):
+**First-use trust выполняется внутри `make bootstrap`.** Сохраните доступ к
+recovery console и рабочую административную сессию. Если запись уже есть в
+`~/.ssh/known_hosts`, bootstrap использует её без повторного сканирования или
+замены. Изменённый ключ по-прежнему приводит к отказу при строгой проверке.
 
-```bash
-ssh -p <verified-port> root@<verified-host>
-```
+Для нового хоста bootstrap получает public host keys через OpenSSH `ssh-keyscan`
+и показывает hostname/IP, port, выбранный тип ключа и SHA256 fingerprint,
+вычисленный `ssh-keygen`. Выбирается один ключ: сначала Ed25519, затем ECDSA,
+затем RSA. Это **первый trust**: ответ из сети сам по себе не подтверждает
+подлинность сервера. Сравните fingerprint с панелью или консолью VPS-провайдера
+перед ответом на `Trust this host? [y/N]`. Только `y` или `yes` сохраняет показанный
+ключ в ваш `~/.ssh/known_hosts`; другой ввод или EOF останавливает bootstrap
+до генерации automation key, запроса пароля и изменения конфигурации VPS.
+Заранее запускать отдельный `ssh` только ради `known_hosts` больше не нужно.
 
-Сравните показанный fingerprint перед подтверждением. Bootstrap требует запись
-known_hosts; он не использует непроверенный вывод `ssh-keyscan` и не отключает
-host-key checking. Неизвестный или изменённый ключ останавливает workflow.
+Для нестандартного порта используется запись `[host]:port`. Ошибки получения
+ключа/fingerprint и отсутствие интерактивного TTY останавливают first trust.
+`make verify` не предлагает first trust и не получает новые ключи; для нового
+хоста сначала выполните bootstrap. Строгая проверка host key остаётся включённой
+для Paramiko bootstrap и OpenSSH verification; silent trust отсутствует.
+См. [OpenSSH ssh-keyscan](https://man.openbsd.org/ssh-keyscan)
+и [ssh-keygen](https://man.openbsd.org/ssh-keygen).
 Заранее подтвердите VPS prerequisites и включение sudoers.d. Не выбирайте чужую
 существующую учётную запись как управляемого пользователя `ansible`.
 
@@ -118,7 +128,7 @@ password prompts и agent. Paramiko используется только для
 | `make ci` | Те же offline checks, что у `make check` | **OFFLINE** |
 
 Bootstrap проверяет prerequisites, local inventory, host/port и запись known_hosts
-до генерации ключа и запроса начального пароля. Затем запускает существующую роль
+с явным подтверждением first-use trust до генерации ключа и запроса начального пароля. Затем запускает существующую роль
 с explicit sudo consent и открывает независимые key-only SSH connections как
 `ansible`. Verification проверяет Ansible ping, `id -un == ansible` и
 `sudo -n id -u == 0`; ошибка любой стадии завершает workflow с ошибкой.
@@ -137,7 +147,10 @@ production inventory, ключи, пароли или соединения с VP
 Access tests также проверяют bootstrap без sshpass, Paramiko password transport,
 OpenSSH key-only verification, отсутствие credentials в arguments/environment,
 генерацию ключа только при bootstrap и pinned plugin с mock SSH client
-(включая отказ при изменённом host key). Setup tests запускают shell scripts с изолированным PATH без system Python/uv
+(включая отказ при изменённом host key). First-trust tests проверяют существующий/новый
+trust, подтверждение, отказ/EOF, ошибки получения ключа/fingerprint, нестандартный
+порт, отсутствие TTY и verification без first trust через mock retrieval
+и offline OpenSSH с синтетическими public keys. Setup tests запускают shell scripts с изолированным PATH без system Python/uv
 и fake downloads: проверяют fresh/repeated setup, сохранение inventory, reuse,
 arm64, ошибки prerequisites и checksum/version.
 GitHub Actions скачивает зависимости и запускает только `make ci`, без production

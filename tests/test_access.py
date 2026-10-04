@@ -198,5 +198,144 @@ class AccessTests(unittest.TestCase):
                 connection._connect_uncached()
 
 
+class HostTrustTests(unittest.TestCase):
+    # Synthetic public-only key encoding. Never generate or read private keys.
+    BLOB = 'AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.path = self.home / '.ssh/known_hosts'
+        self.host = 'fixture.example.test'
+        self.scan_result = subprocess.CompletedProcess([], 0, f'{self.host} ssh-ed25519 {self.BLOB}\n', '')
+        original_run = subprocess.run
+
+        def run(command, **kwargs):
+            if command[0] == 'ssh-keyscan':
+                return self.scan_result
+            self.assertEqual(command[0], 'ssh-keygen')
+            # Only offline OpenSSH lookup/fingerprint commands with synthetic public data.
+            return original_run(command, **kwargs)
+
+        for mock in (patch.object(access.Path, 'home', return_value=self.home),
+                     patch.object(access.sys.stdin, 'isatty', return_value=True),
+                     patch.object(access.subprocess, 'run', side_effect=run),
+                     patch('builtins.input', return_value='yes'), patch('builtins.print')):
+            value = mock.start()
+            self.addCleanup(mock.stop)
+            if mock.attribute == 'run':
+                self.run = value
+            elif mock.attribute == 'input':
+                self.prompt = value
+            elif mock.attribute == 'print':
+                self.output = value
+
+    def write_trust(self, name=None):
+        self.path.parent.mkdir(mode=0o700)
+        self.path.write_text(f'{name or self.host} ssh-ed25519 {self.BLOB}\n')
+
+    def test_existing_trust_is_preserved_without_scan_or_prompt(self):
+        self.write_trust()
+        before = self.path.read_bytes()
+        access.known_host(self.host, 22, allow_trust=True)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.prompt.assert_not_called()
+        self.assertEqual(self.run.call_count, 1)
+
+    def test_new_host_confirmation_saves_displayed_key(self):
+        access.known_host(self.host, 22, allow_trust=True)
+        self.assertEqual(self.path.read_text(), f'{self.host} ssh-ed25519 {self.BLOB}\n')
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
+        displayed = ' '.join(str(call.args) for call in self.output.call_args_list)
+        for value in (self.host, 'port=22', 'ssh-ed25519', 'SHA256:', 'FIRST TRUST', 'provider'):
+            self.assertIn(value, displayed)
+        self.prompt.assert_called_once_with('Trust this host? [y/N] ')
+        self.run.reset_mock()
+        access.known_host(self.host, 22)
+        self.assertEqual(self.run.call_count, 1)
+
+    def test_rejection_and_eof_stop_before_key_or_provisioning(self):
+        for answer in ('no', '', 'maybe', EOFError()):
+            with self.subTest(answer=answer), patch.object(access, 'prerequisites'), \
+                    patch.object(access, 'load_host', return_value=('portfolio', self.host, 22, 'root', '/usr/bin/python3')), \
+                    patch.object(access, 'prepare_key') as key, patch.object(access, 'run_playbook') as playbook:
+                self.prompt.side_effect = answer if isinstance(answer, Exception) else None
+                self.prompt.return_value = answer
+                with self.assertRaisesRegex(ValueError, 'trust declined'):
+                    access.live('bootstrap', self.home / 'fixture.yml', self.home / 'automation')
+                key.assert_not_called()
+                playbook.assert_not_called()
+                self.assertFalse(self.path.parent.exists())
+
+    def test_confirmation_precedes_key_generation_and_bootstrap(self):
+        def prepare(path):
+            self.assertTrue(self.path.exists())
+            self.prompt.assert_called_once()
+
+        with patch.object(access, 'prerequisites'), \
+                patch.object(access, 'load_host', return_value=('portfolio', self.host, 22, 'root', '/usr/bin/python3')), \
+                patch.object(access, 'prepare_key', side_effect=prepare) as key, \
+                patch.object(access, 'run_playbook') as playbook:
+            access.live('bootstrap', self.home / 'fixture.yml', self.home / 'automation')
+            key.assert_called_once()
+            self.assertEqual([call.args[3] for call in playbook.call_args_list], ['bootstrap.yml', 'verify.yml'])
+
+    def test_retrieval_failures_do_not_prompt_or_write(self):
+        for code, text in ((1, ''), (0, ''), (0, 'malformed'),
+                           (0, f'{self.host} ssh-ed25519 not-valid-base64!\n'),
+                           (0, f'{self.host} ssh-ed25519 AAAA\n')):
+            with self.subTest(code=code, text=text):
+                self.scan_result = subprocess.CompletedProcess([], code, text, '')
+                with self.assertRaises(ValueError):
+                    access.known_host(self.host, 22, allow_trust=True)
+                self.prompt.assert_not_called()
+                self.assertFalse(self.path.parent.exists())
+
+    def test_scan_timeout_stops_without_trust(self):
+        self.run.side_effect = subprocess.TimeoutExpired('ssh-keyscan', 60)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            access.known_host(self.host, 22, allow_trust=True)
+        self.prompt.assert_not_called()
+        self.assertFalse(self.path.parent.exists())
+
+    def test_invalid_fingerprint_stops_without_trust(self):
+        original_side_effect = self.run.side_effect
+
+        def run(command, **kwargs):
+            if '-l' in command:
+                return subprocess.CompletedProcess(command, 0, '256 MD5:unexpected', '')
+            return original_side_effect(command, **kwargs)
+
+        self.run.side_effect = run
+        with self.assertRaisesRegex(ValueError, 'Invalid SSH fingerprint'):
+            access.known_host(self.host, 22, allow_trust=True)
+        self.prompt.assert_not_called()
+        self.assertFalse(self.path.parent.exists())
+
+    def test_nondefault_port_preserves_other_entries(self):
+        self.write_trust('other.example.test')
+        before = self.path.read_text().rstrip('\n')
+        self.path.write_text(before)
+        access.known_host(self.host, 2222, allow_trust=True)
+        self.assertEqual(self.path.read_text(), before + f'\n[{self.host}]:2222 ssh-ed25519 {self.BLOB}\n')
+        scan = next(call for call in self.run.call_args_list if call.args[0][0] == 'ssh-keyscan')
+        self.assertEqual(scan.args[0], ['ssh-keyscan', '-T', '15', '-p', '2222', '-t', 'ed25519,ecdsa,rsa', self.host])
+        self.run.reset_mock()
+        access.known_host(self.host, 2222, allow_trust=True)
+        self.assertEqual(self.run.call_count, 1)
+
+    def test_first_trust_requires_tty_and_verify_never_offers_trust(self):
+        with patch.object(access.sys.stdin, 'isatty', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'interactive terminal'):
+                access.known_host(self.host, 22, allow_trust=True)
+        with self.assertRaisesRegex(ValueError, 'not trusted'):
+            access.known_host(self.host, 22)
+        self.run.assert_not_called()
+        self.prompt.assert_not_called()
+        self.assertFalse(self.path.parent.exists())
+
+
 if __name__ == '__main__':
     unittest.main()

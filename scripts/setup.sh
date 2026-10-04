@@ -12,7 +12,7 @@ cd "$project_dir"
 mode=${1:-setup}
 case "$mode" in setup|deps) ;; *) fail 'use setup or deps.' ;; esac
 
-for tool in sh make curl tar gzip sha256sum uname mkdir mktemp chmod mv rm head ssh ssh-keygen scp sftp; do
+for tool in sh make curl tar gzip sha256sum uname mkdir mktemp chmod mv rm head ssh ssh-keygen ssh-keyscan scp sftp; do
     command -v "$tool" >/dev/null 2>&1 || fail "missing $tool; install this system prerequisite and retry."
 done
 umask 077

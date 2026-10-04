@@ -114,7 +114,7 @@ def prepare_key(path):
 
 
 def prerequisites(mode):
-    for tool in ('ssh', 'ssh-keygen', 'sftp', 'scp'):
+    for tool in ('ssh', 'ssh-keygen', 'sftp', 'scp', *(['ssh-keyscan'] if mode == 'bootstrap' else [])):
         require(shutil.which(tool), f'Missing {tool}. Install the documented controller prerequisite.')
     if mode == 'bootstrap':
         require(importlib.util.find_spec('paramiko') is not None, 'Missing local Paramiko. Run make setup or make deps.')
@@ -123,12 +123,73 @@ def prerequisites(mode):
             'Missing ansible.posix collection. Run make deps.')
 
 
-def known_host(host, port):
+def known_host(host, port, allow_trust=False):
+    """First-use trust is explicit and precedes passwords, key generation and provisioning."""
     name = host if port == 22 else f'[{host}]:{port}'
-    result = subprocess.run(['ssh-keygen', '-F', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    require(result.returncode == 0,
-            'Host not found in ~/.ssh/known_hosts. First use OpenSSH to verify its fingerprint '
-            'against the provider console and accept it. Never disable host-key checking.')
+    path = Path.home() / '.ssh/known_hosts'
+
+    def trusted():
+        if not path.exists():
+            return False
+        result = subprocess.run(['ssh-keygen', '-F', name, '-f', str(path)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        require(result.returncode in (0, 1), 'Cannot inspect known_hosts; stopping without changing trust.')
+        return result.returncode == 0
+
+    if trusted():
+        return
+    require(allow_trust, 'Host is not trusted. Run make bootstrap for interactive first-use trust.')
+    require(sys.stdin.isatty(), 'First-use trust requires an interactive terminal.')
+    scan = subprocess.run(['ssh-keyscan', '-T', '15', '-p', str(port), '-t', 'ed25519,ecdsa,rsa', host],
+                          capture_output=True, text=True, timeout=60)
+    require(scan.returncode == 0, 'SSH host-key retrieval failed; no trust was saved.')
+    keys = {}
+    for line in scan.stdout.splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        fields = line.split()
+        require(len(fields) == 3 and fields[1] in (
+            'ssh-ed25519', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'ssh-rsa')
+            and re.fullmatch(r'[A-Za-z0-9+/]+={0,2}', fields[2]),
+            'Invalid SSH host-key response; no trust was saved.')
+        kind, blob = fields[1:]
+        require(kind not in keys or keys[kind] == blob, 'Conflicting SSH host keys; no trust was saved.')
+        keys[kind] = blob
+    require(keys, 'No SSH host key was retrieved; no trust was saved.')
+    # Trust just one displayed key; prefer Ed25519 over ECDSA and RSA.
+    kind = next(kind for kind in ('ssh-ed25519', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384',
+                                 'ecdsa-sha2-nistp521', 'ssh-rsa') if kind in keys)
+    entry = f'{name} {kind} {keys[kind]}\n'
+    fingerprint = subprocess.run(['ssh-keygen', '-l', '-E', 'sha256', '-f', '-'],
+                                 input=entry, capture_output=True, text=True)
+    require(fingerprint.returncode == 0, 'SSH fingerprint calculation failed; no trust was saved.')
+    fields = fingerprint.stdout.split()
+    require(len(fields) >= 2 and re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', fields[1]),
+            'Invalid SSH fingerprint; no trust was saved.')
+    print(f'FIRST TRUST: host={host} port={port} key={kind} fingerprint={fields[1]}', flush=True)
+    print('This host is not yet trusted. Compare this fingerprint with the VPS provider panel/console.\n'
+          'The network response alone does not prove the server identity.', flush=True)
+    try:
+        answer = input('Trust this host? [y/N] ')
+    except EOFError:
+        answer = ''
+    require(answer.strip().lower() in ('y', 'yes'), 'Host trust declined; bootstrap stopped.')
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'a+b') as target:
+        fcntl.flock(target, fcntl.LOCK_EX)
+        # A concurrent run may have accepted a key while this prompt was open.
+        # Preserve that trust and let strict checking detect any mismatch.
+        if not trusted():
+            target.seek(0, os.SEEK_END)
+            size = target.tell()
+            if size:
+                target.seek(size - 1)
+                if target.read(1) != b'\n':
+                    target.write(b'\n')
+            target.write(entry.encode('ascii'))
+            target.flush()
+    print('Host key saved to ~/.ssh/known_hosts. Strict host-key checking remains enabled.', flush=True)
 
 
 def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=False):
@@ -150,7 +211,7 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
 def live(mode, inventory, key):
     prerequisites(mode)
     alias, host, port, user, interpreter = load_host(inventory)
-    known_host(host, port)
+    known_host(host, port, allow_trust=mode == 'bootstrap')
     if mode == 'bootstrap':
         require(sys.stdin.isatty(), 'Bootstrap requires an interactive terminal for the Ansible password prompt.')
         print('LIVE / MUTATING: creates ansible and approves unrestricted NOPASSWD sudo.', flush=True)
@@ -198,7 +259,7 @@ def main():
     except ValueError as error:
         print(f'Error: {error}', file=sys.stderr)
         return 1
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         print('A local prerequisite, SSH or Ansible stage failed; stopping. Keep recovery access.', file=sys.stderr)
         return 1
     return 0

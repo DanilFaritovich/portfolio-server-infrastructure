@@ -32,7 +32,7 @@ class SetupTests(unittest.TestCase):
                         FIXTURE_ROOT=str(self.root), FIXTURE_PYTHON=sys.executable)
         for name in ('sh', 'make', 'tar', 'gzip', 'mkdir', 'mktemp', 'chmod', 'mv', 'rm', 'head', 'cp', 'cat'):
             (self.bin / name).symlink_to(shutil.which(name))
-        for name in ('ssh', 'ssh-keygen', 'scp', 'sftp'):
+        for name in ('ssh', 'ssh-keygen', 'ssh-keyscan', 'scp', 'sftp'):
             self.executable(self.bin / name, 'exit 99')
         self.executable(self.bin / 'uname', 'case "$1" in -s) echo Linux ;; -m) echo "${FIXTURE_ARCH:-x86_64}" ;; esac')
         self.executable(self.bin / 'sha256sum', '''cat >/dev/null
