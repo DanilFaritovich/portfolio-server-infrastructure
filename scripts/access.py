@@ -18,6 +18,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KEY = Path.home() / '.ssh/portfolio-server-infrastructure/ansible_ed25519'
+PASSWORD_CONNECTION = 'portfolio_password'
 HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'ansible_python_interpreter'}
 SSH_BASE = '-o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=15'
 
@@ -209,11 +210,9 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
     if ask_become:
         command.append('--ask-become-pass')
     environment = os.environ.copy()
-    if variables.get('ansible_connection') == 'ansible.builtin.paramiko_ssh':
-        # These plugin options have no variable equivalents in pinned ansible-core.
-        environment.update(ANSIBLE_PARAMIKO_LOOK_FOR_KEYS='False',
-                           ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD='False',
-                           ANSIBLE_PARAMIKO_RECORD_HOST_KEYS='False')
+    for name in ('ANSIBLE_PARAMIKO_LOOK_FOR_KEYS', 'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD',
+                 'ANSIBLE_PARAMIKO_RECORD_HOST_KEYS'):
+        environment.pop(name, None)
     # Contains only connection settings and paths, never passwords/key contents.
     # NamedTemporaryFile uses 0600 and removes this overlay after the child exits.
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', prefix='bootstrap-inventory-') as inventory:
@@ -240,7 +239,7 @@ def live(mode, inventory, key):
     if mode == 'bootstrap':
         run_playbook(inventory, alias, variables | {
             'ansible_user': user,
-            'ansible_connection': 'ansible.builtin.paramiko_ssh',
+            'ansible_connection': PASSWORD_CONNECTION,
             'ansible_paramiko_host_key_checking': True,
             'ansible_paramiko_private_key_file': '', 'ansible_paramiko_proxy_command': '',
             'ansible_paramiko_timeout': 15,

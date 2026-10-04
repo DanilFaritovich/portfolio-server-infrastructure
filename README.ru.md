@@ -106,13 +106,20 @@ Generated keys создаются **без passphrase** для unattended provis
 роли остаётся `false`. Отдельный `/etc/sudoers.d/ansible` принадлежит root,
 имеет `0440` и проверяется через `visudo -cf`. Login password для `ansible` не задаётся.
 
-Initial root connection использует `ansible.builtin.paramiko_ssh` из pinned
+Initial root connection использует локальный адаптер `portfolio_password` поверх
+`ansible.builtin.paramiko_ssh` из pinned
 Ansible Core **2.18.6** с project-local Paramiko **5.0.0**. Штатный Ansible
 `--ask-pass` интерактивно запрашивает пароль и держит его в памяти процесса;
 wrapper не читает и не сохраняет пароль. Он не передаётся через command arguments,
 environment variables или файлы и не сохраняется в inventory, `.env`,
 конфигурации или shell history. Используйте обычный интерактивный терминал;
 не записывайте секретный ввод и не передавайте пароль shell-командами.
+
+Адаптер переиспользует встроенную SSH-реализацию и задаёт `look_for_keys=False`,
+`host_key_auto_add=False` и `record_host_keys=False` через plugin API
+`set_options(direct=...)`. В Core 2.18.6 первые две опции не имеют variable bindings;
+их environment/INI bindings также задают deprecated globals. Эти environment
+settings удаляются из дочерних процессов; deprecation warnings остаются включены.
 
 Initial bootstrap отключает SSH agent authentication и поиск private keys,
 проверяет подтверждённую запись `known_hosts`; автоматическое добавление host keys

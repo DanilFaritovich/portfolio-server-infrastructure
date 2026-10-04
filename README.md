@@ -106,13 +106,21 @@ Running `make bootstrap` deliberately approves that policy; the role's default
 consent remains `false`. A dedicated root-owned `/etc/sudoers.d/ansible` file uses
 `0440` and is validated with `visudo -cf`. No login password is set for `ansible`.
 
-The initial root connection uses `ansible.builtin.paramiko_ssh` from pinned
+The initial root connection uses the local `portfolio_password` adapter around
+`ansible.builtin.paramiko_ssh` from pinned
 Ansible Core **2.18.6**, with project-local Paramiko **5.0.0**. Ansible's native
 `--ask-pass` prompts interactively and keeps the password in process memory;
 our wrapper never reads or stores it. It is not passed in command arguments,
 environment variables or files, and is never saved in inventory, `.env`,
 configuration or shell history. Use a normal interactive terminal; do not record
 secret input or supply passwords through shell commands.
+
+The adapter reuses the builtin SSH implementation and sets `look_for_keys=False`,
+`host_key_auto_add=False` and `record_host_keys=False` through the plugin's
+`set_options(direct=...)` API. Core 2.18.6 exposes no variable bindings for the
+first two options; their environment/INI bindings also configure deprecated
+globals. Those environment settings are removed from child processes, and
+deprecation warnings remain enabled.
 
 Initial bootstrap disables SSH agent authentication and private-key lookup and
 checks the verified `known_hosts` entry; automatic host-key addition is disabled.

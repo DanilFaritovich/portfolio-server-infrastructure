@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from ansible import constants as ansible_constants
 from ansible.errors import AnsibleConnectionFailure
 from ansible.playbook.play_context import PlayContext
 from ansible.plugins.loader import connection_loader, init_plugin_loader
@@ -123,7 +124,7 @@ class AccessTests(unittest.TestCase):
             access.live('bootstrap', self.inventory, self.key)
             initial, verify = run.call_args_list
             self.assertEqual(initial.args[2]['ansible_user'], 'root')
-            self.assertEqual(initial.args[2]['ansible_connection'], 'ansible.builtin.paramiko_ssh')
+            self.assertEqual(initial.args[2]['ansible_connection'], access.PASSWORD_CONNECTION)
             self.assertTrue(initial.args[2]['ansible_paramiko_host_key_checking'])
             self.assertEqual(initial.args[2]['ansible_paramiko_private_key_file'], '')
             self.assertTrue(initial.kwargs['ask_pass'])
@@ -164,7 +165,9 @@ class AccessTests(unittest.TestCase):
 
         with patch.object(access, 'prerequisites'), patch.object(access, 'known_host'), \
                 patch.object(access, 'prepare_key') as prepare, patch.object(access.sys.stdin, 'isatty', return_value=True), \
-                patch.dict(os.environ, {'FIXTURE_MARKER': 'unchanged'}, clear=True), \
+                patch.dict(os.environ, {'FIXTURE_MARKER': 'unchanged',
+                                        'ANSIBLE_PARAMIKO_LOOK_FOR_KEYS': 'True',
+                                        'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD': 'True'}, clear=True), \
                 patch.object(access.subprocess, 'run', side_effect=capture) as run:
             access.live('bootstrap', self.inventory, self.key)
             prepare.assert_called_once_with(self.key)
@@ -179,15 +182,15 @@ class AccessTests(unittest.TestCase):
                                      if name != 'bootstrap_user_allow_passwordless_sudo'))
                 self.assertNotIn('shell', call.kwargs)
                 self.assertNotIn('input', call.kwargs)
-            self.assertEqual(initial.kwargs['env'], {
-                'FIXTURE_MARKER': 'unchanged', 'ANSIBLE_PARAMIKO_LOOK_FOR_KEYS': 'False',
-                'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD': 'False', 'ANSIBLE_PARAMIKO_RECORD_HOST_KEYS': 'False',
-            })
+            self.assertEqual(initial.kwargs['env'], {'FIXTURE_MARKER': 'unchanged'})
             self.assertEqual(verify.kwargs['env'], {'FIXTURE_MARKER': 'unchanged'})
-            self.assertEqual(dict(os.environ), {'FIXTURE_MARKER': 'unchanged'})
+            self.assertEqual(dict(os.environ), {
+                'FIXTURE_MARKER': 'unchanged', 'ANSIBLE_PARAMIKO_LOOK_FOR_KEYS': 'True',
+                'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD': 'True',
+            })
             initial_host = overlays[0]['all']['hosts']['portfolio']
             verify_host = overlays[1]['all']['hosts']['portfolio']
-            self.assertEqual(initial_host['ansible_connection'], 'ansible.builtin.paramiko_ssh')
+            self.assertEqual(initial_host['ansible_connection'], access.PASSWORD_CONNECTION)
             self.assertEqual(initial_host['ansible_user'], 'root')
             self.assertEqual(verify_host['ansible_connection'], 'ssh')
             self.assertEqual(verify_host['ansible_user'], 'ansible')
@@ -228,7 +231,7 @@ class AccessTests(unittest.TestCase):
             results.append(result)
 
         variables = {
-            'ansible_connection': 'ansible.builtin.paramiko_ssh', 'ansible_user': 'root',
+            'ansible_connection': access.PASSWORD_CONNECTION, 'ansible_user': 'root',
             'ansible_paramiko_host_key_checking': True,
             'bootstrap_user_name': 'ansible', 'bootstrap_user_public_key_path': str(public),
             'bootstrap_user_allow_passwordless_sudo': True,
@@ -249,6 +252,8 @@ class AccessTests(unittest.TestCase):
                 self.assertIn('ESTABLISH LOCAL CONNECTION', output)
                 self.assertNotIn('ESTABLISH PARAMIKO SSH CONNECTION', output)
                 self.assertNotIn('Network is forbidden', output)
+                self.assertNotIn('PARAMIKO_HOST_KEY_AUTO_ADD', output)
+                self.assertNotIn('PARAMIKO_LOOK_FOR_KEYS', output)
                 self.assertNotIn('Create the managed automation user', output)
                 if state == 'regular':
                     self.assertEqual(result.returncode, 0, output)
@@ -260,15 +265,22 @@ class AccessTests(unittest.TestCase):
     def test_pinned_paramiko_plugin_password_and_host_key_behavior(self):
         # Simulate Ansible's in-memory prompt result; never use a real credential or network.
         init_plugin_loader()
-        with patch.dict(os.environ, {'ANSIBLE_PARAMIKO_LOOK_FOR_KEYS': 'False',
-                                     'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD': 'False'}, clear=True), \
+        connection_loader.add_directory(str(access.ROOT / 'plugins/connection'))
+        with patch.dict(os.environ, {}, clear=True), \
                 patch.object(paramiko, 'SSHClient') as client:
-            connection = connection_loader.get('ansible.builtin.paramiko_ssh', PlayContext(), io.StringIO())
+            connection = connection_loader.get(access.PASSWORD_CONNECTION, PlayContext(), io.StringIO())
             connection.set_options(var_options={
                 'ansible_host': 'fixture.example.test', 'ansible_port': 2222, 'ansible_user': 'root',
                 'ansible_password': 'synthetic prompt result', 'ansible_paramiko_private_key_file': '',
                 'ansible_paramiko_host_key_checking': True, 'ansible_paramiko_proxy_command': '',
             })
+            self.assertFalse(connection.get_option('look_for_keys'))
+            self.assertFalse(connection.get_option('host_key_auto_add'))
+            self.assertFalse(connection.get_option('record_host_keys'))
+            self.assertEqual(connection.transport, 'paramiko')
+            self.assertTrue(ansible_constants.DEPRECATION_WARNINGS)
+            self.assertFalse(any(name in ('PARAMIKO_HOST_KEY_AUTO_ADD', 'PARAMIKO_LOOK_FOR_KEYS')
+                                 for name, _ in ansible_constants.config.DEPRECATED))
             connection._connect_uncached()
             arguments = client.return_value.connect.call_args.kwargs
             self.assertEqual(arguments['password'], 'synthetic prompt result')
