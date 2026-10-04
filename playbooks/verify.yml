@@ -1,0 +1,20 @@
+---
+- name: Verify managed automation access without changing host configuration
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Verify Ansible connectivity
+      ansible.builtin.ping:
+
+    - name: Verify the SSH login identity
+      ansible.builtin.command: id -un
+      changed_when: false
+      register: verify_login
+      failed_when: verify_login.rc != 0 or verify_login.stdout != 'ansible'
+
+    - name: Verify non-interactive sudo reaches root
+      ansible.builtin.command: sudo -n id -u
+      changed_when: false
+      register: verify_root
+      failed_when: verify_root.rc != 0 or verify_root.stdout != '0'

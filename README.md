@@ -2,52 +2,157 @@
 
 [Русский](README.ru.md)
 
-Ansible infrastructure for a personal Ubuntu VPS. The first stage prepares a
-managed `ansible` user through an existing administrative SSH account, adds a
-controller-provided public key, and installs an explicitly approved passwordless
-sudo policy. It stops there. Offline validation has passed; live execution and
-independent verification of the new account have not been performed.
+Host provisioning through Ansible for an Ubuntu VPS. This stage creates only the
+`ansible` automation account, installs its public key and a sudo policy, verifies
+new access, then **STOP**. Docker, Compose, networks, firewall, SSH hardening,
+Caddy and application deployment are outside this PR's scope.
 
-## Scope and prerequisites
+## Quick Start
 
-The developer controller needs Linux x86_64 or arm64, Make, a POSIX shell, curl,
-tar (with gzip support), and coreutils (including sha256sum). Python 3.12 must
-be available as `python3.12`, with venv and pip support. For the project-local
-Python preparation below, you also need uv available on PATH. Go is not required.
-Python tools and `ansible.posix` are pinned in `requirements-dev.txt` and
-`requirements.yml`; actionlint v1.7.7 and its archive SHA256 checksums are pinned
-in `scripts/install-actionlint.sh`. Dependency setup downloads packages and a
-prebuilt release from GitHub. Checks are offline after setup.
+Use a Linux controller with Make, Python 3.12 (`python3.12`, venv and pip),
+OpenSSH clients (`ssh`, `ssh-keygen`, `scp`, `sftp`), **sshpass**, curl, tar/gzip
+and coreutils. Install missing controller prerequisites yourself; for example,
+on Ubuntu `sudo apt install sshpass`. No target installs system packages silently.
+The VPS must already allow root SSH password login and have `/usr/bin/python3`,
+`/bin/bash`, sudo, `/usr/sbin/visudo` and an active `/etc/sudoers.d` include.
 
-Before bootstrap, independently confirm the existing host, SSH port, authorized
-administrator, host fingerprint and recovery console. The target must already
-have `/usr/bin/python3`, `/bin/bash`, sudo, `/usr/sbin/visudo`, and an active sudoers
-include for `/etc/sudoers.d`. The current administrator must be able to become
-root. This stage does not install those prerequisites or change SSH settings.
+```bash
+git clone https://github.com/DanilFaritovich/portfolio-server-infrastructure.git
+cd portfolio-server-infrastructure
+make setup
 
-The default managed account is `ansible`, with home `/home/ansible` and shell
-`/bin/bash`. Username can be overridden; its home must be `/home/<username>`.
-Do not select an existing unrelated account or the current bootstrap login.
-No account password is provisioned, and existing supplementary groups and
-unrelated authorized keys are preserved. Home and SSH file ownership/modes are
-managed explicitly. The new account is intended for public-key authentication.
+# Edit inventories/production.yml: ansible_host and ansible_port.
+# Before live execution, complete the fingerprint/recovery preparation below.
+make check
+make bootstrap
+# Ansible requests the root SSH password interactively.
+make verify
+```
 
-`bootstrap_user_allow_passwordless_sudo` defaults to `false`. Bootstrap fails
-before account changes unless the operator explicitly sets it to boolean `true`.
-This selects unrestricted `NOPASSWD: ALL`, which is root-equivalent. A dedicated
-root-owned `0440` sudoers fragment is validated with `visudo -cf` before activation.
-Review this policy before opting in.
+`make setup` downloads pinned project-local dependencies and copies the example
+inventory **only if production.yml does not exist**. Existing inventory is never
+read or overwritten by setup. `make deps` installs dependencies without creating
+inventory. Edit only the hostname/address and existing SSH port for the standard
+path; `ansible_user` defaults to `root`. Keep the one-host `bootstrap` structure
+and never store passwords or key bytes in inventory.
 
-Only an absolute path to a readable regular `.pub` file is accepted. Symlinks are
-rejected. The file is read on the controller and must contain one OpenSSH RSA,
-Ed25519, or NIST ECDSA public key. Key tasks suppress key material from output.
-Private keys are never read or copied by the playbook. Keep real inventories,
-public/private key material, credentials and logs out of Git.
+**Before the first live bootstrap:** independently verify host, port and host-key
+fingerprint through the provider console; keep recovery console access and a
+working administrative session available. Open SSH once to accept the verified
+fingerprint into the controller's `~/.ssh/known_hosts` (this is **LIVE**):
 
-## Local setup and offline validation
+```bash
+ssh -p <verified-port> root@<verified-host>
+```
 
-Run from the repository root. Keep the existing local Python 3.12 / `.venv`
-approach. If Python 3.12 is not already available, prepare it locally with uv:
+Compare the displayed fingerprint before accepting it. Bootstrap requires that
+known-host entry; it never uses unchecked `ssh-keyscan` output or disables
+host-key checking. Unknown/changed keys stop the workflow. Confirm the VPS
+prerequisites and sudoers include before proceeding. Do not select an unrelated
+existing account as the managed `ansible` account.
+
+## Access and security
+
+The standard path is **root + interactive SSH password → ansible + dedicated
+SSH key + NOPASSWD sudo**. Root is used only for initial bootstrap. Subsequent
+provisioning must use `ansible`; `make verify` explicitly overrides the initial
+inventory login with `ansible` and never uses a root password.
+
+`make bootstrap` creates an Ed25519 key locally if neither member of the pair
+exists:
+
+```text
+~/.ssh/portfolio-server-infrastructure/ansible_ed25519
+~/.ssh/portfolio-server-infrastructure/ansible_ed25519.pub
+```
+
+The directory is protected with `0700`, and the private key with `0600` or
+stricter permissions. Existing keys are never overwritten. An incomplete pair,
+symlinks, unsafe permissions or a key path inside this repository cause failure.
+The wrapper only inspects private-key metadata; the private key remains on the
+controller and is used only by its SSH client. The bootstrap role receives only
+the public-key path, reads that public key locally and adds it to
+`/home/ansible/.ssh/authorized_keys`, preserving unrelated authorized keys.
+Keep all SSH keys, real inventories, credentials and logs out of Git.
+
+Generated keys have **no passphrase** for unattended provisioning. Possession of
+this private automation key, together with unrestricted `NOPASSWD: ALL`, grants
+**root-equivalent access to the VPS**. Protect the controller and key backups.
+Running `make bootstrap` deliberately approves that policy; the role's default
+consent remains `false`. A dedicated root-owned `/etc/sudoers.d/ansible` file uses
+`0440` and is validated with `visudo -cf`. No login password is set for `ansible`.
+
+The password prompt is Ansible's native `--ask-pass`, using OpenSSH and sshpass
+with the pinned Ansible version. The password is held in process memory and
+passed internally over a pipe; our wrapper never handles it. It is not passed in
+command arguments, environment variables or files, and is never saved in
+inventory, `.env`, configuration or shell history. Use a normal interactive
+terminal; do not record secret input or supply passwords through shell commands.
+See [Ansible SSH transport documentation](https://docs.ansible.com/projects/ansible-core/2.18/collections/ansible/builtin/ssh_connection.html).
+
+## Commands and boundaries
+
+| Target | Purpose | Host access |
+| --- | --- | --- |
+| `make setup` | Install local dependencies; create missing local inventory | Dependency registries only |
+| `make deps` | Install pinned local tooling/collections | Dependency registries only |
+| `make bootstrap` | Create/reuse dedicated key, bootstrap account, then verify | **LIVE / MUTATING** |
+| `make verify` | Verify existing key-only ansible access | **LIVE / verification**, no managed configuration changes |
+| `make check` | YAML/Ansible lint, syntax, actionlint, wrapper tests | **OFFLINE** |
+| `make ci` | Same offline checks as `make check` | **OFFLINE** |
+
+Bootstrap validates prerequisites, the local inventory, host/port and known-host
+entry before generating a key or requesting the initial password. It runs the
+existing bootstrap role with explicit sudo consent, then opens independent
+key-only SSH connections as `ansible`. Verification checks Ansible ping,
+`id -un == ansible` and `sudo -n id -u == 0`; every failed stage returns an error.
+SSH connection sharing with the initial login is disabled. No further host
+provisioning follows verification.
+
+`make verify` uses the same verification playbook without running the bootstrap
+role or creating a key. Password authentication and prompts are disabled. Its
+purpose is read-only: Ansible may create and remove transient module files, but
+it does not change account or host configuration. Keep fallback access if it
+fails. A successful bootstrap recap alone is insufficient proof of the handoff.
+
+Checks always use `inventories/production.example.yml`, never production
+inventory, keys, passwords or VPS connections. Wrapper tests use temporary
+synthetic fixtures and mocked processes, including mocked key generation.
+GitHub Actions downloads dependencies and runs only `make ci`, with no production
+credentials. Offline success does not prove live access or runtime idempotency.
+No safe automatic formatter (`make fix`) is configured. For targeted diagnosis:
+`make lint-yaml`, `make lint-ansible`, `make syntax-check`, `make lint-workflows`,
+`make test-access`. Configure `offline-validation` as a required branch-protection
+check separately.
+
+## Overrides and troubleshooting
+
+Make accepts a local inventory path and an absolute private-key path outside the
+repository. Use the same overrides for both live targets:
+
+```bash
+make bootstrap INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
+make verify INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
+```
+
+The sibling `.pub` must exist for an existing key. Use a dedicated unencrypted
+key for this wrapper; encrypted existing keys cannot authenticate in its
+non-interactive verification. Existing key-directory permissions must already
+be `0700` or stricter; repair unsafe local permissions deliberately. A missing
+pair is generated, but a partial pair is never repaired or replaced automatically.
+
+An existing administrator can replace `ansible_user: root` in inventory without
+changing the role. It must support SSH password login and sudo; bootstrap then
+also requests its sudo password through native `--ask-become-pass`. The managed
+user for these Make targets remains `ansible`. Inventory supports only one host
+and the example's host, port, initial user and Python-interpreter fields;
+credentials and extra runtime variables are rejected.
+
+Dependency tooling remains in ignored `.venv`, `.ansible` and `.tools` directories:
+Python/Ansible versions and `ansible.posix` are pinned in the requirements files;
+actionlint's version and archive checksums are pinned in its installer. Linux
+x86_64 and arm64 are supported; Go is not required. If Python 3.12 is unavailable,
+prepare a local runtime with uv (optional):
 
 ```bash
 export UV_PYTHON_INSTALL_DIR="$PWD/.tools/python"
@@ -55,165 +160,15 @@ export UV_CACHE_DIR="$PWD/.cache/uv"
 uv python install 3.12 --no-bin
 mkdir -p .tools/runtime-bin
 ln -sf "$(uv python find --managed-python 3.12)" .tools/runtime-bin/python3.12
-```
-
-For each new terminal using this local runtime, expose it and keep pip's cache
-inside the project:
-
-```bash
 export PATH="$PWD/.tools/runtime-bin:$PATH"
 export PIP_CACHE_DIR="$PWD/.cache/pip"
+make setup
 ```
 
-The Python runtime lives under `.tools/python`, with a `python3.12` symlink in
-`.tools/runtime-bin`. `make deps` creates `.venv` using `python3.12 -m venv`,
-installs the pinned Python/Ansible tools there, and installs collections into
-`.ansible/collections`. It downloads the pinned prebuilt actionlint binary for
-the controller architecture, verifies its SHA256 checksum, and installs it as
-`.tools/bin/actionlint`. No Go runtime or compilation is involved.
-
-`.tools`, `.venv`, `.cache` and `.ansible` are ignored project-local directories;
-they are not system installations. Neither setup nor checks install tools
-system-wide. Setup needs network access to dependency sources, but does not
-contact the VPS:
-
-```bash
-make deps
-```
-
-Run one aggregate offline check:
-
-```bash
-make check
-```
-
-`make check` and `make lint-workflows` use `.tools/bin/actionlint` directly;
-there is no need to add actionlint to PATH.
-
-`make ci` uses the same aggregate. For isolated diagnosis, use only the relevant
-target rather than repeating all checks:
-
-```bash
-make lint-yaml
-make lint-ansible
-make syntax-check
-make lint-workflows
-```
-
-Syntax checks and Ansible lint use the safe example inventory. They never execute
-tasks, load a real public key, or contact a managed host. There is no `make fix`
-or `make verify`: no safe automatic formatter or disposable integration test is
-configured. Lint/syntax success does not demonstrate runtime idempotency or access.
-
-GitHub Actions installs dependencies and runs `make ci` for PRs into `develop` and
-`main`, and pushes to those branches. CI uses no production inventory or secrets.
-Configure the `offline-validation` job as a required check in branch protection;
-repository settings are a separate manual step.
-
-## Manual first bootstrap
-
-Keep a working administrative SSH session open and recovery console available.
-Complete the offline checks first. The following local preparation does not
-connect to the VPS:
-
-```bash
-cp inventories/production.example.yml inventories/production.yml
-```
-
-Edit the ignored `inventories/production.yml`: replace the example host, initial
-`ansible_user`, existing SSH port and Python path if necessary. Keep the host alias
-`portfolio` for the commands below. Do not switch the inventory to user `ansible`
-before that account exists. Do not put passwords or actual key bytes in inventory.
-
-Set these controller-side variables to your actual, independently verified values;
-the sample strings are placeholders, not a server configuration:
-
-```bash
-export VPS_HOST='your-verified-host'
-export VPS_PORT='your-existing-port'
-export VPS_ADMIN='your-existing-admin'
-export BOOTSTRAP_PUBLIC_KEY='/absolute/path/to/automation_key.pub'
-export BOOTSTRAP_PRIVATE_KEY='/absolute/path/to/automation_key'
-```
-
-The private-key variable is used only by your SSH client during independent login
-verification. The playbook receives only `BOOTSTRAP_PUBLIC_KEY`. Administrative
-authentication can use your existing SSH config/agent; add `--private-key` with
-the existing administrator key if necessary. Unlock an encrypted key in your
-local agent yourself if needed.
-
-**LIVE: the next command connects to the VPS.** Verify the fingerprint through a
-trusted channel; do not disable host-key checking. Inspect the current sudo policy
-and Python availability, then retain this session as fallback:
-
-```bash
-ssh -p "$VPS_PORT" "$VPS_ADMIN@$VPS_HOST"
-# In that remote administrative session:
-command -v python3
-sudo -l
-sudo /usr/sbin/visudo -c
-```
-
-Confirm the sudoers include for `/etc/sudoers.d` through your administrative
-review before proceeding. This implementation checks prerequisite paths, but
-does not rewrite the main sudoers file or enable that include.
-
-**LIVE, MUTATING: from a separate controller terminal, bootstrap the account.**
-This is deliberate consent for unrestricted passwordless sudo:
-
-```bash
-.venv/bin/ansible-playbook -i inventories/production.yml playbooks/bootstrap.yml \
-  --limit portfolio --ask-become-pass \
-  -e "$(.venv/bin/python -c 'import json, os; print(json.dumps({"bootstrap_user_public_key_path": os.environ["BOOTSTRAP_PUBLIC_KEY"]}))')" \
-  -e '{"bootstrap_user_allow_passwordless_sudo": true}'
-```
-
-Omit `--ask-become-pass` if the existing administrator is root or already has
-passwordless sudo. The local Python snippet serializes only the public-key path
-as JSON, including paths containing spaces; it does not read any key file.
-Stop on any failure; do not disable validations or expand the task to hardening.
-
-There is no automatic live target in Make or CI. A production `--check` run also
-contacts the host and may fail on dependent key/file tasks if the user does not
-exist; it cannot verify a subsequent login. Do not treat it as offline validation
-or replace the independent handoff with its recap.
-
-## Independent access handoff and STOP
-
-**LIVE: from another controller terminal, verify new key-only access and sudo.**
-These commands force public-key authentication with the selected private key:
-
-```bash
-ssh -p "$VPS_PORT" -i "$BOOTSTRAP_PRIVATE_KEY" \
-  -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \
-  -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
-  "ansible@$VPS_HOST" 'id -un && sudo -n -l && sudo -n id -u'
-```
-
-Expect username `ansible`, the intended sudo policy, and final UID `0`; check
-all output and the command's exit status. A successful recap alone is insufficient.
-If login or sudo fails, retain the old administrative session and investigate
-that failure rather than hardening SSH.
-
-Optional **LIVE** Ansible verification after the SSH/sudo handoff uses the same
-host alias with explicit connection overrides. No account-changing role runs:
-
-```bash
-.venv/bin/ansible portfolio -i inventories/production.yml \
-  -u ansible --private-key "$BOOTSTRAP_PRIVATE_KEY" -e ansible_user=ansible \
-  -m ansible.builtin.ping
-.venv/bin/ansible portfolio -i inventories/production.yml \
-  -u ansible --private-key "$BOOTSTRAP_PRIVATE_KEY" -e ansible_user=ansible \
-  --become -m ansible.builtin.command -a 'id -u'
-```
-
-To assess idempotency, deliberately repeat the same **LIVE, MUTATING** bootstrap
-command through the original administrator; an already-correct host should show
-`changed=0`. This is a separate real execution, not an offline check.
-
-STOP after independent access/privilege verification. No Docker, proxy, firewall,
-SSH hardening, port change, root-login removal, password-authentication change or
-deployment is implemented or authorized by this stage. Keep fallback access.
+Expose that PATH again in later terminals. Do not use production `--check` as
+an offline test: it contacts the host and does not verify a newly created login.
+Deliberately repeating bootstrap to assess `changed=0` is another live, mutating
+operation, requiring separate authorization. This PR has performed no VPS access.
 
 ## License
 

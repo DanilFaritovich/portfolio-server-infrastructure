@@ -5,13 +5,7 @@ all:
       hosts:
         portfolio:
           ansible_host: vps.example.invalid
-          ansible_user: existing_admin
-          # Replace with the existing, verified SSH port before a live run.
-          ansible_port: 2222
+          # Set the existing SSH port; bootstrap does not change it.
+          ansible_port: 22
+          ansible_user: root
           ansible_python_interpreter: /usr/bin/python3
-      vars:
-        bootstrap_user_name: ansible
-        # Pass an absolute controller-side .pub path at execution time.
-        bootstrap_user_public_key_path: ""
-        # Explicit runtime consent is required for root-equivalent sudo.
-        bootstrap_user_allow_passwordless_sudo: false
