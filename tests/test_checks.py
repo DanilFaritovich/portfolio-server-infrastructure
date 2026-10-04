@@ -75,7 +75,8 @@ exit 17
                                 capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('WARNING fixture diagnostic', result.stderr)
-        self.assertIn('Error 17', result.stderr)
+        # Make translates the error label according to the caller's locale.
+        self.assertRegex(result.stderr, r'\b17\b')
 
 
 if __name__ == '__main__':
