@@ -38,7 +38,7 @@ Use for Infrastructure as Code that configures Linux hosts. This skill governs A
 
 Read a reference only when its subject is in scope:
 
-- [references/bootstrap.md](./references/bootstrap.md): initial controller access, managed administrator, sudo, and SSH public-key provisioning.
+- [references/bootstrap.md](./references/bootstrap.md): initial controller access, bootstrap project shape, managed administrator, controller-side SSH public-key provisioning, sudo, and the verification handoff before hardening.
 - [references/ssh-firewall.md](./references/ssh-firewall.md): SSH daemon/socket, access restrictions, firewall, and lockout prevention.
 - [references/docker-host.md](./references/docker-host.md): Docker Engine, Compose plugin, host networks, and permission boundaries.
 - [references/validation.md](./references/validation.md): Makefile/CI checks, live dry runs, structured failure diagnosis, and output limits.
