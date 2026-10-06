@@ -1,0 +1,225 @@
+---
+- name: Require a supported Ubuntu release and architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == 'Ubuntu'
+      - ansible_facts.distribution_release in docker_host_releases
+      - ansible_facts.architecture in docker_host_architectures
+      - ansible_facts.service_mgr == 'systemd'
+    fail_msg: Docker host requires supported Ubuntu with systemd; check the release and architecture allowlists.
+    quiet: true
+
+- name: Inspect installed packages before mutation
+  ansible.builtin.package_facts:
+    manager: apt
+
+- name: Refuse replacement of an existing conflicting runtime
+  ansible.builtin.assert:
+    that:
+      - docker_host_conflicting_packages | intersect(ansible_facts.packages.keys() | list) | length == 0
+    fail_msg: >-
+      Conflicting Docker/container runtime packages exist. Review their workloads,
+      configuration and data, then remove or migrate them manually before retrying.
+      This role never removes runtime packages or data automatically.
+    quiet: true
+
+- name: Inspect existing Docker configuration and custom service units
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+    get_mime: false
+  loop:
+    - /etc/docker/daemon.json
+    - /etc/apt/sources.list.d/docker.sources
+    - /etc/systemd/system/docker.service
+    - /etc/systemd/system/containerd.service
+    - /etc/apt/keyrings/docker.asc
+  register: docker_host_existing
+  become: true
+
+- name: Refuse symlinks and custom service units before mutation
+  ansible.builtin.assert:
+    that:
+      - not (docker_host_existing.results[0].stat.islnk | default(false))
+      - not (docker_host_existing.results[1].stat.islnk | default(false))
+      - not docker_host_existing.results[2].stat.exists
+      - not docker_host_existing.results[3].stat.exists
+      - not (docker_host_existing.results[4].stat.islnk | default(false))
+      - >-
+        not docker_host_existing.results[4].stat.exists or
+        docker_host_existing.results[4].stat.checksum | default('') == docker_host_key_checksum.split(':')[1]
+    fail_msg: Review existing symlinks, signing key or custom Docker/containerd units manually before provisioning.
+    quiet: true
+
+- name: Inspect service drop-ins and residual runtime data
+  ansible.builtin.find:
+    paths: "{{ item }}"
+    hidden: true
+    file_type: any
+  loop:
+    - /etc/systemd/system/docker.service.d
+    - /etc/systemd/system/containerd.service.d
+    - /var/lib/docker
+    - /var/lib/containerd
+  register: docker_host_custom
+  become: true
+
+- name: Require standard service configuration and no orphan runtime data
+  ansible.builtin.assert:
+    that:
+      - docker_host_custom.results[0].matched == 0
+      - docker_host_custom.results[1].matched == 0
+      - "'docker-ce' in ansible_facts.packages or docker_host_custom.results[2].matched == 0"
+      - "'containerd.io' in ansible_facts.packages or docker_host_custom.results[3].matched == 0"
+    fail_msg: Review service drop-ins or orphan runtime data manually; no existing configuration or data will be removed.
+    quiet: true
+
+- name: Read existing daemon configuration without displaying its contents
+  ansible.builtin.slurp:
+    src: /etc/docker/daemon.json
+  when: docker_host_existing.results[0].stat.exists
+  register: docker_host_existing_daemon
+  become: true
+  no_log: true
+
+- name: Compare existing daemon configuration privately
+  when: docker_host_existing.results[0].stat.exists
+  block:
+    - name: Compare daemon settings without displaying their contents
+      ansible.builtin.set_fact:
+        docker_host_daemon_matches: >-
+          {{ (docker_host_existing_daemon.content | b64decode | from_json) == docker_host_daemon_config }}
+      no_log: true
+  rescue:
+    - name: Reject an unreadable daemon configuration
+      ansible.builtin.fail:
+        msg: Existing daemon.json is invalid. Review it manually before provisioning.
+
+- name: Refuse an unmanaged daemon configuration
+  ansible.builtin.assert:
+    that: docker_host_daemon_matches | default(true)
+    fail_msg: Existing daemon.json differs from the minimal managed logging policy. Review and migrate it manually first.
+    quiet: true
+
+- name: Find APT source files before changing repository configuration
+  ansible.builtin.find:
+    paths: /etc/apt/sources.list.d
+    patterns: ['*.list', '*.sources']
+    file_type: any
+  register: docker_host_sources
+  become: true
+
+- name: Inspect the main APT sources file
+  ansible.builtin.stat:
+    path: /etc/apt/sources.list
+    get_checksum: false
+    get_mime: false
+  register: docker_host_main_source
+  become: true
+
+- name: Read APT source files without displaying their contents
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: >-
+    {{ (docker_host_sources.files | map(attribute='path') | list)
+       + (['/etc/apt/sources.list'] if docker_host_main_source.stat.exists else []) }}
+  register: docker_host_source_contents
+  become: true
+  no_log: true
+
+- name: Compare repository contents privately
+  ansible.builtin.set_fact:
+    docker_host_sources_match: >-
+      {{ (docker_host_sources_match | default(true)) and
+         ((item.item == '/etc/apt/sources.list.d/docker.sources'
+         and (item.content | b64decode) == lookup('ansible.builtin.template', 'docker.sources.j2'))
+         or (item.item != '/etc/apt/sources.list.d/docker.sources'
+         and 'download.docker.com' not in (item.content | b64decode))) }}
+  loop: "{{ docker_host_source_contents.results }}"
+  no_log: true
+
+- name: Refuse competing Docker repositories or an unmanaged target source
+  ansible.builtin.assert:
+    that: docker_host_sources_match | default(true)
+    fail_msg: Review existing Docker APT sources manually; this role will not overwrite or duplicate them.
+    quiet: true
+
+# All safety inspection above completes before the first managed-state change.
+- name: Install APT HTTPS certificate support if missing
+  ansible.builtin.apt:
+    name: ca-certificates
+    state: present
+    update_cache: "{{ 'ca-certificates' not in ansible_facts.packages }}"
+  become: true
+
+- name: Create the APT keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: Install the official Docker signing key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+    checksum: "{{ docker_host_key_checksum }}"
+  become: true
+  register: docker_host_key
+
+- name: Configure the official stable Docker APT repository
+  ansible.builtin.template:
+    src: docker.sources.j2
+    dest: /etc/apt/sources.list.d/docker.sources
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  register: docker_host_repository
+
+- name: Install Docker Engine and CLI plugins without upgrading present packages
+  ansible.builtin.apt:
+    name: "{{ docker_host_packages }}"
+    state: present
+    update_cache: >-
+      {{ docker_host_repository.changed or docker_host_key.changed
+         or (docker_host_packages | difference(ansible_facts.packages.keys() | list) | length > 0) }}
+  become: true
+
+- name: Create the Docker configuration directory
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+- name: Install validated bounded container logging configuration
+  ansible.builtin.copy:
+    content: "{{ docker_host_daemon_config | to_nice_json }}\n"
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/bin/dockerd --validate --config-file %s
+  become: true
+  notify: Restart Docker after validated configuration changes
+
+- name: Enable and start the container runtime services
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - containerd.service
+    - docker.service
+  become: true

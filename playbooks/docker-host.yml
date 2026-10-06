@@ -1,0 +1,21 @@
+---
+- name: Prepare a Docker-ready Ubuntu host using managed access
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Require managed OpenSSH access before host inspection
+      ansible.builtin.assert:
+        that:
+          - ansible_user == 'ansible'
+          - ansible_connection == 'ssh'
+          - ansible_private_key_file is defined
+          - ansible_host_key_checking | bool
+        fail_msg: Use make docker-host after make bootstrap-user and make verify-access.
+        quiet: true
+
+    - name: Gather minimal OS facts
+      ansible.builtin.setup:
+        gather_subset: ["!all", "!min", distribution, architecture, service_mgr]
+  roles:
+    - role: docker_host

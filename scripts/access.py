@@ -117,9 +117,9 @@ def prepare_key(path):
 
 
 def prerequisites(mode):
-    for tool in ('ssh', 'ssh-keygen', 'sftp', 'scp', *(['ssh-keyscan'] if mode == 'bootstrap' else [])):
+    for tool in ('ssh', 'ssh-keygen', 'sftp', 'scp', *(['ssh-keyscan'] if mode == 'bootstrap-user' else [])):
         require(shutil.which(tool), f'Missing {tool}. Install the documented controller prerequisite.')
-    if mode == 'bootstrap':
+    if mode == 'bootstrap-user':
         require(importlib.util.find_spec('paramiko') is not None, 'Missing local Paramiko. Run make setup or make deps.')
     require((ROOT / '.venv/bin/ansible-playbook').is_file(), 'Run make setup or make deps first.')
     require((ROOT / '.ansible/collections/ansible_collections/ansible/posix').is_dir(),
@@ -141,7 +141,7 @@ def known_host(host, port, allow_trust=False):
 
     if trusted():
         return
-    require(allow_trust, 'Host is not trusted. Run make bootstrap for interactive first-use trust.')
+    require(allow_trust, 'Host is not trusted. Run make bootstrap-user for interactive first-use trust.')
     require(sys.stdin.isatty(), 'First-use trust requires an interactive terminal.')
     scan = subprocess.run(['ssh-keyscan', '-T', '15', '-p', str(port), '-t', 'ed25519,ecdsa,rsa', host],
                           capture_output=True, text=True, timeout=60)
@@ -224,9 +224,14 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
 
 def live(mode, inventory, key):
     prerequisites(mode)
+    if mode in ('docker-host', 'verify-docker'):
+        try:
+            check_key(key)
+        except (ValueError, OSError):
+            raise ValueError('Managed access is not ready. Run make bootstrap-user first; check the dedicated key pair.') from None
     alias, host, port, user, _ = load_host(inventory)
-    known_host(host, port, allow_trust=mode == 'bootstrap')
-    if mode == 'bootstrap':
+    known_host(host, port, allow_trust=mode == 'bootstrap-user')
+    if mode == 'bootstrap-user':
         require(sys.stdin.isatty(), 'Bootstrap requires an interactive terminal for the Ansible password prompt.')
         print('LIVE / MUTATING: creates ansible and approves unrestricted NOPASSWD sudo.', flush=True)
         prepare_key(key)
@@ -236,7 +241,7 @@ def live(mode, inventory, key):
         'ansible_connection': 'ssh', 'ansible_host_key_checking': True,
         'ansible_ssh_args': SSH_BASE, 'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
     }
-    if mode == 'bootstrap':
+    if mode == 'bootstrap-user':
         run_playbook(inventory, alias, variables | {
             'ansible_user': user,
             'ansible_connection': PASSWORD_CONNECTION,
@@ -246,19 +251,26 @@ def live(mode, inventory, key):
             'bootstrap_user_name': 'ansible', 'bootstrap_user_public_key_path': str(key) + '.pub',
             'bootstrap_user_allow_passwordless_sudo': True,
         }, 'bootstrap.yml', ask_pass=True, ask_become=user != 'root')
-    print('LIVE / VERIFY: checking new key-only ansible access, ping and sudo -n.', flush=True)
-    run_playbook(inventory, alias, variables | {
+    print('LIVE / VERIFY: checking key-only ansible access, ping and sudo -n. Run make bootstrap-user first if access fails.', flush=True)
+    managed = variables | {
         'ansible_user': 'ansible', 'ansible_private_key_file': str(key), 'ansible_become': False,
         'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
                             ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
                             ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
-    }, 'verify.yml')
-    print('Verified ansible login and UID 0 via sudo -n. STOP.')
+    }
+    run_playbook(inventory, alias, managed, 'verify.yml')
+    if mode in ('docker-host', 'verify-docker'):
+        print('LIVE / MUTATING: Docker host provisioning.' if mode == 'docker-host' else
+              'LIVE / VERIFY: Docker checks and disposable runtime smoke test (image cache may change).', flush=True)
+        # Host-level ansible_become=False would override task-level become=True.
+        stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
+        run_playbook(inventory, alias, stage | {'ansible_become_flags': '-n'}, mode + '.yml')
+    print('Requested stage completed. STOP.')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['setup', 'bootstrap', 'verify'])
+    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=str(DEFAULT_KEY))
     args = parser.parse_args()

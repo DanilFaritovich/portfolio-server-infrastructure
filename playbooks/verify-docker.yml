@@ -1,0 +1,71 @@
+---
+- name: Verify Docker and run a disposable container using managed access
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Require managed OpenSSH access
+      ansible.builtin.assert:
+        that:
+          - ansible_user == 'ansible'
+          - ansible_connection == 'ssh'
+          - ansible_private_key_file is defined
+          - ansible_host_key_checking | bool
+        fail_msg: Use make verify-docker after make bootstrap-user and make docker-host.
+        quiet: true
+
+    - name: Verify Docker Engine and CLI plugins
+      ansible.builtin.command:
+        argv: "{{ item }}"
+      loop:
+        - [docker, version]
+        - [docker, info]
+        - [docker, compose, version]
+        - [docker, buildx, version]
+      become: true
+      changed_when: false
+
+    - name: Verify bounded logging is active
+      ansible.builtin.command:
+        argv: [docker, info, --format, "{{ '{{.LoggingDriver}}' }}"]
+      become: true
+      changed_when: false
+      register: verify_docker_logging
+      failed_when: verify_docker_logging.rc != 0 or verify_docker_logging.stdout != 'local'
+
+    - name: Verify runtime services are active and enabled
+      ansible.builtin.command:
+        argv: [systemctl, "{{ item.0 }}", "{{ item.1 }}"]
+      loop: "{{ ['is-active', 'is-enabled'] | product(['docker.service', 'containerd.service']) | list }}"
+      become: true
+      changed_when: false
+      register: verify_docker_service
+      failed_when: >-
+        verify_docker_service.rc != 0 or
+        verify_docker_service.stdout != ('active' if item.0 == 'is-active' else 'enabled')
+
+    # Keep the ID returned by Docker; cleanup also runs after a failed start.
+    - name: Run a disposable runtime smoke test
+      block:
+        - name: Create an isolated disposable container
+          ansible.builtin.command:
+            argv: [docker, create, --network, none, hello-world:latest]
+          become: true
+          register: verify_docker_container
+          changed_when: true
+
+        - name: Start and wait for the smoke container
+          ansible.builtin.command:
+            argv: [timeout, --kill-after=10s, 120s, docker, start, --attach, "{{ verify_docker_container.stdout | trim }}"]
+          become: true
+          changed_when: true
+
+      always:
+        - name: Remove the smoke container even if execution fails
+          ansible.builtin.command:
+            argv: [docker, rm, --force, "{{ verify_docker_container.stdout | trim }}"]
+          when:
+            - verify_docker_container is defined
+            - verify_docker_container.rc | default(1) == 0
+          become: true
+          changed_when: true
