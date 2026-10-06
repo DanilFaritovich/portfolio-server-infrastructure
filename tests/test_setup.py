@@ -113,7 +113,7 @@ exec "$FIXTURE_PYTHON" "$@"''')
         self.assertIn(f'pip install --python {self.root}/.venv/bin/python -r requirements-dev.txt', calls)
         self.assertIn('galaxy collection install -r collections.yml -p .ansible/collections', calls)
         self.assertRegex((self.root / 'requirements-dev.txt').read_text(), r'(?m)^paramiko==\d+\.\d+\.\d+$')
-        self.assertNotIn('bootstrap', calls)
+        self.assertNotIn('bootstrap-user', calls)
         self.assertFalse((self.root / '.ssh').exists())
         inventory = self.root / 'inventories/production.yml'
         inventory.write_text('existing operator configuration')

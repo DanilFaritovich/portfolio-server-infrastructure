@@ -60,7 +60,7 @@ class AccessTests(unittest.TestCase):
         with patch.object(access.shutil, 'which', side_effect=lambda name: None if name == 'sshpass' else '/fixture/' + name) as which, \
                 patch.object(access.Path, 'is_file', return_value=True), \
                 patch.object(access.Path, 'is_dir', return_value=True):
-            access.prerequisites('bootstrap')
+            access.prerequisites('bootstrap-user')
             self.assertNotIn('sshpass', [call.args[0] for call in which.call_args_list])
 
     def test_default_root_and_host_validation(self):
@@ -121,7 +121,7 @@ class AccessTests(unittest.TestCase):
         with patch.object(access, 'prerequisites'), patch.object(access, 'known_host'), \
                 patch.object(access, 'prepare_key'), patch.object(access.sys.stdin, 'isatty', return_value=True), \
                 patch.object(access, 'run_playbook') as run:
-            access.live('bootstrap', self.inventory, self.key)
+            access.live('bootstrap-user', self.inventory, self.key)
             initial, verify = run.call_args_list
             self.assertEqual(initial.args[2]['ansible_user'], 'root')
             self.assertEqual(initial.args[2]['ansible_connection'], access.PASSWORD_CONNECTION)
@@ -142,14 +142,14 @@ class AccessTests(unittest.TestCase):
             run.reset_mock()
             run.side_effect = subprocess.CalledProcessError(1, 'mocked')
             with self.assertRaises(subprocess.CalledProcessError):
-                access.live('bootstrap', self.inventory, self.key)
+                access.live('bootstrap-user', self.inventory, self.key)
             self.assertEqual(run.call_count, 1)
 
     def test_verify_never_creates_key_or_runs_role(self):
         self.pair()
         with patch.object(access, 'prerequisites'), patch.object(access, 'known_host'), \
                 patch.object(access, 'prepare_key') as prepare, patch.object(access, 'run_playbook') as run:
-            access.live('verify', self.inventory, self.key)
+            access.live('verify-access', self.inventory, self.key)
             prepare.assert_not_called()
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.args[3], 'verify.yml')
@@ -169,7 +169,7 @@ class AccessTests(unittest.TestCase):
                                         'ANSIBLE_PARAMIKO_LOOK_FOR_KEYS': 'True',
                                         'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD': 'True'}, clear=True), \
                 patch.object(access.subprocess, 'run', side_effect=capture) as run:
-            access.live('bootstrap', self.inventory, self.key)
+            access.live('bootstrap-user', self.inventory, self.key)
             prepare.assert_called_once_with(self.key)
             initial, verify = run.call_args_list
             self.assertIn('--ask-pass', initial.args[0])
@@ -361,7 +361,7 @@ class HostTrustTests(unittest.TestCase):
                 self.prompt.side_effect = answer if isinstance(answer, Exception) else None
                 self.prompt.return_value = answer
                 with self.assertRaisesRegex(ValueError, 'trust declined'):
-                    access.live('bootstrap', self.home / 'fixture.yml', self.home / 'automation')
+                    access.live('bootstrap-user', self.home / 'fixture.yml', self.home / 'automation')
                 key.assert_not_called()
                 playbook.assert_not_called()
                 self.assertFalse(self.path.parent.exists())
@@ -375,7 +375,7 @@ class HostTrustTests(unittest.TestCase):
                 patch.object(access, 'load_host', return_value=('portfolio', self.host, 22, 'root', '/usr/bin/python3')), \
                 patch.object(access, 'prepare_key', side_effect=prepare) as key, \
                 patch.object(access, 'run_playbook') as playbook:
-            access.live('bootstrap', self.home / 'fixture.yml', self.home / 'automation')
+            access.live('bootstrap-user', self.home / 'fixture.yml', self.home / 'automation')
             key.assert_called_once()
             self.assertEqual([call.args[3] for call in playbook.call_args_list], ['bootstrap.yml', 'verify.yml'])
 

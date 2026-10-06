@@ -2,10 +2,17 @@
 
 [Русский](README.ru.md)
 
-Host provisioning through Ansible for an Ubuntu VPS. This stage creates only the
-`ansible` automation account, installs its public key and a sudo policy, verifies
-new access, then **STOP**. Docker, Compose, networks, firewall, SSH hardening,
-Caddy and application deployment are outside this PR's scope.
+Host provisioning through Ansible for an Ubuntu VPS. The pipeline is:
+
+```text
+local setup -> bootstrap managed ansible user -> verify access
+-> provision Docker host -> verify Docker -> STOP
+```
+
+Docker Engine, Compose and Buildx are prepared for future workloads. Caddy,
+application networks/Compose files, Vue, domains/TLS, GHCR authentication,
+deployment/CD, firewall, SSH/root/password-login hardening, fail2ban and
+automatic upgrades belong to separate stages.
 
 ## Quick Start
 
@@ -24,9 +31,11 @@ make setup
 
 # Edit inventories/production.yml: ansible_host and ansible_port.
 # Have the provider fingerprint and recovery console available.
-make bootstrap
+make bootstrap-user
 # For a new host, confirm its fingerprint first; then Ansible prompts for the root password.
-make verify
+make verify-access
+make docker-host
+make verify-docker
 ```
 
 `make setup` verifies minimal system tools, installs checksum-verified pinned
@@ -49,7 +58,7 @@ the project `.venv/bin` first in PATH so Ansible subprocesses use the same toolc
 Edit only the hostname/address and existing SSH port for the standard path; `ansible_user` defaults to `root`. Keep the one-host `bootstrap` structure
 and never store passwords or key bytes in inventory.
 
-**First-use trust is handled inside `make bootstrap`.** Keep recovery console
+**First-use trust is handled inside `make bootstrap-user`.** Keep recovery console
 access and a working administrative session available. For an existing entry in
 `~/.ssh/known_hosts`, bootstrap uses the stored trust without rescanning or
 replacing it. Changed keys still fail strict checking.
@@ -65,7 +74,7 @@ before automation-key generation, password prompting or VPS configuration change
 No separate `ssh` command is needed just to populate `known_hosts`.
 
 Non-default ports use `[host]:port` entries. Retrieval/fingerprint failures and
-absence of an interactive TTY stop first trust. `make verify` never offers first
+absence of an interactive TTY stop first trust. `make verify-access` never offers first
 trust or retrieves keys; run bootstrap first for a new host. Strict host-key
 checking remains enabled for both Paramiko bootstrap and OpenSSH verification;
 there is no silent trust. See [OpenSSH ssh-keyscan](https://man.openbsd.org/ssh-keyscan)
@@ -77,10 +86,10 @@ an unrelated existing account as the managed `ansible` account.
 
 The standard path is **root + interactive SSH password → ansible + dedicated
 SSH key + NOPASSWD sudo**. Root is used only for initial bootstrap. Subsequent
-provisioning must use `ansible`; `make verify` explicitly overrides the initial
+provisioning must use `ansible`; `make verify-access` explicitly overrides the initial
 inventory login with `ansible` and never uses a root password.
 
-`make bootstrap` creates an Ed25519 key locally if neither member of the pair
+`make bootstrap-user` creates an Ed25519 key locally if neither member of the pair
 exists, immediately before bootstrap. `make setup` never generates SSH keys:
 
 ```text
@@ -107,7 +116,7 @@ Only role inputs remain in `-e`. The overlay contains no passwords or key conten
 Generated keys have **no passphrase** for unattended provisioning. Possession of
 this private automation key, together with unrestricted `NOPASSWD: ALL`, grants
 **root-equivalent access to the VPS**. Protect the controller and key backups.
-Running `make bootstrap` deliberately approves that policy; the role's default
+Running `make bootstrap-user` deliberately approves that policy; the role's default
 consent remains `false`. A dedicated root-owned `/etc/sudoers.d/ansible` file uses
 `0440` and is validated with `visudo -cf`. No login password is set for `ansible`.
 
@@ -129,7 +138,7 @@ deprecation warnings remain enabled.
 
 Initial bootstrap disables SSH agent authentication and private-key lookup and
 checks the verified `known_hosts` entry; automatic host-key addition is disabled.
-Both the automatic handoff verification and `make verify` use **OpenSSH + the
+Both the automatic handoff verification and `make verify-access` use **OpenSSH + the
 dedicated private key + public-key-only authentication**, with password prompts
 and agent use disabled. Paramiko is limited to initial password-based bootstrap.
 See [the pinned Ansible Paramiko transport documentation](https://docs.ansible.com/projects/ansible-core/2.18/collections/ansible/builtin/paramiko_ssh_connection.html).
@@ -142,8 +151,10 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | --- | --- | --- |
 | `make setup` | Install local dependencies; create missing local inventory | Dependency registries only |
 | `make deps` | Install pinned local tooling/collections | Dependency registries only |
-| `make bootstrap` | Create/reuse dedicated key, bootstrap account, then verify | **LIVE / MUTATING** |
-| `make verify` | Verify existing key-only ansible access | **LIVE / verification**, no managed configuration changes |
+| `make bootstrap-user` | Create/reuse dedicated key, bootstrap account, then verify | **LIVE / MUTATING** |
+| `make verify-access` | Verify existing key-only ansible access | **LIVE / verification**, no managed configuration changes |
+| `make docker-host` | Provision Docker packages, logging policy and services | **LIVE / MUTATING**, managed key-only access |
+| `make verify-docker` | Check Docker/services and run a disposable container | **LIVE / verification**, transient container/image-cache changes |
 | `make check` | YAML/Ansible lint, syntax, actionlint, wrapper tests | **OFFLINE** |
 | `make ci` | Same offline checks as `make check` | **OFFLINE** |
 
@@ -153,14 +164,20 @@ the initial password. It runs the
 existing bootstrap role with explicit sudo consent, then opens independent
 key-only SSH connections as `ansible`. Verification checks Ansible ping,
 `id -un == ansible` and `sudo -n id -u == 0`; every failed stage returns an error.
-SSH connection sharing with the initial login is disabled. No further host
-provisioning follows verification.
+SSH connection sharing with the initial login is disabled. Docker provisioning is a separate explicit target; access verification does not run it.
 
-`make verify` uses the same verification playbook without running the bootstrap
+`make verify-access` uses the same verification playbook without running the bootstrap
 role or creating a key. Password authentication and prompts are disabled. Its
 purpose is read-only: Ansible may create and remove transient module files, but
 it does not change account or host configuration. Keep fallback access if it
 fails. A successful bootstrap recap alone is insufficient proof of the handoff.
+
+Docker regression tests cover managed key-only orchestration, connection-overlay
+isolation, preflight failure before provisioning, example inventory rejection,
+Make/CI offline boundaries, unchanged probes and guaranteed smoke cleanup.
+Selected safety assertions and daemon-policy convergence run with real Ansible
+on temporary local fixtures with network connections blocked. Syntax checks
+cover all four entry-point playbooks; lint includes both roles.
 
 Checks always use `inventories/production.example.yml`, never production
 inventory, keys, passwords or VPS connections. Wrapper tests use temporary
@@ -183,14 +200,89 @@ No safe automatic formatter (`make fix`) is configured. For targeted diagnosis:
 `make test-access`. Configure `offline-validation` as a required branch-protection
 check separately.
 
+## Docker host stage
+
+`make docker-host` reuses the existing access wrapper, dedicated key and strict
+`known_hosts` trust. It does not generate keys or accept new host trust. Before
+any Docker mutation it runs `playbooks/verify.yml`: login must be `ansible` and
+`sudo -n` must reach UID 0. Missing keys fail with a `make bootstrap-user` hint;
+failed login/sudo verification stops the stage. Docker tasks use per-task
+privilege escalation with non-interactive sudo. `ansible` is never added to the
+`docker` group. The inventory's initial administrator is overridden only for
+the managed host, preserving controller-local execution.
+
+`playbooks/docker-host.yml` calls `roles/docker_host`. The remote inventory Python
+must have Ubuntu's `python3-apt` available for non-mutating package inspection;
+if it is missing, preflight fails before changes. Prepare it through existing
+administrative access before this stage. Supported hosts are
+Ubuntu Jammy 22.04, Noble 24.04 and Resolute 26.04 with systemd; architecture
+mapping covers amd64, arm64, armhf, ppc64el and s390x. See the role defaults and
+[Docker's Ubuntu installation guide](https://docs.docker.com/engine/install/ubuntu/).
+The role configures the official stable APT repository with a dedicated ASCII
+signing keyring, a pinned SHA256 key checksum, and the host's release/architecture.
+A vendor signing-key rotation requires deliberate checksum review. It installs
+`docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin` and
+`docker-compose-plugin` with `state: present`; reruns do not upgrade installed
+packages. APT metadata refresh runs only when prerequisites/packages are missing
+or the managed repository/key changes, keeping a converged rerun at `changed=0`.
+
+All safety inspection precedes package, repository or configuration changes.
+Conflicting `docker.io`, `docker-compose`, `docker-compose-v2`, `docker-doc`,
+`docker-buildx`, `podman-docker`, `containerd` or `runc` packages stop provisioning.
+There is no automatic uninstall, purge or runtime-data deletion. Existing Docker
+APT sources must exactly match the managed source; competing sources, custom
+Docker/containerd systemd units/drop-ins, unexpected keyring content and orphan
+runtime data require manual review. Existing `daemon.json` must contain exactly
+the managed policy; invalid or different settings stop the role with a migration
+hint. Review existing workloads/configuration and migrate deliberately before
+retrying. This stage does not automatically adopt arbitrary runtime installations.
+
+The role enables/starts `docker.service` and `containerd.service`. Its minimal
+`/etc/docker/daemon.json` uses the Docker-supported `local` logging driver with
+`max-size: 20m` and `max-file: "5"` (five rotated files per container).
+Configuration is validated with `dockerd --validate` before replacement; only a
+changed config notifies the Docker restart handler. This limits logs for **new
+containers**; existing containers retain their creation-time logging policy.
+See [Docker local logging](https://docs.docker.com/engine/logging/drivers/local/).
+No application networks or deployment configuration are created.
+
+`make verify-docker` first repeats key-only access/sudo verification, then runs
+`docker version`, `docker info`, `docker compose version`, `docker buildx version`,
+checks active/enabled status for both services and requires the active logging
+driver to be `local`. These probes report `changed=0`. The smoke test creates a
+`hello-world:latest` container with `--network none`, starts/attaches with a
+120-second timeout, then removes its exact ID in an `always` cleanup block,
+including on a failed start. Runtime operations accurately report changes.
+The smoke test can download an image from Docker Hub and leave it in the Docker
+image cache; verification is **not strictly read-only**. No test container is
+left running after the cleanup. No cache pruning removes unrelated operator data.
+
+Manual validation after managed access has already been bootstrapped:
+
+```bash
+make setup
+make check
+make verify-access
+make docker-host
+make verify-docker
+make docker-host
+make verify-docker
+```
+
+The second `make docker-host` should report `changed=0` if external state has not
+changed. Live access, installation, runtime behavior and full host idempotency
+must be verified manually; the agent has not run these commands against the VPS.
+
 ## Overrides and troubleshooting
 
 Make accepts a local inventory path and an absolute private-key path outside the
-repository. Use the same overrides for both live targets:
+repository. Use the same overrides for all live targets:
 
 ```bash
-make bootstrap INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
-make verify INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
+make bootstrap-user INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
+make verify-access INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
+make docker-host INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
+make verify-docker INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
 ```
 
 The sibling `.pub` must exist for an existing key. Use a dedicated unencrypted
