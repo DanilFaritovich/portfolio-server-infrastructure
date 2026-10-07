@@ -38,6 +38,7 @@ make verify-access
 make docker-host
 make verify-docker
 # Проверьте hardening settings, recovery console и сетевые правила провайдера ниже.
+make inspect-hardening
 make harden
 make verify-hardening
 ```
@@ -158,6 +159,7 @@ password prompts и agent. Paramiko используется только для
 | `make verify-access` | Проверить существующий key-only доступ ansible | **LIVE / verification**, без изменений managed configuration |
 | `make docker-host` | Установить Docker, logging policy и настроить services | **LIVE / MUTATING**, managed key-only access |
 | `make verify-docker` | Проверить Docker/services и disposable container | **LIVE / verification**, временные container/image-cache changes |
+| `make inspect-hardening` | Собрать все Stage 3 safety findings перед harden | **LIVE / read-only**, exit 0 для PASS/WARN, non-zero для FAIL |
 | `make harden` | Настроить UFW и validated SSH listening ports | **LIVE / MUTATING**, managed key-only access |
 | `make verify-hardening` | Проверить все SSH-порты, UFW и active Docker/containerd | **LIVE / verification**, без изменения managed state |
 | `make check` | YAML/Ansible lint, syntax, actionlint, wrapper tests | **OFFLINE** |
@@ -425,11 +427,37 @@ isolation managed/controller connections, verification каждого порта
 порядок firewall enable и verification без записи managed state. Эти проверки
 не доказывают работоспособность production host.
 
+`make inspect-hardening` — read-only preflight всего Stage 3. Он проверяет managed
+key-only access и `sudo -n` по текущему inventory route, затем собирает независимые
+SSH, systemd, Docker/containerd и UFW safety findings одним компактным отчётом.
+Проверяются desired/effective/live ports, supported SSH files и legacy Port adoption,
+activation mode, disk/generated/loaded socket state, unit overrides, UFW package
+baseline, ownership, raw rules и unsafe file types. Содержимое конфигов, credentials,
+command stderr и ownership fingerprints не выводятся.
+
+`PASS` означает подходящее состояние. `WARN` означает, что harden умеет безопасно
+adopt/converge его: например, supported legacy Ports, отсутствующий или inactive
+pristine UFW, stale stock socket state. `FAIL` блокирует harden. Exit code равен 0
+при отсутствии FAIL, включая WARN-only отчёты, и non-zero при blocking findings.
+Перед harden исправьте все FAIL; повторные запуски harden не заменяют диагностику.
+Проверки, которым нужны недоступные или небезопасные данные, отмечаются как
+unavailable; остальные безопасные проверки продолжаются. Без managed access/sudo
+remote inspection продолжить нельзя. Будущие SSH-порты проверяются без требования
+их сетевой доступности до convergence.
+
+Inspection передаёт общую с harden и verify-hardening implementation
+`portfolio_hardening_info.py` через SSH stdin с `sudo -n` и Python `-B`, без remote
+payload/temp files. Он не устанавливает пакеты, не пишет файлы, не меняет firewall
+или systemd, не делает daemon-reload и SSH reload/restart, не запускает handlers.
+Существующее strict host trust сохраняется. READY — snapshot текущего состояния;
+harden повторяет safety checks перед mutation, а verification требует runtime
+convergence.
+
 Ручная live validation на уже Docker-ready host:
 
 ```bash
 make verify-access &&
-make verify-docker &&
+make inspect-hardening &&
 make harden &&
 make verify-hardening &&
 make harden &&

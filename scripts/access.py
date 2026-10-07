@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -41,7 +42,7 @@ def setup_inventory(path):
         print('Inventory created. Edit ansible_host and ansible_port before bootstrap.')
 
 
-def load_host(path):
+def load_host(path, validate_hardening=True):
     require(path.is_file() and path.resolve() != ROOT / 'inventories/production.example.yml',
             'Real local inventory required. Run make setup, then edit host and port.')
     try:
@@ -60,7 +61,7 @@ def load_host(path):
         require(alias != 'localhost', 'Reserve localhost for the controller; use a separate VPS alias.')
         require(isinstance(values, dict) and set(values) <= HOST_FIELDS,
                 'Only host, port, initial user, Python interpreter and hardening port lists belong in inventory.')
-        for name in HARDENING_FIELDS & values.keys():
+        for name in HARDENING_FIELDS & values.keys() if validate_hardening else ():
             validate_ports(values[name], allow_empty=name == 'firewall_allowed_tcp_ports')
         host = values.get('ansible_host')
         port = values.get('ansible_port')
@@ -86,11 +87,13 @@ def validate_ports(values, allow_empty=False):
             len(values) == len(set(values)), 'Hardening ports must be unique integers from 1 to 65535.')
 
 
-def hardening_inputs(path, alias, port):
+def hardening_inputs(path, alias, port, validate=True):
     # load_host has already validated the complete static inventory structure.
     host = yaml.safe_load(path.read_text())['all']['children']['bootstrap']['hosts'][alias]
     result = {'ssh_listen_ports': host.get('ssh_listen_ports', [port]),
               'firewall_allowed_tcp_ports': host.get('firewall_allowed_tcp_ports', [80, 443])}
+    if not validate:
+        return result
     for name, values in result.items():
         validate_ports(values, allow_empty=name == 'firewall_allowed_tcp_ports')
     require(port in result['ssh_listen_ports'],
@@ -243,16 +246,54 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
         subprocess.run(command, cwd=ROOT, check=True, env=environment)
 
 
+def inspect_host(host, port, interpreter, key, inputs):
+    """Read-only SSH transport avoids Ansible's remote payload/tempfile writes."""
+    ssh = ['ssh'] + shlex.split(SSH_BASE) + [
+        '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
+        '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
+        '-o', 'KbdInteractiveAuthentication=no', '-o', 'IdentityAgent=none',
+        '-i', str(key), '-p', str(port), 'ansible@' + host,
+    ]
+    login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False)
+    if login.returncode or login.stdout.strip() != 'ansible':
+        print('Hardening preflight\nFAIL  managed SSH access\n'
+              'FAIL  host inspection unavailable without managed key-only access\n\nResult: NOT READY')
+        raise ValueError('Managed SSH access failed; remaining host checks cannot run safely.')
+    params = {'current_port': port, 'ssh_ports': inputs['ssh_listen_ports'],
+              'tcp_ports': inputs['firewall_allowed_tcp_ports'], 'verify': False,
+              'refresh_rules': False, 'socket_candidate': False, 'report_only': True}
+    # Python receives code through stdin. -I isolates imports; -B prevents bytecode-cache writes;
+    # imports are standard-library only. No copy, temp files, modules or handlers.
+    payload = '__name__ = "portfolio_inspection"\n' + (ROOT / 'library/portfolio_hardening_info.py').read_text()
+    payload += '\ninspect_stream(json.loads(' + repr(json.dumps(params)) + '))\n'
+    process = subprocess.run(ssh + ['sudo -n ' + shlex.quote(interpreter) + ' -I -B -'],
+                             input=payload, capture_output=True, text=True, check=False)
+    try:
+        require(process.returncode == 0, 'Managed sudo or host inspection failed.')
+        result = json.loads(process.stdout)
+        require(type(result['ready']) is bool and isinstance(result['report'], str), 'Invalid inspection result.')
+    except (ValueError, KeyError, TypeError):
+        # Never dump SSH stderr, sudo errors, parser input or captured stdout.
+        print('Hardening preflight\nPASS  managed SSH login\n'
+              'FAIL  managed sudo or read-only inspection unavailable\n\nResult: NOT READY')
+        raise ValueError('Cannot safely complete host inspection; check managed sudo and Python.') from None
+    print(result['report'].replace('Hardening preflight', 'Hardening preflight\nPASS  managed SSH access', 1))
+    require(result['ready'], 'Resolve all FAIL findings before make harden. WARN findings can converge safely.')
+
+
 def live(mode, inventory, key):
     prerequisites(mode)
-    if mode in ('docker-host', 'verify-docker', 'harden', 'verify-hardening'):
+    if mode in ('docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening'):
         try:
             check_key(key)
         except (ValueError, OSError):
             raise ValueError('Managed access is not ready. Run make bootstrap-user first; check the dedicated key pair.') from None
-    alias, host, port, user, _ = load_host(inventory)
-    inputs = hardening_inputs(inventory, alias, port) if mode in ('harden', 'verify-hardening') else {}
+    alias, host, port, user, interpreter = load_host(inventory, validate_hardening=mode != 'inspect-hardening')
+    inputs = hardening_inputs(inventory, alias, port, validate=mode != 'inspect-hardening') if mode in ('harden', 'verify-hardening', 'inspect-hardening') else {}
     known_host(host, port, allow_trust=mode == 'bootstrap-user')
+    if mode == 'inspect-hardening':
+        inspect_host(host, port, interpreter, key, inputs)
+        return
     if mode == 'bootstrap-user':
         require(sys.stdin.isatty(), 'Bootstrap requires an interactive terminal for the Ansible password prompt.')
         print('LIVE / MUTATING: creates ansible and approves unrestricted NOPASSWD sudo.', flush=True)
@@ -315,7 +356,7 @@ def live(mode, inventory, key):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening'])
+    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=str(DEFAULT_KEY))
     args = parser.parse_args()

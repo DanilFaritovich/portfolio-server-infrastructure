@@ -8,7 +8,7 @@ export ANSIBLE_HOME := $(CURDIR)/.ansible
 # Subprocesses must find the same pinned Ansible tools as the invoking interpreter.
 export PATH := $(abspath $(VENV))/bin:$(PATH)
 
-.PHONY: deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
+.PHONY: deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
 
 # Dependency setup uses registries; checks below use installed dependencies offline.
 deps:
@@ -42,6 +42,11 @@ verify-docker:
 harden:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py harden --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
+# LIVE / read-only: aggregate all Stage 3 safety findings before harden.
+inspect-hardening:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py inspect-hardening --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
 
 # LIVE / read-only: independent key-only connections and hardening/runtime probes.
 verify-hardening:

@@ -52,6 +52,237 @@ class HardeningTests(unittest.TestCase):
     def local_ansible(self, tasks, variables):
         return test_docker.DockerTests.local_ansible(self, tasks, variables)
 
+    def test_inspection_aggregates_independent_blockers_and_redacts_contents(self):
+        fake = self.inspection_fixture(managed=False, active=False)
+        fake.params['report_only'] = True
+        self.service = 'inactive'
+        self.fixture_path('/etc/ssh/sshd_config').write_text(
+            'ListenAddress 127.0.0.1 # secret-ssh-content\nInclude /secret-path/*.conf\n')
+        self.fixture_path('/etc/ufw/before.rules').write_text('secret-base-content')
+        self.fixture_path('/etc/ufw/user.rules').write_text('-A secret-raw-content\n')
+        self.added = 'ufw allow from secret-rule-content'
+        before = {p: p.read_bytes() for p in self.directory.rglob('*') if p.is_file()}
+        result = self.inspect(fake)
+        self.assertFalse(result['ready'])
+        for diagnostic in ('ListenAddress', 'Include hierarchy', 'docker.service', 'containerd.service',
+                           'raw UFW', 'package baseline', 'Unknown existing UFW rule'):
+            self.assertIn(diagnostic, result['report'])
+        for secret in ('secret-', 'sha256', 'ssh_sources'):
+            self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(set(result), {'ready', 'findings', 'report'})
+        self.assertEqual(before, {p: p.read_bytes() for p in self.directory.rglob('*') if p.is_file()})
+        allowed = {('systemctl', 'show'), ('systemctl', 'is-active'), ('systemctl', 'is-enabled'),
+                   ('/usr/sbin/sshd', '-t'), ('/usr/sbin/sshd', '-T'), ('ss', '-H'),
+                   ('ufw', 'status'), ('ufw', 'show'), ('dpkg-query', '-W')}
+        self.assertTrue(all(tuple(call.args[0][:2]) in allowed for call in fake.run_command.call_args_list))
+        fake.params['report_only'] = False
+        with self.assertRaisesRegex(ValueError, 'NOT READY'):
+            self.inspect(fake)
+
+    def test_inspection_warns_only_on_safely_convergeable_state(self):
+        fake = self.inspection_fixture(managed=False, active=False)
+        fake.params['report_only'] = True
+        self.fixture_path('/etc/ssh/sshd_config').write_text('Port 2222\n')
+        self.effective = 'port 2222\npubkeyauthentication yes\n'
+        self.sockets = self.sockets.replace(':2200', ':2222')
+        result = self.inspect(fake)
+        self.assertTrue(result['ready'], result['report'])
+        self.assertIn('WARN  legacy SSH Ports', result['report'])
+        self.assertIn('WARN  UFW runtime', result['report'])
+        fake.params['report_only'] = False
+        self.assertTrue(self.inspect(fake)['ssh_adoption'])
+        fake.params.update(verify=True, report_only=True)
+        self.assertFalse(self.inspect(fake)['ready'])
+        fake = self.inspection_fixture(managed=True, active=True)
+        fake.params.update(verify=False, report_only=True)
+        result = self.inspect(fake)
+        self.assertTrue(result['ready'], result['report'])
+        self.assertTrue(all(item['status'] == 'PASS' for item in result['findings']), result['report'])
+
+    def test_inspection_socket_staleness_is_warn_but_custom_overrides_block(self):
+        fake = self.inspection_fixture()
+        fake.params.update(verify=False, report_only=True)
+        self.enable_socket()
+        self.generated_socket_fixture([2222])
+        result = self.inspect(fake)
+        self.assertTrue(result['ready'], result['report'])
+        self.assertIn('WARN  generated/loaded SSH socket state', result['report'])
+        fake.params['report_only'] = False
+        self.assertTrue(self.inspect(fake)['socket_reload_required'])
+        fake.params.update(verify=True, report_only=True)
+        self.assertFalse(self.inspect(fake)['ready'])
+        fake.params['verify'] = False
+        self.fixture_path(self.socket_dropins).write_text('[Socket]\nListenStream=127.0.0.1:2222\n')
+        self.assertFalse(self.inspect(fake)['ready'])
+        fake.params['report_only'] = False
+        with self.assertRaises(ValueError):
+            self.inspect(fake)
+
+    def test_inspection_rejects_unsafe_files_without_reading_them(self):
+        for filename in ('/etc/ssh/sshd_config', '/etc/ufw/user.rules', '/etc/ufw/before.rules',
+                         '/etc/ufw/portfolio-hardening.json'):
+            fake = self.inspection_fixture()
+            fake.params.update(verify=False, report_only=True)
+            path = self.fixture_path(filename)
+            path.unlink()
+            path.symlink_to(self.directory / 'does-not-exist')
+            with self.subTest(filename=filename):
+                result = self.inspect(fake)
+                self.assertFalse(result['ready'], result['report'])
+                self.assertNotIn('does-not-exist', result['report'])
+                path.unlink()
+        fake = self.inspection_fixture()
+        fake.params.update(verify=False, report_only=True)
+        path = self.fixture_path('/etc/ufw/user.rules')
+        path.unlink()
+        os.mkfifo(path)
+        self.assertFalse(self.inspect(fake)['ready'])
+
+    def test_inspection_continues_after_invalid_ports_and_malformed_marker(self):
+        fake = self.inspection_fixture()
+        fake.params.update(ssh_ports=['sensitive-port'], tcp_ports=[False], verify=False, report_only=True)
+        self.marker.write_text('{"secret-invalid-json')
+        self.service = 'inactive'
+        result = self.inspect(fake)
+        self.assertFalse(result['ready'])
+        for label in ('desired SSH ports', 'desired HTTP/HTTPS', 'UFW ownership marker', 'docker.service'):
+            self.assertIn('FAIL  ' + label, result['report'])
+        self.assertNotIn('sensitive-port', result['report'])
+        self.assertNotIn('secret-invalid-json', result['report'])
+
+    def test_inspection_parser_errors_cannot_impersonate_safe_diagnoses(self):
+        fake = self.inspection_fixture()
+        fake.params.update(verify=False, report_only=True)
+        self.effective = 'port secret Review and reconcile manually;\npubkeyauthentication yes\n'
+        result = self.inspect(fake)
+        self.assertFalse(result['ready'])
+        self.assertNotIn('secret', json.dumps(result))
+
+    def test_inspection_detects_unloaded_systemd_overrides_and_generated_state(self):
+        fake = self.inspection_fixture()
+        fake.params.update(verify=False, report_only=True)
+        self.enable_socket()
+        path = self.generated_socket_fixture([2222])
+        self.socket_dropins = ''  # generated file is newer than the loaded unit
+        result = self.inspect(fake)
+        self.assertTrue(result['ready'], result['report'])
+        self.assertIn('WARN  generated/loaded SSH socket state', result['report'])
+        path.unlink()
+        custom = self.fixture_path('/etc/systemd/system/ufw.service.d/unsafe.conf')
+        custom.parent.mkdir(parents=True, exist_ok=True)
+        custom.write_text('[Service]\nExecStart=secret-service-override\n')
+        result = self.inspect(fake)
+        self.assertFalse(result['ready'])
+        self.assertIn('FAIL  ufw.service drop-in', result['report'])
+        self.assertNotIn('secret-service-override', result['report'])
+        fake.params['report_only'] = False
+        with self.assertRaises(ValueError):
+            self.inspect(fake)
+
+    def test_inspection_collects_all_dormant_masked_socket_overrides(self):
+        fake = self.inspection_fixture()
+        fake.params.update(verify=False, report_only=True)
+        self.socket_enabled = 'masked'
+        stock_command = fake.run_command.side_effect
+
+        def command(argv, **kwargs):
+            if argv[:3] == ['systemctl', 'show', 'ssh.socket']:
+                return 0, 'FragmentPath=/dev/null\nDropInPaths=\n', ''
+            return stock_command(argv, **kwargs)
+
+        fake.run_command.side_effect = command
+        self.assertTrue(self.inspect(fake)['ready'])
+        for root in ('/etc', '/run'):
+            path = self.fixture_path(root + '/systemd/system/ssh.socket.d/unsafe.conf')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('[Socket]\nListenStream=secret-listener\n')
+        result = self.inspect(fake)
+        self.assertFalse(result['ready'])
+        self.assertEqual(result['report'].count('Custom disabled SSH socket drop-ins detected.'), 2)
+        self.assertNotIn('secret-listener', result['report'])
+        fake.params['report_only'] = False
+        with self.assertRaises(ValueError):
+            self.inspect(fake)
+
+    def test_inspection_wrapper_streams_shared_code_without_remote_files(self):
+        import contextlib
+        import io
+        fake = self.inspection_fixture()
+        fake.params.update(verify=False, report_only=True)
+        self.host['ssh_listen_ports'] = [2222, 2200]
+        self.host['firewall_allowed_tcp_ports'] = [80, 443]
+        self.write_inventory()
+        before = {p: p.read_bytes() for p in self.directory.rglob('*') if p.is_file()}
+        calls = []
+
+        def command(argv, **kwargs):
+            if argv[0] != 'ssh':
+                rc, stdout, stderr = fake.run_command(argv, environ_update={'LC_ALL': 'C'})
+                return subprocess.CompletedProcess(argv, rc, stdout, stderr)
+            calls.append(argv)
+            self.assertEqual(argv[argv.index('-p') + 1], '2222')
+            self.assertIn('StrictHostKeyChecking=yes', argv)
+            self.assertIn('IdentityAgent=none', argv)
+            self.assertIn('PasswordAuthentication=no', argv)
+            if argv[-1] == 'id -un':
+                return subprocess.CompletedProcess(argv, 0, 'ansible\n', '')
+            self.assertEqual(argv[-1], 'sudo -n /usr/bin/python3 -I -B -')
+            payload = kwargs['input']
+            self.assertIn((ROOT / 'library/portfolio_hardening_info.py').read_text(), payload)
+            # Execute exactly the streamed entry point, only remapping paths to fixtures.
+            namespace = {'fixture_path': self.fixture_path}
+            payload = payload.replace('from pathlib import Path', 'Path = fixture_path')
+            output = io.StringIO()
+            with patch.object(info.glob, 'glob', return_value=[]), \
+                    patch('shutil.which', return_value='/usr/sbin/ufw'), patch('os.geteuid', return_value=0), \
+                    contextlib.redirect_stdout(output):
+                exec(compile(payload, '<ssh-stdin-fixture>', 'exec'), namespace)
+            return subprocess.CompletedProcess(argv, 0, output.getvalue(), '')
+
+        with patch.object(access, 'prerequisites'), patch.object(access, 'known_host') as trust, \
+                patch.object(access, 'run_playbook') as playbook, \
+                patch.object(access.subprocess, 'run', side_effect=command), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            access.live('inspect-hardening', self.inventory, self.key)
+        self.assertIn('PASS  managed SSH access', output.getvalue())
+        self.assertIn('Result: READY', output.getvalue())
+        self.assertEqual(len(calls), 2)
+        playbook.assert_not_called()
+        trust.assert_called_once_with('fixture.example.test', 2222, allow_trust=False)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.directory.rglob('*') if p.is_file()})
+        result = subprocess.run(['make', '-n', 'inspect-hardening'], cwd=ROOT, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('scripts/access.py inspect-hardening ', result.stdout)
+
+    def test_inspection_public_exit_codes_and_transport_redaction(self):
+        import contextlib
+        import io
+        for ready, expected in ((True, 0), (False, 1)):
+            result = {'ready': ready, 'report': 'Hardening preflight\n' +
+                      ('WARN  safe convergence\nResult: READY' if ready else 'FAIL  blocking state\nResult: NOT READY')}
+            with self.subTest(ready=ready), patch.object(access, 'prerequisites'), \
+                    patch.object(access, 'known_host'), patch.object(access.subprocess, 'run', side_effect=[
+                        subprocess.CompletedProcess([], 0, 'ansible\n', ''),
+                        subprocess.CompletedProcess([], 0, json.dumps(result), 'sensitive-stderr')]), \
+                    patch.object(access.sys, 'argv', ['access.py', 'inspect-hardening', '--inventory',
+                                                     str(self.inventory), '--key', str(self.key)]), \
+                    contextlib.redirect_stdout(io.StringIO()) as output, \
+                    contextlib.redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(access.main(), expected)
+            self.assertNotIn('sensitive-stderr', output.getvalue() + error.getvalue())
+        for login_ok in (False, True):
+            responses = [subprocess.CompletedProcess([], 0 if login_ok else 1,
+                                                   'ansible\n' if login_ok else 'sensitive-stdout', 'secret-stderr')]
+            if login_ok:
+                responses.append(subprocess.CompletedProcess([], 1, 'sensitive-stdout', 'secret-stderr'))
+            with patch.object(access.subprocess, 'run', side_effect=responses), \
+                    contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(ValueError):
+                access.inspect_host('fixture.example.test', 2222, '/usr/bin/python3', self.key,
+                                    {'ssh_listen_ports': [2222], 'firewall_allowed_tcp_ports': [80, 443]})
+            self.assertIn('NOT READY', output.getvalue())
+            self.assertNotIn('sensitive-stdout', output.getvalue())
+            self.assertNotIn('secret-stderr', output.getvalue())
+
     def test_live_entrypoints_preserve_key_only_transport_and_verify_every_port(self):
         for mode in ('harden', 'verify-hardening'):
             with self.subTest(mode=mode), patch.object(access, 'prerequisites'), \
@@ -317,13 +548,23 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         self.assertNotIn('state: absent', (ROOT / 'roles/host_hardening/tasks/main.yml').read_text())
 
     def fixture_path(self, name):
-        return self.directory / str(name).lstrip('/') if str(name).startswith(('/etc/', '/run/', '/proc/')) else Path(name)
+        return self.directory / str(name).lstrip('/') if str(name).startswith(('/etc/', '/run/', '/proc/', '/usr/lib/systemd/')) else Path(name)
 
     def inspection_fixture(self, managed=True, active=True):
+        import shutil
+        # Each call models a fresh host snapshot, including unloaded disk state.
+        for root in ('/etc/systemd', '/run/systemd'):
+            shutil.rmtree(self.fixture_path(root), ignore_errors=True)
         files = {'/etc/os-release': 'ID=ubuntu\n', '/etc/ssh/sshd_config': 'Include /etc/ssh/sshd_config.d/*.conf\n',
                  '/proc/sys/net/ipv6/bindv6only': '0\n',
                  '/etc/default/ufw': 'IPV6=yes\nDEFAULT_INPUT_POLICY="DROP"\nDEFAULT_OUTPUT_POLICY="ACCEPT"\n',
                  '/etc/ufw/ufw.conf': 'ENABLED=yes\n'}
+        for name in ('ssh.service', 'ssh.socket', 'ufw.service'):
+            files['/usr/lib/systemd/system/' + name] = '# stock unit fixture\n'
+        if managed:
+            files['/etc/ssh/sshd_config'] = (info.MARKER.format(mark='BEGIN') +
+                '\nPort 2200\nPort 2222\nPubkeyAuthentication yes\n' + info.MARKER.format(mark='END') +
+                '\nInclude /etc/ssh/sshd_config.d/*.conf\n')
         for name in info.PROTECTED + info.RULE_FILES:
             files.setdefault(name, '# stock fixture\n')
         for name, content in files.items():

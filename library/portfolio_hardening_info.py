@@ -11,15 +11,17 @@ options:
   ssh_ports:
     description: Intended SSH listening ports.
     required: true
-    type: list
-    elements: int
+    type: raw
   tcp_ports:
     description: Additional incoming TCP ports.
     required: true
-    type: list
-    elements: int
+    type: raw
   verify:
     description: Require fully converged runtime state.
+    type: bool
+    default: false
+  report_only:
+    description: Return all sanitized findings without failing on blocking findings.
     type: bool
     default: false
   socket_candidate:
@@ -66,7 +68,6 @@ import json
 from pathlib import Path
 import re
 
-from ansible.module_utils.basic import AnsibleModule
 
 MARKER = '# {mark} ANSIBLE PORTFOLIO SSH PORTS'
 STATE = Path('/etc/ufw/portfolio-hardening.json')
@@ -77,9 +78,13 @@ PROTECTED = ('/etc/default/ufw', '/etc/ufw/ufw.conf', '/etc/ufw/before.rules',
              '/etc/ufw/sysctl.conf', '/etc/ufw/before.init', '/etc/ufw/after.init')
 
 
+class SafetyError(ValueError):
+    """Only reviewed static diagnoses may cross the public reporting boundary."""
+
+
 def require(condition, message):
     if not condition:
-        raise ValueError(message + ' Review and reconcile manually; no automatic reset/removal.')
+        raise SafetyError(message + ' Review and reconcile manually; no automatic reset/removal.')
 
 
 def ports(values, empty=False):
@@ -89,18 +94,32 @@ def ports(values, empty=False):
     return sorted(values)
 
 
-def unmanaged_ssh(text, main=False, adopt=False):
+def unmanaged_ssh(text, main=False, adopt=False, findings=None, label="SSH configuration"):
     """Only the role's main-file block owns listening directives."""
+    def validate(condition, message):
+        if findings is None:
+            require(condition, message)
+        elif not condition:
+            findings.probe(label, lambda: require(False, message))
+        return bool(condition)
+
     begin, end = (MARKER.format(mark=value) for value in ('BEGIN', 'END'))
     managed = begin in text
     if main and (begin in text or end in text):
-        require(text.count(begin) == text.count(end) == 1 and text.index(begin) < text.index(end),
-                'Malformed managed SSH block.')
-        require(text.startswith(begin), 'Managed SSH block must precede all other directives.')
+        valid_block = validate(text.count(begin) == text.count(end) == 1 and text.index(begin) < text.index(end),
+                               'Malformed managed SSH block.')
+        if not valid_block:
+            # The boundary is ambiguous; scan all remaining directives for independent issues.
+            return scan_ssh_directives(text, main, adopt, managed, validate)
+        validate(text.startswith(begin), 'Managed SSH block must precede all other directives.')
         block = text[text.index(begin) + len(begin):text.index(end)]
-        require(all(not line.strip() or re.fullmatch(r'(?:Port [0-9]+|PubkeyAuthentication yes)', line.strip())
+        validate(all(not line.strip() or re.fullmatch(r'(?:Port [0-9]+|PubkeyAuthentication yes)', line.strip())
                     for line in block.splitlines()), 'Unexpected directives inside managed SSH block.')
         text = text[:text.index(begin)] + text[text.index(end) + len(end):]
+    return scan_ssh_directives(text, main, adopt, managed, validate)
+
+
+def scan_ssh_directives(text, main, adopt, managed, validate):
     legacy = []
     matched = False
     includes = 0
@@ -109,27 +128,26 @@ def unmanaged_ssh(text, main=False, adopt=False):
         if not fields or not fields[0]:
             continue
         directive = fields[0].lower()
-        require(directive != 'listenaddress', 'Unmanaged ListenAddress directive detected.')
+        validate(directive != 'listenaddress', 'Unmanaged ListenAddress directive detected.')
         if directive == 'match':
             matched = True
         if directive == 'port':
-            require(adopt and not matched and re.fullmatch(r'\s*Port[ \t]+[0-9]+[ \t]*(?:#.*)?', line),
-                    'Unsupported legacy Port directive detected.')
-            legacy.append({'line': number, 'port': int(fields[1])})
+            if validate(adopt and not matched and re.fullmatch(r'\s*Port[ \t]+[0-9]+[ \t]*(?:#.*)?', line),
+                        'Unsupported legacy Port directive detected.'):
+                legacy.append({'line': number, 'port': int(fields[1])})
         if directive == 'include':
             includes += 1
-            require(not matched and includes == 1 and main and
+            validate(not matched and includes == 1 and main and
                     re.fullmatch(r'\s*Include[ \t]+/etc/ssh/sshd_config\.d/\*\.conf[ \t]*(?:#.*)?', line, re.I),
                     'Unsupported SSH Include hierarchy detected.')
-    require(not legacy or not managed,
+    validate(not legacy or not managed,
             'Legacy Port directive conflicts with managed SSH configuration.')
     return legacy
 
 
 def fingerprint(path):
-    if not path.exists():
+    if not safe_file(path, 'Unexpected UFW configuration file type.', optional=True):
         return None
-    require(path.is_file() and not path.is_symlink(), 'Unexpected UFW configuration file type.')
     content = path.read_bytes()
     if path.name == 'ufw' and path.parent.name == 'default':
         content = re.sub(rb'^DEFAULT_(?:INPUT|OUTPUT)_POLICY=.*\n?', b'', content, flags=re.M)
@@ -188,29 +206,54 @@ def unit_properties(run, name, properties):
     return result
 
 
-def stock_unit(unit, name, socket_mode=False, ipv6_only=False):
+def stock_unit(unit, name, socket_mode=False, ipv6_only=False, findings=None):
+    def check(label, operation):
+        return findings.probe(label, operation) if findings is not None else operation()
+
+    def fragment():
+        require(unit['FragmentPath'] in ('/usr/lib/systemd/system/' + name, '/lib/systemd/system/' + name),
+                'Custom systemd unit detected.')
+        path = Path(unit['FragmentPath'])
+        require(path.is_file() and not path.is_symlink(), 'Unsafe systemd unit file type.')
+    check(name + ' package unit file', fragment)
     generated = None
-    require(unit['FragmentPath'] in ('/usr/lib/systemd/system/' + name, '/lib/systemd/system/' + name),
-            'Custom systemd unit detected.')
-    for filename in unit['DropInPaths'].split():
-        path = Path(filename)
-        require(path.is_file() and not path.is_symlink(), 'Unsupported systemd drop-in.')
-        lines = [line.strip() for line in path.read_text().splitlines()
-                 if line.strip() and not line.lstrip().startswith('#')]
-        if socket_mode and name == 'ssh.service':
-            require(filename in ('/etc/systemd/system/ssh.service.d/00-socket.conf',
-                                 '/run/systemd/generator/ssh.service.d/00-socket.conf') and
-                    len(lines) == 3 and lines[0] == '[Unit]' and
-                    set(lines[1:]) == {'After=ssh.socket', 'Requires=ssh.socket'},
-                    'Custom SSH service drop-in detected.')
-        elif socket_mode and name == 'ssh.socket':
-            require(filename == '/run/systemd/generator/ssh.socket.d/addresses.conf' and
-                    len(lines) >= 3 and lines[:2] == ['[Socket]', 'ListenStream='] and
-                    all(line.startswith('ListenStream=') and line != 'ListenStream=' for line in lines[2:]),
-                    'Custom SSH socket drop-in detected.')
-            generated = socket_listeners(' '.join(line.split('=', 1)[1] + ' (Stream)' for line in lines[2:]), ipv6_only)
-        else:
-            require(False, 'Custom systemd drop-in detected.')
+    dropins = set(unit['DropInPaths'].split())
+    for root in ('/etc/systemd/system', '/run/systemd/system', '/run/systemd/generator'):
+        def override(root=root):
+            path = Path(root + '/' + name)
+            require(not path.exists() and not path.is_symlink(), 'Custom systemd unit detected.')
+        check(name + ' unit override in ' + root, override)
+        def directory_files(root=root):
+            directory = Path(root + '/' + name + '.d')
+            require(not directory.is_symlink() and (not directory.exists() or directory.is_dir()),
+                    'Unsupported systemd drop-in directory.')
+            return [root + '/' + name + '.d/' + path.name for path in directory.glob('*.conf')]
+        files = check(name + ' drop-in directory in ' + root, directory_files)
+        if files is not None:
+            dropins.update(files)
+    for index, filename in enumerate(sorted(dropins), 1):
+        def dropin(filename=filename):
+            path = Path(filename)
+            safe_file(path, 'Unsupported systemd drop-in.')
+            lines = [line.strip() for line in path.read_text().splitlines()
+                     if line.strip() and not line.lstrip().startswith('#')]
+            if socket_mode and name == 'ssh.service':
+                require(filename in ('/etc/systemd/system/ssh.service.d/00-socket.conf',
+                                     '/run/systemd/generator/ssh.service.d/00-socket.conf') and
+                        len(lines) == 3 and lines[0] == '[Unit]' and
+                        set(lines[1:]) == {'After=ssh.socket', 'Requires=ssh.socket'},
+                        'Custom SSH service drop-in detected.')
+            elif socket_mode and name == 'ssh.socket':
+                require(filename == '/run/systemd/generator/ssh.socket.d/addresses.conf' and
+                        len(lines) >= 3 and lines[:2] == ['[Socket]', 'ListenStream='] and
+                        all(line.startswith('ListenStream=') and line != 'ListenStream=' for line in lines[2:]),
+                        'Custom SSH socket drop-in detected.')
+                return socket_listeners(' '.join(line.split('=', 1)[1] + ' (Stream)' for line in lines[2:]), ipv6_only)
+            else:
+                require(False, 'Custom systemd drop-in detected.')
+        routes = check(name + ' drop-in ' + str(index), dropin)
+        if routes is not None:
+            generated = routes
     return generated
 
 
@@ -242,194 +285,412 @@ def socket_listeners(text, ipv6_only=False):
     return found
 
 
+class Findings:
+    """Independent probes stop locally; their fixed, sanitized diagnoses accumulate."""
+
+    def __init__(self):
+        self.items = []
+
+    def probe(self, label, operation, dependencies=True):
+        if not dependencies:
+            self.items.append({'status': 'FAIL', 'check': label,
+                               'detail': 'Cannot evaluate safely until prerequisite findings are resolved.'})
+            return None
+        failures_before = sum(item['status'] == 'FAIL' for item in self.items)
+        try:
+            value = operation()
+        except (ValueError, OSError, KeyError, TypeError, UnicodeError, IndexError):
+            import sys
+            error = sys.exc_info()[1]
+            # Only require() messages contain reviewed, static text. Never expose
+            # command output, parser errors, file contents or exception arguments.
+            detail = str(error).split(' Review and reconcile manually;', 1)[0] if \
+                isinstance(error, SafetyError) else \
+                'Cannot safely inspect this state; review configuration manually.'
+            self.items.append({'status': 'FAIL', 'check': label, 'detail': detail})
+            return None
+        if sum(item['status'] == 'FAIL' for item in self.items) == failures_before:
+            self.items.append({'status': 'PASS', 'check': label})
+        return value
+
+    def convergence(self, label, converged, verify, message):
+        if verify:
+            self.probe(label, lambda: require(converged, message))
+        else:
+            self.items.append({'status': 'PASS' if converged else 'WARN', 'check': label,
+                               **({} if converged else {'detail': message})})
+
+    def result(self):
+        blockers = sum(item['status'] == 'FAIL' for item in self.items)
+        lines = ['Hardening preflight']
+        grouped = set()
+        for item in self.items:
+            if item['status'] == 'PASS' and (' unit override in ' in item['check'] or
+                    ' drop-in directory in ' in item['check'] or item['check'].endswith(' package unit file')):
+                continue
+            group = next((prefix for prefix in ('UFW base file ', 'UFW raw rules file ',
+                         'UFW package base file ', 'pristine raw UFW rules ')
+                         if item['check'].startswith(prefix)), None)
+            if group and item['status'] == 'PASS':
+                if any(other['status'] != 'PASS' and other['check'].startswith(group) for other in self.items):
+                    continue
+                if group not in grouped:
+                    lines.append('PASS  ' + group.strip() + ' checks completed')
+                    grouped.add(group)
+                continue
+            lines.append(item['status'] + '  ' + item['check'] +
+                         (': ' + item['detail'] if 'detail' in item else ''))
+        lines += ['', 'Result: ' + ('NOT READY' if blockers else 'READY'),
+                  str(blockers) + ' blocking findings require handling before harden']
+        return {'ready': blockers == 0, 'findings': self.items, 'report': '\n'.join(lines)}
+
+
+def safe_file(path, message, optional=False):
+    # Check symlinks before exists(), including dangling links. Never read devices
+    # or FIFOs, nor follow a symlinked configuration directory.
+    require(not path.is_symlink() and all(not parent.is_symlink() for parent in path.parents), message)
+    require((optional and not path.exists()) or path.is_file(), message)
+    return path.exists()
+
+
 def inspect(module):
-    ssh_ports = ports(module.params['ssh_ports'])
-    tcp_ports = ports(module.params['tcp_ports'], empty=True)
-    wanted = set(ssh_ports + tcp_ports)
+    checks = Findings()
+    verify = module.params['verify']
+    candidate = module.params.get('socket_candidate', False)
 
     def run(argv, optional=False):
         rc, stdout, _ = module.run_command(argv, environ_update={'LC_ALL': 'C'})
         require(optional or rc == 0, 'Host inspection command failed: ' + argv[0] + '.')
         return rc, stdout.strip()
 
+    ssh_ports = checks.probe('desired SSH ports', lambda: ports(module.params['ssh_ports']))
+    tcp_ports = checks.probe('desired HTTP/HTTPS and additional TCP ports',
+                             lambda: ports(module.params['tcp_ports'], empty=True))
+    wanted = set(ssh_ports + tcp_ports) if ssh_ports is not None and tcp_ports is not None else None
+    checks.probe('Ubuntu host', lambda: require(
+        re.search(r'^ID=[\"\']?ubuntu[\"\']?$', Path('/etc/os-release').read_text(), re.M),
+        'Hardening supports Ubuntu only.'))
     installed = module.get_bin_path('ufw') is not None
-    require(re.search(r'^ID=[\"\']?ubuntu[\"\']?$', Path('/etc/os-release').read_text(), re.M),
-            'Hardening supports Ubuntu only.')
-    _, active = run(['systemctl', 'is-active', 'ssh.socket'], optional=True)
-    _, enabled = run(['systemctl', 'is-enabled', 'ssh.socket'], optional=True)
-    socket_mode = active == 'active' and enabled == 'enabled'
-    require(socket_mode or (active in ('inactive', 'not-found') and enabled in ('disabled', 'masked', 'not-found')),
-            'Ambiguous SSH activation mode.')
-    for service in ('ssh.service', 'ufw.service') if installed else ('ssh.service',):
-        stock_unit(unit_properties(run, service, ['FragmentPath', 'DropInPaths']), service, socket_mode)
-    socket_routes = set()
+
+    def activation():
+        _, active = run(['systemctl', 'is-active', 'ssh.socket'], optional=True)
+        _, enabled = run(['systemctl', 'is-enabled', 'ssh.socket'], optional=True)
+        mode = active == 'active' and enabled == 'enabled'
+        require(mode or (active in ('inactive', 'not-found') and enabled in ('disabled', 'masked', 'not-found')),
+                'Ambiguous SSH activation mode.')
+        return mode, enabled
+
+    activation_state = checks.probe('SSH activation mode', activation)
+    socket_mode = activation_state[0] if activation_state is not None else None
+    for name in ('ssh.service', 'ufw.service') if installed else ('ssh.service',):
+        checks.probe(name + ' stock unit and drop-ins', lambda name=name: stock_unit(
+            unit_properties(run, name, ['FragmentPath', 'DropInPaths']), name, socket_mode, findings=checks),
+            dependencies=socket_mode is not None or name == 'ufw.service')
+
+    socket_routes = None
     generated_routes = None
     ipv6_only = False
-    if not socket_mode:
-        # Disabled sockets still must not hide custom overrides for a later boot.
-        unit = unit_properties(run, 'ssh.socket', ['FragmentPath', 'DropInPaths'])
-        if unit['FragmentPath'] in ('', '/dev/null'):
-            require(not unit['DropInPaths'] and enabled in ('masked', 'not-found'),
-                    'Ambiguous disabled SSH socket unit.')
-        else:
-            stock_unit(unit, 'ssh.socket')
-    if socket_mode:
-        unit = unit_properties(run, 'ssh.socket', ['FragmentPath', 'DropInPaths', 'Listen', 'Accept', 'Triggers', 'BindIPv6Only'])
-        require(unit['BindIPv6Only'] in ('default', 'both', 'ipv6-only'), 'Ambiguous IPv6 socket binding policy.')
-        policy = unit['BindIPv6Only']
-        if policy == 'default':
-            default = Path('/proc/sys/net/ipv6/bindv6only').read_text().strip()
-            require(default in ('0', '1'), 'Ambiguous system IPv6 binding policy.')
-            ipv6_only = default == '1'
-        else:
-            ipv6_only = policy == 'ipv6-only'
-        generated_routes = stock_unit(unit, 'ssh.socket', True, ipv6_only)
-        require(unit['Accept'] == 'no' and unit['Triggers'] == 'ssh.service', 'Unsupported SSH socket activation.')
-        socket_routes = socket_listeners(unit['Listen'], ipv6_only)
-        service = unit_properties(run, 'ssh.service', ['Requires', 'After', 'KillMode'])
-        require('ssh.socket' in service['Requires'].split() and 'ssh.socket' in service['After'].split() and
-                service['KillMode'] == 'process', 'Unsafe SSH socket/service restart relationship.')
+    if socket_mode is False:
+        def disabled_socket():
+            unit = unit_properties(run, 'ssh.socket', ['FragmentPath', 'DropInPaths'])
+            if unit['FragmentPath'] in ('', '/dev/null'):
+                require(not unit['DropInPaths'] and activation_state[1] in ('masked', 'not-found'),
+                        'Ambiguous disabled SSH socket unit.')
+                for root in ('/etc/systemd/system', '/run/systemd/system', '/run/systemd/generator'):
+                    def dormant_override(root=root):
+                        path = Path(root + '/ssh.socket')
+                        directory = Path(root + '/ssh.socket.d')
+                        require(not directory.exists() and not directory.is_symlink(),
+                                'Custom disabled SSH socket drop-ins detected.')
+                        require((not path.exists() and not path.is_symlink()) or
+                                (activation_state[1] == 'masked' and path.is_symlink() and
+                                 str(path.resolve()) == '/dev/null'), 'Custom disabled SSH socket unit detected.')
+                    checks.probe('disabled SSH socket overrides in ' + root, dormant_override)
+            else:
+                stock_unit(unit, 'ssh.socket', findings=checks)
+        checks.probe('disabled ssh.socket stock configuration', disabled_socket)
+    elif socket_mode is True:
+        unit = checks.probe('loaded SSH socket properties', lambda: unit_properties(
+            run, 'ssh.socket', ['FragmentPath', 'DropInPaths', 'Listen', 'Accept', 'Triggers', 'BindIPv6Only']))
+        def binding():
+            policy = unit['BindIPv6Only']
+            require(policy in ('default', 'both', 'ipv6-only'), 'Ambiguous IPv6 socket binding policy.')
+            if policy == 'default':
+                default = Path('/proc/sys/net/ipv6/bindv6only').read_text().strip()
+                require(default in ('0', '1'), 'Ambiguous system IPv6 binding policy.')
+                return default == '1'
+            return policy == 'ipv6-only'
+        ipv6_only = checks.probe('SSH socket IPv6 binding', binding, unit is not None)
+        generated_routes = checks.probe('generated ssh.socket stock configuration',
+            lambda: stock_unit(unit, 'ssh.socket', True, ipv6_only, findings=checks), unit is not None and ipv6_only is not None)
+        socket_routes = checks.probe('loaded SSH socket listeners',
+            lambda: socket_listeners(unit['Listen'], ipv6_only), unit is not None and ipv6_only is not None)
+        checks.probe('SSH socket activation relationship', lambda: require(
+            unit['Accept'] == 'no' and unit['Triggers'] == 'ssh.service', 'Unsupported SSH socket activation.'),
+            unit is not None)
+        def relationship():
+            service = unit_properties(run, 'ssh.service', ['Requires', 'After', 'KillMode'])
+            require('ssh.socket' in service['Requires'].split() and 'ssh.socket' in service['After'].split() and
+                    service['KillMode'] == 'process', 'Unsafe SSH socket/service restart relationship.')
+        checks.probe('safe SSH socket/service restart relationship', relationship)
         for directory in ('/etc', '/run'):
-            generator = Path(directory + '/systemd/system-generators/sshd-socket-generator')
-            require(not generator.exists() and not generator.is_symlink(),
-                    'Custom or masked SSH socket generator detected.')
-    for service in ('ssh.service', 'docker.service', 'containerd.service'):
-        _, output = run(['systemctl', 'is-active', service])
-        require(output == 'active', 'SSH/Docker/containerd must remain active.')
-    run(['/usr/sbin/sshd', '-t'])
-    # Do not follow arbitrary include trees or overwrite their listening policy.
-    main = Path('/etc/ssh/sshd_config')
-    require(main.is_file() and not main.is_symlink(), 'Unsupported main SSH configuration.')
-    sources = []
-    legacy = []
-    for name in ['/etc/ssh/sshd_config'] + sorted(glob.glob('/etc/ssh/sshd_config.d/*.conf')):
-        path = Path(name)
-        require(path.is_file() and not path.is_symlink(), 'Unsupported SSH include file type.')
-        data = path.read_bytes()
-        text = data.decode()
-        records = unmanaged_ssh(text, main=name == '/etc/ssh/sshd_config', adopt=not module.params['verify'])
+            def generator(directory=directory):
+                path = Path(directory + '/systemd/system-generators/sshd-socket-generator')
+                require(not path.exists() and not path.is_symlink(), 'Custom or masked SSH socket generator detected.')
+            checks.probe(directory + ' SSH generator overrides', generator)
+    for name in ('ssh.service', 'docker.service', 'containerd.service'):
+        def service_active(name=name):
+            _, output = run(['systemctl', 'is-active', name], optional=True)
+            require(output == 'active', name + ' must remain active.')
+        checks.probe(name + ' active', service_active)
+    checks.probe('SSH syntax', lambda: run(['/usr/sbin/sshd', '-t']))
+
+    for name in ('/etc/ssh', '/etc/ssh/sshd_config.d'):
+        def ssh_directory(name=name):
+            path = Path(name)
+            require(not path.is_symlink() and (not path.exists() or path.is_dir()),
+                    'Unsupported SSH configuration directory type.')
+        checks.probe('SSH configuration directory ' + name, ssh_directory)
+    sources, legacy = [], []
+    main_managed = False
+    config_ok = True
+    for index, name in enumerate(['/etc/ssh/sshd_config'] + sorted(glob.glob('/etc/ssh/sshd_config.d/*.conf'))):
+        def source(name=name, index=index):
+            path = Path(name)
+            safe_file(path, 'Unsupported main SSH configuration.' if index == 0 else 'Unsupported SSH include file type.')
+            data = path.read_bytes()
+            text = data.decode()
+            records = unmanaged_ssh(text, main=index == 0, adopt=not verify, findings=checks,
+                                    label='SSH listening directives in file ' + str(index + 1))
+            return data, text, records
+        failures_before = sum(item['status'] == 'FAIL' for item in checks.items)
+        value = checks.probe('SSH main configuration' if index == 0 else 'SSH standard include ' + str(index), source)
+        if value is None:
+            config_ok = False
+            continue
+        if sum(item['status'] == 'FAIL' for item in checks.items) != failures_before:
+            config_ok = False
+        data, text, records = value
+        if index == 0:
+            main_managed = MARKER.format(mark='BEGIN') in text
         legacy.extend(dict(record, path=name) for record in records)
         sources.append({'path': name, 'sha256': hashlib.sha256(data).hexdigest()})
-    require(not legacy or MARKER.format(mark='BEGIN') not in main.read_text(),
-            'Legacy Port directive conflicts with managed SSH configuration.')
-    require(all(record['port'] in ssh_ports for record in legacy),
-            'Legacy Port directive is outside desired SSH ports.')
-    _, effective = run(['/usr/sbin/sshd', '-T'])
-    require('pubkeyauthentication yes' in effective.splitlines(), 'Public-key authentication must remain enabled.')
-    _, sockets = run(['ss', '-H', '-ltnp'])
-    live_ports = listeners(sockets)
-    socket_ports = {route[3] for route in socket_routes}
-    live_routes = set()
-    if socket_mode:
-        # PID 1 can retain socket ownership alongside sshd. Attribute only the
-        # effective ssh.socket ports, never arbitrary systemd listeners.
-        for line in sockets.splitlines():
-            fields = line.split()
-            if len(fields) >= 4 and (re.search(r'"sshd(?:-[^"]*)?"', line) or re.search(r'"systemd",pid=1,', line)):
-                port = fields[3].rsplit(':', 1)[1]
-                if port.isdigit() and (int(port) in socket_ports or re.search(r'"sshd(?:-[^"]*)?"', line)):
-                    live_ports.add(int(port))
-                    live_routes.update(wildcard_listener(fields[3], ipv6_only))
-    effective_ports = {int(line.split()[1]) for line in effective.splitlines() if line.startswith('port ')}
-    desired_routes = {('tcp', family, '*', port) for port in ssh_ports for family in ('ipv4', 'ipv6')}
-    candidate = module.params.get('socket_candidate', False)
-    if socket_mode and (candidate or module.params['verify']):
-        # Only daemon-reload establishes a common cycle for generated files and
-        # loaded unit properties. Preflight validates their structure separately.
-        require(generated_routes is None or generated_routes == socket_routes,
-                'Generated socket file differs semantically from effective listeners.')
-        require(socket_ports == effective_ports, 'Generated socket listeners differ from sshd configuration.')
-        if candidate:
-            require(socket_routes == desired_routes, 'Generated socket listeners differ from desired ports.')
-        else:
-            require(live_routes == socket_routes, 'Live SSH socket listeners differ semantically from effective configuration.')
-    require(not candidate or socket_mode, 'Socket candidate requires socket activation.')
-    require(live_ports <= set(ssh_ports), 'Preserve existing live SSH routes in desired ports.')
+
+    effective_result = checks.probe('effective SSH configuration', lambda: run(['/usr/sbin/sshd', '-T']))
+    effective_ports = None
+    if effective_result is not None:
+        effective = effective_result[1]
+        checks.probe('SSH public-key authentication', lambda: require(
+            'pubkeyauthentication yes' in effective.splitlines(), 'Public-key authentication must remain enabled.'))
+        effective_ports = checks.probe('effective SSH ports', lambda: set(ports(
+            [int(line.split()[1]) for line in effective.splitlines() if line.startswith('port ')])))
+    sockets_result = checks.probe('live SSH listener inspection', lambda: run(['ss', '-H', '-ltnp']))
+    live_ports, live_routes = None, None
+    socket_ports = {route[3] for route in socket_routes} if socket_routes is not None else set()
+    if sockets_result is not None:
+        sockets = sockets_result[1]
+        def live():
+            found = listeners(sockets)
+            routes = set()
+            if socket_mode:
+                require(socket_routes is not None and ipv6_only is not None, 'Cannot attribute SSH socket listeners safely.')
+                for line in sockets.splitlines():
+                    fields = line.split()
+                    if len(fields) >= 4 and (re.search(r'"sshd(?:-[^"]*)?"', line) or re.search(r'"systemd",pid=1,', line)):
+                        port = fields[3].rsplit(':', 1)[1]
+                        if port.isdigit() and (int(port) in socket_ports or re.search(r'"sshd(?:-[^"]*)?"', line)):
+                            found.add(int(port))
+                            routes.update(wildcard_listener(fields[3], ipv6_only))
+            return found, routes
+        value = checks.probe('live SSH listeners', live, socket_mode is not None)
+        if value is not None:
+            live_ports, live_routes = value
+        def occupied():
+            for line in sockets.splitlines():
+                fields = line.split()
+                if len(fields) >= 4 and fields[3].rsplit(':', 1)[1].isdigit():
+                    require(int(fields[3].rsplit(':', 1)[1]) not in ssh_ports or re.search(r'"sshd(?:-[^"]*)?"', line) or
+                            (socket_mode and int(fields[3].rsplit(':', 1)[1]) in socket_ports and
+                             re.search(r'"systemd",pid=1,', line)),
+                            'A configured SSH port is occupied by another process.')
+        checks.probe('desired SSH ports available', occupied, ssh_ports is not None and socket_mode is not None)
+    desired_routes = {('tcp', family, '*', port) for port in ssh_ports for family in ('ipv4', 'ipv6')} if ssh_ports else None
     current_port = module.params.get('current_port')
-    if current_port is not None:
+    def current_route():
         ports([current_port])
         require(current_port in ssh_ports and current_port in live_ports,
                 'Current inventory SSH route must remain live and included in desired ports.')
-    require(not legacy or (current_port is not None and effective_ports <= set(ssh_ports)),
-            'Legacy Port directive differs from safe effective SSH ports.')
-    for line in sockets.splitlines():
-        fields = line.split()
-        if len(fields) >= 4 and fields[3].rsplit(':', 1)[1].isdigit():
-            require(int(fields[3].rsplit(':', 1)[1]) not in ssh_ports or re.search(r'"sshd(?:-[^"]*)?"', line) or
-                    (socket_mode and int(fields[3].rsplit(':', 1)[1]) in socket_ports and
-                     re.search(r'"systemd",pid=1,', line)),
-                    'A configured SSH port is occupied by another process.')
-    if module.params['verify']:
-        require(effective_ports == set(ssh_ports) == live_ports, 'Effective SSH ports/listeners do not match configuration.')
-        if socket_mode:
-            require(live_routes == desired_routes, 'Live SSH socket listeners differ from desired routes.')
+    if current_port is not None:
+        checks.probe('current inventory SSH route', current_route, ssh_ports is not None and live_ports is not None)
+    checks.probe('preserve live SSH routes', lambda: require(live_ports <= set(ssh_ports),
+        'Preserve existing live SSH routes in desired ports.'), ssh_ports is not None and live_ports is not None)
+    def adoption():
+        require(not legacy or not main_managed, 'Legacy Port directive conflicts with managed SSH configuration.')
+        require(all(record['port'] in ssh_ports for record in legacy), 'Legacy Port directive is outside desired SSH ports.')
+        require(not legacy or (current_port is not None and effective_ports <= set(ssh_ports)),
+                'Legacy Port directive differs from safe effective SSH ports.')
+        return bool(legacy)
+    adoptable = checks.probe('safe SSH adoption', adoption,
+                            config_ok and ssh_ports is not None and effective_ports is not None)
+    if config_ok:
+        checks.convergence('managed SSH port block', main_managed, False,
+                           'Harden can install the validated managed SSH port block.')
+    if adoptable:
+        checks.convergence('legacy SSH Ports', False, verify, 'Legacy SSH Ports can be adopted after staged validation.')
+    if effective_ports is not None and live_ports is not None and ssh_ports is not None:
+        checks.convergence('SSH port convergence', effective_ports == set(ssh_ports) == live_ports, verify,
+                           'Effective SSH ports/listeners do not match configuration.')
+    if socket_mode and socket_routes is not None and live_routes is not None and desired_routes is not None:
+        coherent = (generated_routes is None or generated_routes == socket_routes) and socket_ports == effective_ports
+        checks.convergence('generated/loaded SSH socket state', coherent, candidate or verify,
+                           'Generated socket file differs semantically from effective listeners or sshd configuration.')
+        if candidate:
+            checks.probe('generated desired SSH socket routes', lambda: require(socket_routes == desired_routes,
+                'Generated socket listeners differ from desired ports.'))
+        else:
+            checks.convergence('live SSH socket state', live_routes == socket_routes, verify,
+                               'Live SSH socket listeners differ semantically from effective configuration.')
+            checks.convergence('desired SSH socket routes', live_routes == desired_routes, verify,
+                               'Live SSH socket listeners differ from desired routes.')
+    checks.probe('socket candidate activation mode', lambda: require(not candidate or socket_mode,
+                 'Socket candidate requires socket activation.'))
+    result = {'ssh_adoption': legacy, 'ssh_sources': sources, 'ufw_installed': installed,
+              'ssh_activation': 'socket' if socket_mode else 'service',
+              'socket_reload_required': bool(socket_mode and (socket_routes != desired_routes or
+                  live_routes != desired_routes or (generated_routes is not None and generated_routes != socket_routes)))}
 
-    result = {'ssh_adoption': legacy, 'ssh_sources': sources, 'ufw_installed': installed, 'ssh_activation': 'socket' if socket_mode else 'service',
-              'socket_reload_required': socket_mode and (
-                  socket_routes != desired_routes or live_routes != desired_routes or
-                  (generated_routes is not None and generated_routes != socket_routes))}
+    status, rules = None, None
+    active = None
+    if installed:
+        def firewall_status():
+            _, text = run(['ufw', 'status', 'verbose'])
+            require(text.startswith(('Status: active', 'Status: inactive')), 'Unrecognized UFW status.')
+            return text
+        status = checks.probe('UFW installed and runtime status', firewall_status)
+        if status is not None:
+            active = status.startswith('Status: active')
+        rules = checks.probe('existing UFW rules', lambda: added_ports(run(['ufw', 'show', 'added'])[1]))
+        checks.probe('preserve managed UFW ports', lambda: require(rules <= wanted,
+            'Existing managed UFW ports were removed from desired configuration.'), rules is not None and wanted is not None)
     if candidate:
-        require(installed, 'SSH socket activation requires the prepared firewall.')
-        _, status = run(['ufw', 'status', 'verbose'])
-        require(set(ssh_ports) <= runtime_ports(status) and set(ssh_ports) <= runtime_ports(status, ipv6=True),
-                'All desired SSH ports must be allowed for IPv4 and IPv6 before socket activation.')
-        return result
-    if not installed:
-        require(not Path('/etc/systemd/system/ufw.service').exists() and
-                not Path('/etc/systemd/system/ufw.service.d').exists(), 'Orphan custom UFW unit detected.')
-        require(not Path('/etc/ufw').exists() and not Path('/etc/default/ufw').exists(), 'Orphan UFW configuration detected.')
-        require(not module.params['verify'], 'UFW is missing.')
-        return result
-
-    _, status = run(['ufw', 'status', 'verbose'])
-    require(status.startswith(('Status: active', 'Status: inactive')), 'Unrecognized UFW status.')
-    active = status.startswith('Status: active')
-    _, added = run(['ufw', 'show', 'added'])
-    rules = added_ports(added)
-    require(rules <= wanted, 'Existing managed UFW ports were removed from desired configuration.')
-    baseline = {name: fingerprint(Path(name)) for name in PROTECTED}
-    rule_hashes = {name: fingerprint(Path(name)) for name in RULE_FILES}
-    snapshot = {'base': baseline, 'rules': rule_hashes}
-    if STATE.exists():
-        require(STATE.is_file() and not STATE.is_symlink(), 'Unsafe UFW ownership marker.')
-        previous = json.loads(STATE.read_text())
-        require(previous['base'] == baseline, 'Protected UFW configuration changed outside the role.')
-        require(module.params['refresh_rules'] or previous['rules'] == rule_hashes,
-                'Raw UFW user rules changed outside the role.')
+        checks.probe('firewall prepared for socket activation', lambda: require(installed and status is not None and
+            set(ssh_ports) <= runtime_ports(status) and set(ssh_ports) <= runtime_ports(status, ipv6=True),
+            'All desired SSH ports must be allowed for IPv4 and IPv6 before socket activation.'), ssh_ports is not None)
+    elif not installed:
+        for name in ('/etc/systemd/system/ufw.service', '/etc/systemd/system/ufw.service.d',
+                     '/run/systemd/system/ufw.service', '/run/systemd/system/ufw.service.d',
+                     '/run/systemd/generator/ufw.service', '/run/systemd/generator/ufw.service.d',
+                     '/etc/ufw', '/etc/default/ufw'):
+            checks.probe('absent UFW orphan check ' + name, lambda name=name: require(
+                not Path(name).exists() and not Path(name).is_symlink(), 'Orphan UFW configuration or custom unit detected.'))
+        checks.convergence('UFW installed', False, verify, 'UFW is missing; harden can install it.')
     else:
-        require(not active and not rules, 'Existing UFW state is not owned by this role.')
-        for name in RULE_FILES:
-            pristine_rules(Path(name))
-        _, conffiles = run(['dpkg-query', '-W', '-f=${Conffiles}', 'ufw'])
-        package_files = {m[1]: m[2] for line in conffiles.splitlines()
-                         if (m := re.fullmatch(r'\s*(/\S+) ([0-9a-f]{32})(?: obsolete)?', line))}
-        for name in PROTECTED:
-            path = Path(name)
-            if path.exists():
-                require(name in package_files and hashlib.md5(path.read_bytes()).hexdigest() == package_files[name],
-                        'Unmanaged UFW base configuration detected.')
-    defaults = Path('/etc/default/ufw').read_text()
-    require(re.search(r'^IPV6=yes$', defaults, re.M) is not None, 'UFW must protect IPv4 and IPv6.')
-    incoming = re.findall(r'^DEFAULT_INPUT_POLICY="([A-Z]+)"$', defaults, re.M)
-    outgoing = re.findall(r'^DEFAULT_OUTPUT_POLICY="([A-Z]+)"$', defaults, re.M)
-    require(len(incoming) == len(outgoing) == 1, 'Ambiguous UFW default policy configuration.')
-    result.update(baseline=snapshot, ufw_active=active, marker_exists=STATE.exists(),
-                  incoming=incoming[0], outgoing=outgoing[0])
-    if module.params['verify']:
-        require(STATE.exists() and active and 'ENABLED=yes' in Path('/etc/ufw/ufw.conf').read_text().splitlines(),
-                'UFW must be enabled at runtime and boot.')
-        require('Default: deny (incoming), allow (outgoing),' in status and
-                incoming == ['DROP'] and outgoing == ['ACCEPT'], 'UFW default policies do not match.')
-        require(rules == wanted and wanted <= runtime_ports(status) and wanted <= runtime_ports(status, ipv6=True),
-                'Configured TCP ports must be allowed at runtime for IPv4 and IPv6.')
+        base = {name: checks.probe('UFW base file ' + name, lambda name=name: fingerprint(Path(name)))
+                for index, name in enumerate(PROTECTED, 1)}
+        hashes = {name: checks.probe('UFW raw rules file ' + name, lambda name=name: fingerprint(Path(name)))
+                  for index, name in enumerate(RULE_FILES, 1)}
+        snapshot = {'base': base, 'rules': hashes}
+        def marker():
+            if not safe_file(STATE, 'Unsafe UFW ownership marker.', optional=True):
+                return False
+            previous = json.loads(STATE.read_text())
+            require(isinstance(previous, dict) and set(previous) == {'base', 'rules'} and
+                    isinstance(previous['base'], dict) and isinstance(previous['rules'], dict), 'Unsafe UFW ownership marker.')
+            return previous
+        previous = checks.probe('UFW ownership marker', marker)
+        if isinstance(previous, dict):
+            checks.probe('protected UFW base configuration', lambda: require(previous['base'] == base,
+                         'Protected UFW configuration changed outside the role.'))
+            checks.probe('protected raw UFW rules', lambda: require(module.params['refresh_rules'] or previous['rules'] == hashes,
+                         'Raw UFW user rules changed outside the role.'))
+        elif previous is False:
+            checks.probe('unmanaged UFW ownership', lambda: require(not active and not rules,
+                         'Existing UFW state is not owned by this role.'), active is not None and rules is not None)
+            for index, name in enumerate(RULE_FILES, 1):
+                def raw_rules(name=name):
+                    safe_file(Path(name), 'Unexpected UFW configuration file type.', optional=True)
+                    pristine_rules(Path(name))
+                checks.probe('pristine raw UFW rules ' + name, raw_rules)
+            package_result = checks.probe('UFW package baseline available', lambda: run(['dpkg-query', '-W', '-f=${Conffiles}', 'ufw']))
+            package_files = {m[1]: m[2] for line in package_result[1].splitlines()
+                             if (m := re.fullmatch(r'\s*(/\S+) ([0-9a-f]{32})(?: obsolete)?', line))} if package_result else None
+            for index, name in enumerate(PROTECTED, 1):
+                def baseline(name=name):
+                    path = Path(name)
+                    if safe_file(path, 'Unexpected UFW configuration file type.', optional=True):
+                        require(name in package_files and hashlib.md5(path.read_bytes()).hexdigest() == package_files[name],
+                                'Unmanaged UFW base configuration detected; differs from package baseline.')
+                checks.probe('UFW package base file ' + name, baseline, package_files is not None)
+        def defaults():
+            path = Path('/etc/default/ufw')
+            safe_file(path, 'Unexpected UFW configuration file type.')
+            text = path.read_text()
+            require(re.search(r'^IPV6=yes$', text, re.M) is not None, 'UFW must protect IPv4 and IPv6.')
+            incoming = re.findall(r'^DEFAULT_INPUT_POLICY="([A-Z]+)"$', text, re.M)
+            outgoing = re.findall(r'^DEFAULT_OUTPUT_POLICY="([A-Z]+)"$', text, re.M)
+            require(len(incoming) == len(outgoing) == 1, 'Ambiguous UFW default policy configuration.')
+            return incoming[0], outgoing[0]
+        policies = checks.probe('UFW IPv4/IPv6 and default policy configuration', defaults)
+        def boot_enabled():
+            path = Path('/etc/ufw/ufw.conf')
+            safe_file(path, 'Unexpected UFW configuration file type.')
+            return 'ENABLED=yes' in path.read_text().splitlines()
+        boot = checks.probe('UFW boot configuration', boot_enabled)
+        if policies is not None and active is not None and rules is not None and wanted is not None:
+            result.update(baseline=snapshot, ufw_active=active, marker_exists=isinstance(previous, dict),
+                          incoming=policies[0], outgoing=policies[1])
+            checks.convergence('UFW runtime and boot enabled', isinstance(previous, dict) and active and boot is True, verify,
+                               'UFW must be enabled at runtime and boot.')
+            checks.convergence('UFW default policies', 'Default: deny (incoming), allow (outgoing),' in status and
+                               policies == ('DROP', 'ACCEPT'), verify, 'UFW default policies do not match.')
+            checks.convergence('desired UFW IPv4/IPv6 TCP rules', rules == wanted and wanted <= runtime_ports(status) and
+                               wanted <= runtime_ports(status, ipv6=True), verify,
+                               'Configured TCP ports must be allowed at runtime for IPv4 and IPv6.')
+
+    summary = checks.result()
+    if module.params.get('report_only', False):
+        # Public inspection exposes only fixed diagnoses, never fingerprints,
+        # adoption source paths/records or command/configuration contents.
+        return summary
+    if not summary['ready']:
+        raise SafetyError(summary['report'] + ' Review and reconcile manually; no automatic reset/removal.')
     return result
 
 
+def inspect_stream(params):
+    """SSH stdin entry point: standard library only, no remote Ansible payload files."""
+    import os
+    import shutil
+    import subprocess
+
+    class ReadOnlyHost:
+        def __init__(self):
+            self.params = params
+
+        @staticmethod
+        def get_bin_path(name):
+            return shutil.which(name)
+
+        @staticmethod
+        def run_command(argv, environ_update):
+            environment = os.environ.copy()
+            environment.update(environ_update)
+            process = subprocess.run(argv, capture_output=True, text=True,
+                                     env=environment, check=False)
+            return process.returncode, process.stdout, process.stderr
+
+    require(os.geteuid() == 0, 'Managed non-interactive sudo must reach root.')
+    print(json.dumps(inspect(ReadOnlyHost())))
+
+
 def main():
+    from ansible.module_utils.basic import AnsibleModule
+
     module = AnsibleModule(argument_spec={
-        'ssh_ports': {'type': 'list', 'elements': 'int', 'required': True},
-        'tcp_ports': {'type': 'list', 'elements': 'int', 'required': True},
+        'ssh_ports': {'type': 'raw', 'required': True},
+        'tcp_ports': {'type': 'raw', 'required': True},
         'verify': {'type': 'bool', 'default': False},
+        'report_only': {'type': 'bool', 'default': False},
         'refresh_rules': {'type': 'bool', 'default': False},
         'socket_candidate': {'type': 'bool', 'default': False},
         'current_port': {'type': 'int'},
@@ -440,7 +701,7 @@ def main():
         # Avoid dumping config, parser input or command stderr into failure output.
         import sys
         error = sys.exc_info()[1]
-        message = str(error) if isinstance(error, ValueError) and 'Review and reconcile manually;' in str(error) else \
+        message = str(error) if isinstance(error, SafetyError) else \
             'Cannot safely inspect hardening state. Review configuration manually.'
         module.fail_json(msg=message)
 

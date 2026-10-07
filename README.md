@@ -38,6 +38,7 @@ make verify-access
 make docker-host
 make verify-docker
 # Review hardening settings and provider recovery/network access below.
+make inspect-hardening
 make harden
 make verify-hardening
 ```
@@ -159,6 +160,7 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make verify-access` | Verify existing key-only ansible access | **LIVE / verification**, no managed configuration changes |
 | `make docker-host` | Provision Docker packages, logging policy and services | **LIVE / MUTATING**, managed key-only access |
 | `make verify-docker` | Check Docker/services and run a disposable container | **LIVE / verification**, transient container/image-cache changes |
+| `make inspect-hardening` | Report all Stage 3 safety findings before harden | **LIVE / read-only**, exit 0 for PASS/WARN, non-zero for FAIL |
 | `make harden` | Configure UFW and validated SSH listening ports | **LIVE / MUTATING**, managed key-only access |
 | `make verify-hardening` | Verify all configured SSH ports, UFW and active Docker/containerd | **LIVE / verification**, no managed state changes |
 | `make check` | YAML/Ansible lint, syntax, actionlint, wrapper tests | **OFFLINE** |
@@ -422,11 +424,36 @@ verification, SSH validation before replacement, unchanged fallback policy,
 SSH/UFW convergence, firewall enable ordering and verification without state
 writes. These tests do not establish production runtime success.
 
+`make inspect-hardening` is the read-only Stage 3 preflight. It verifies managed
+key-only access and `sudo -n` on the current inventory route, then collects all
+independent SSH, systemd, Docker/containerd and UFW safety findings in one compact
+report. This includes desired/effective/live ports, supported SSH files and legacy
+Port adoption, activation mode, disk/generated/loaded socket state, unit overrides,
+UFW package baselines, ownership, raw rules and unsafe file types. Config contents,
+credentials, command stderr and ownership fingerprints are never printed.
+
+`PASS` means the check already fits. `WARN` means harden can safely adopt or converge
+the state, such as supported legacy Ports, absent/inactive pristine UFW or stale
+stock socket state. `FAIL` blocks harden. Exit status is 0 without FAIL findings,
+including WARN-only reports, and non-zero when inspection is blocked. Resolve all
+FAIL findings before running harden; repeated harden attempts are not a diagnosis
+workflow. Checks that depend on unavailable/unsafe data are marked as unavailable;
+other safe checks continue. Without managed access/sudo, remote inspection cannot
+continue. Future SSH ports are inspected without requiring them to be reachable yet.
+
+Inspection streams the same `portfolio_hardening_info.py` implementation used by
+harden and verify-hardening over SSH stdin with `sudo -n` and Python `-B`; it creates
+no remote payload/temp files. It installs no packages, writes no files, changes no
+firewall/systemd state, performs no daemon-reload or SSH reload/restart, and runs no
+handlers. It preserves existing strict host trust. A ready report is a snapshot;
+harden repeats safety checks before mutation, while verification requires runtime
+convergence.
+
 Manual live validation on the already Docker-ready host:
 
 ```bash
 make verify-access &&
-make verify-docker &&
+make inspect-hardening &&
 make harden &&
 make verify-hardening &&
 make harden &&
