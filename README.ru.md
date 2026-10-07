@@ -311,7 +311,7 @@ stop и требует осознанной ручной миграции.
 
 `playbooks/harden.yml` вызывает `roles/host_hardening`. До изменений проверяются:
 неоднозначные activation modes, custom SSH/UFW service/socket units и нестандартные
-systemd drop-ins, unmanaged `Port`/`ListenAddress`, нестандартные SSH Include
+systemd drop-ins, unsupported legacy `Port`/unmanaged `ListenAddress`, нестандартные SSH Include
 hierarchies, занятые SSH-порты, неактивные Docker/containerd и неоднозначный UFW
 state останавливают роль. Поддерживается обычный `/etc/ssh/sshd_config` со
 стандартным include `/etc/ssh/sshd_config.d/*.conf` и управляемыми ролью listening
@@ -321,6 +321,29 @@ dependency drop-in принимается только с точными дир�
 и `Requires=ssh.socket`; socket address drop-ins должны быть созданы runtime
 generator Ubuntu. Custom overrides отклоняются. Все текущие live SSH listening
 ports должны оставаться в `ssh_listen_ports`.
+
+Допускается adoption ровно одной обычной legacy-директивы `Port <integer>` из
+основного файла или обычного файла стандартного include directory. Значение должно
+входить в desired list; текущий inventory port должен входить туда и быть live;
+effective SSH ports должны совпадать с legacy port, а live ports не должны содержать
+неизвестных ports. `ListenAddress`, несколько Port declarations (включая duplicates),
+legacy Port рядом с managed block, нестандартные/вложенные/условные или повторные
+Includes, symlinked configuration files и custom systemd/socket ownership по-прежнему
+останавливают роль до mutation. Диагностика указывает тип директивы без вывода SSH config.
+
+Read-only preflight сохраняет точные source path, line number, port и fingerprints
+файлов. После создания UFW rules для всех desired SSH ports `portfolio_ssh_adopt`
+собирает полный main/include candidate с managed block, удаляет только подтверждённую
+директиву, сохраняя inline comment и unrelated settings/comments. До записи выполняются
+`sshd -t` и проверка effective ports/public-key authentication через `sshd -T`;
+invalid candidate оставляет оригинальные SSH-файлы целыми. Изменения source после
+preflight останавливают adoption. Snippet и main заменяются атомарно по отдельности,
+с откатом при обнаруженной ошибке записи; единой filesystem transaction нет, поэтому
+прерванная запись требует проверки через recovery access. Существующие service/socket
+handlers валидируют и активируют установленную конфигурацию, затем wrapper проверяет
+независимые подключения на каждом desired port. После convergence legacy-директивы
+нет, следующий запуск даёт `changed=0`.
+
 Preflight проверяет штатную структуру generator/drop-ins без требования совпадения
 generated file на диске с уже загруженными listeners или `sshd -T`: эти состояния
 могут относиться к разным reload cycles. После `daemon-reload` generated
@@ -338,7 +361,7 @@ desired list содержит будущие ports. Текущий порт до
 существующий UFW должен быть inactive, без user rules, с package-original base
 configuration. Fingerprints сохраняются в `/etc/ufw/portfolio-hardening.json`;
 повторный запуск отклоняет посторонние изменения base/raw rules и unknown rules.
-Reset, удаление правил и замена unmanaged configuration не выполняются.
+Reset, удаление правил и произвольная замена unmanaged configuration не выполняются.
 После прерванного firewall mutation ownership snapshot может устареть: изучите
 реальное состояние и осознанно согласуйте его через recovery access до retry.
 Read-only модуль `library/portfolio_hardening_info.py` выполняет inspection.

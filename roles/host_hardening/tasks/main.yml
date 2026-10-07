@@ -109,6 +109,15 @@
     mode: '0600'
   become: true
 
+- name: Adopt the exact legacy SSH Port after firewall preparation and full candidate validation
+  portfolio_ssh_adopt:
+    sources: "{{ hardening_before.ssh_sources }}"
+    adoption: "{{ hardening_before.ssh_adoption }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+  become: true
+  when: hardening_before.ssh_adoption | length > 0
+  notify: Reload SSH after validated configuration changes
+
 - name: Configure SSH ports and public-key authentication with full candidate validation
   ansible.builtin.blockinfile:
     path: /etc/ssh/sshd_config

@@ -310,7 +310,7 @@ lists cause a safety stop and require deliberate manual migration.
 
 `playbooks/harden.yml` calls `roles/host_hardening`. Safety inspection precedes
 mutation: ambiguous activation modes, custom SSH/UFW service/socket units or
-nonstandard drop-ins, unmanaged `Port`/`ListenAddress` directives or nonstandard
+nonstandard drop-ins, unsupported legacy `Port`/unmanaged `ListenAddress` directives or nonstandard
 SSH Include hierarchies, occupied SSH ports, inactive Docker/containerd and
 ambiguous UFW state stop the role. Supported SSH input is the regular
 `/etc/ssh/sshd_config` with the standard `/etc/ssh/sshd_config.d/*.conf` include
@@ -320,6 +320,29 @@ activation modes. The standard socket dependency drop-in is accepted only with
 its exact `After=ssh.socket` and `Requires=ssh.socket` directives; socket address
 drop-ins must come from Ubuntu's runtime generator. Custom overrides are rejected.
 All existing live SSH listening ports must remain in `ssh_listen_ports`.
+
+A single plain legacy `Port <integer>` may be adopted from the main file or one
+regular file in the standard include directory. Its value must be desired, the
+current inventory port must be desired and live, and effective SSH ports must
+match that legacy port; live ports must contain no unknown ports. `ListenAddress`,
+multiple Port declarations (including duplicates), a legacy Port alongside the
+managed block, nonstandard/nested/conditional or repeated Includes, symlinked
+configuration files and custom systemd/socket ownership still stop before mutation.
+Diagnostics identify the directive type without dumping SSH configuration.
+
+Read-only preflight records the exact source path, line number, port and file
+fingerprints. After all desired SSH UFW rules exist, `portfolio_ssh_adopt` stages
+the complete main/include candidate with a managed block, removes only that
+approved directive and retains its inline comment and unrelated settings/comments.
+It validates with `sshd -t` and checks effective ports/public-key authentication
+with `sshd -T` before writing; an invalid candidate leaves original SSH files intact.
+Source changes since preflight abort adoption. Snippet and main replacements are
+atomic per file, with rollback on a reported write failure; they are not one
+filesystem transaction, so interrupted writes require recovery inspection.
+Existing service/socket handlers validate and activate the installed configuration,
+and the wrapper then verifies independent connections on every desired port.
+After convergence there is no legacy directive and the next run reports `changed=0`.
+
 Preflight validates stock generator/drop-in structure without requiring the generated
 file on disk to match currently loaded listeners or `sshd -T`: these states can
 belong to different reload cycles. After `daemon-reload`, generated `ListenStream`
@@ -336,7 +359,7 @@ Absent UFW is installed with `state: present`. Existing UFW must be inactive,
 without user rules and with package-original base configuration before first
 adoption. The role records fingerprints in `/etc/ufw/portfolio-hardening.json`;
 subsequent runs reject unrelated base/raw-rule changes and unknown rules. No
-reset, rule deletion or unmanaged configuration replacement is performed.
+reset, rule deletion or arbitrary unmanaged configuration replacement is performed.
 Interrupted firewall mutation can leave the ownership snapshot stale; inspect
 actual state and reconcile it deliberately through recovery access before retrying.
 The focused read-only `library/portfolio_hardening_info.py` module performs these

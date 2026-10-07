@@ -89,9 +89,10 @@ def ports(values, empty=False):
     return sorted(values)
 
 
-def unmanaged_ssh(text, main=False):
+def unmanaged_ssh(text, main=False, adopt=False):
     """Only the role's main-file block owns listening directives."""
     begin, end = (MARKER.format(mark=value) for value in ('BEGIN', 'END'))
+    managed = begin in text
     if main and (begin in text or end in text):
         require(text.count(begin) == text.count(end) == 1 and text.index(begin) < text.index(end),
                 'Malformed managed SSH block.')
@@ -100,15 +101,29 @@ def unmanaged_ssh(text, main=False):
         require(all(not line.strip() or re.fullmatch(r'(?:Port [0-9]+|PubkeyAuthentication yes)', line.strip())
                     for line in block.splitlines()), 'Unexpected directives inside managed SSH block.')
         text = text[:text.index(begin)] + text[text.index(end) + len(end):]
-    for line in text.splitlines():
+    legacy = []
+    matched = False
+    includes = 0
+    for number, line in enumerate(text.splitlines(), 1):
         fields = re.split(r'[\s=]+', line.split('#', 1)[0].strip())
         if not fields or not fields[0]:
             continue
         directive = fields[0].lower()
-        require(directive not in ('port', 'listenaddress'), 'Unmanaged SSH listening directives detected.')
+        require(directive != 'listenaddress', 'Unmanaged ListenAddress directive detected.')
+        if directive == 'match':
+            matched = True
+        if directive == 'port':
+            require(adopt and not matched and re.fullmatch(r'\s*Port[ \t]+[0-9]+[ \t]*(?:#.*)?', line),
+                    'Unsupported legacy Port directive detected.')
+            legacy.append({'line': number, 'port': int(fields[1])})
         if directive == 'include':
-            require(main and fields[1:] == ['/etc/ssh/sshd_config.d/*.conf'],
+            includes += 1
+            require(not matched and includes == 1 and main and
+                    re.fullmatch(r'\s*Include[ \t]+/etc/ssh/sshd_config\.d/\*\.conf[ \t]*(?:#.*)?', line, re.I),
                     'Unsupported SSH Include hierarchy detected.')
+    require(not legacy or not managed,
+            'Legacy Port directive conflicts with managed SSH configuration.')
+    return legacy
 
 
 def fingerprint(path):
@@ -285,9 +300,20 @@ def inspect(module):
     # Do not follow arbitrary include trees or overwrite their listening policy.
     main = Path('/etc/ssh/sshd_config')
     require(main.is_file() and not main.is_symlink(), 'Unsupported main SSH configuration.')
-    unmanaged_ssh(main.read_text(), main=True)
-    for name in glob.glob('/etc/ssh/sshd_config.d/*.conf'):
-        unmanaged_ssh(Path(name).read_text())
+    sources = []
+    legacy = []
+    for name in ['/etc/ssh/sshd_config'] + sorted(glob.glob('/etc/ssh/sshd_config.d/*.conf')):
+        path = Path(name)
+        require(path.is_file() and not path.is_symlink(), 'Unsupported SSH include file type.')
+        text = path.read_text()
+        records = unmanaged_ssh(text, main=name == '/etc/ssh/sshd_config', adopt=not module.params['verify'])
+        legacy.extend(dict(record, path=name) for record in records)
+        sources.append({'path': name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+    require(len(legacy) <= 1, 'Multiple/conflicting legacy Port directives detected.')
+    require(not legacy or MARKER.format(mark='BEGIN') not in main.read_text(),
+            'Legacy Port directive conflicts with managed SSH configuration.')
+    require(all(record['port'] in ssh_ports for record in legacy),
+            'Legacy Port directive is outside desired SSH ports.')
     _, effective = run(['/usr/sbin/sshd', '-T'])
     require('pubkeyauthentication yes' in effective.splitlines(), 'Public-key authentication must remain enabled.')
     _, sockets = run(['ss', '-H', '-ltnp'])
@@ -324,6 +350,9 @@ def inspect(module):
         ports([current_port])
         require(current_port in ssh_ports and current_port in live_ports,
                 'Current inventory SSH route must remain live and included in desired ports.')
+    require(not legacy or (current_port is not None and effective_ports <= set(ssh_ports) and
+                          effective_ports == {legacy[0]['port']}),
+            'Legacy Port directive differs from safe effective SSH ports.')
     for line in sockets.splitlines():
         fields = line.split()
         if len(fields) >= 4 and fields[3].rsplit(':', 1)[1].isdigit():
@@ -336,7 +365,7 @@ def inspect(module):
         if socket_mode:
             require(live_routes == desired_routes, 'Live SSH socket listeners differ from desired routes.')
 
-    result = {'ufw_installed': installed, 'ssh_activation': 'socket' if socket_mode else 'service',
+    result = {'ssh_adoption': legacy, 'ssh_sources': sources, 'ufw_installed': installed, 'ssh_activation': 'socket' if socket_mode else 'service',
               'socket_reload_required': socket_mode and (
                   socket_routes != desired_routes or live_routes != desired_routes or
                   (generated_routes is not None and generated_routes != socket_routes))}
