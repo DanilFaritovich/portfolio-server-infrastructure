@@ -144,3 +144,11 @@
 
 - name: Apply validated SSH configuration before independent connection verification
   ansible.builtin.meta: flush_handlers
+
+- name: Require strict runtime convergence after applying SSH listeners
+  portfolio_hardening_info:
+    current_port: "{{ ansible_port | int }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+    tcp_ports: "{{ firewall_allowed_tcp_ports }}"
+    verify: true
+  become: true

@@ -352,8 +352,10 @@ After convergence there is no legacy directive and the next run reports `changed
 Preflight validates stock generator/drop-in structure without requiring the generated
 file on disk to match currently loaded listeners or `sshd -T`: these states can
 belong to different reload cycles. After `daemon-reload`, generated `ListenStream`
-entries and systemd `Listen` are compared as TCP listener
-sets (address family, wildcard bind and port), including Ubuntu's explicit
+entries must exactly match desired TCP routes and effective `sshd -T` ports.
+Loaded systemd `Listen` and live listeners may still retain the old safe subset
+until restart. After restart all three route sets must exactly match desired
+routes (address family, wildcard bind and port), including Ubuntu's explicit
 `0.0.0.0:<port>` / `[::]:<port>` pair. IPv6 wildcard coverage of IPv4 follows
 `BindIPv6Only` and, for `default`, `/proc/sys/net/ipv6/bindv6only`; a family mismatch
 is still rejected. See [systemd socket binding semantics](https://www.freedesktop.org/software/systemd/man/systemd.socket.html#BindIPv6Only=).
@@ -386,15 +388,22 @@ candidate is validated with `sshd -t -f` before atomic replacement. A changed
 block or unconverged socket state notifies the handler, which repeats `sshd -t`.
 Service mode uses a narrow
 `ssh.service` reload. Socket mode runs `daemon-reload`, validates the generated
-and effective semantic listeners against each other, and their ports against
-`sshd -T` and the desired list while existing listeners remain available. Candidate
+candidate routes and `sshd -T` against the desired list while existing loaded/live
+listeners remain available as a safe subset. Candidate validation requires the
+generated file to exist and retain the supported stock structure. Candidate
 inspection also requires runtime IPv4/IPv6 UFW allow rules for all desired SSH
 ports before restarting `ssh.socket` and `ssh.service` in one
-ordered transaction. Preflight checks the actual socket/service dependencies and
+ordered transaction. The role then strictly verifies generated, loaded and live
+routes, effective SSH ports, Docker/containerd and the active UFW with exact desired
+IPv4/IPv6 TCP rules. The wrapper verifies fresh key-only SSH and `sudo -n` on every
+desired SSH port. Runtime mismatch is a hard failure. Preflight checks the actual socket/service dependencies and
 `KillMode=process` to preserve established sessions. A generated-port mismatch
 stops before listener restart; use recovery access to reconcile configuration
 before retrying. Socket drift also schedules these handlers when the installed
-SSH block is unchanged, allowing an interrupted transition to converge. A converged
+SSH block is unchanged, allowing an interrupted transition to converge in one
+`make harden` run. Safe pre-transition generated/loaded/live drift is reported as
+WARN by `make inspect-hardening`, which remains READY; it becomes PASS after
+convergence. A converged
 repeat run does not reload or restart SSH.
 See [Ubuntu socket activation](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189).
 See [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)

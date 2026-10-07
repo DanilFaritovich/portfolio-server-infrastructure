@@ -353,8 +353,10 @@ handlers валидируют и активируют установленную
 Preflight проверяет штатную структуру generator/drop-ins без требования совпадения
 generated file на диске с уже загруженными listeners или `sshd -T`: эти состояния
 могут относиться к разным reload cycles. После `daemon-reload` generated
-`ListenStream` и systemd `Listen` сравниваются как множества TCP
-listeners: address family, wildcard bind и port. Принимается штатная пара
+`ListenStream` должен точно совпасть с desired TCP routes и effective ports
+`sshd -T`. Loaded systemd `Listen` и live listeners могут сохранять старый
+безопасный subset до restart. После restart все три множества routes должны
+точно совпасть с desired: address family, wildcard bind и port. Принимается штатная пара
 Ubuntu `0.0.0.0:<port>` / `[::]:<port>`. Доступность IPv4 через IPv6 wildcard
 определяется `BindIPv6Only`, а при `default` — `/proc/sys/net/ipv6/bindv6only`;
 реальное несовпадение address families отклоняется. См.
@@ -386,17 +388,24 @@ IPv4 и IPv6 должны быть включены и проверены. В н
 managed port/public-key block; остальное содержимое сохраняется. Полный candidate
 проходит `sshd -t -f` до atomic replacement. Изменённый block или несошедшееся
 socket state вызывает handler, который повторяет `sshd -t`. В service mode выполняется узкий reload
-`ssh.service`. В socket mode выполняется `daemon-reload`, затем generated/effective
-semantic listeners сравниваются между собой, а их ports — с `sshd -T` и desired
-list, пока текущие listeners продолжают работать. Candidate inspection также
+`ssh.service`. В socket mode выполняется `daemon-reload`, затем generated
+candidate routes и `sshd -T` сравниваются с desired list, пока loaded/live
+listeners продолжают работать как безопасный subset. Candidate validation требует
+наличия generated file со штатной поддерживаемой структурой. Candidate inspection также
 требует runtime UFW allow для всех desired SSH ports в IPv4/IPv6 до restart.
 После успешной проверки `ssh.socket` и
-`ssh.service` перезапускаются одной упорядоченной транзакцией. Preflight проверяет
+`ssh.service` перезапускаются одной упорядоченной транзакцией. Затем role строго
+проверяет generated, loaded и live routes, effective SSH ports, Docker/containerd
+и active UFW с точными desired IPv4/IPv6 TCP rules. Wrapper проверяет свежий
+key-only SSH и `sudo -n` на каждом desired SSH port. Runtime mismatch завершает
+запуск ошибкой. Preflight проверяет
 фактические зависимости socket/service и `KillMode=process` для сохранения
 установленных сессий. Несовпадение generated ports останавливает выполнение до
 restart listeners; перед повторной попыткой согласуйте конфигурацию через recovery
 access. При socket drift handlers запускаются и с неизменённым установленным SSH
-block, чтобы завершить прерванный transition. Повторный запуск после convergence
+block, чтобы завершить прерванный transition за один `make harden`. Безопасный
+pre-transition drift generated/loaded/live даёт WARN в `make inspect-hardening`,
+который остаётся READY; после convergence эти проверки дают PASS. Повторный запуск после convergence
 не выполняет reload/restart SSH. См.
 [Ubuntu socket activation](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189),
 [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)

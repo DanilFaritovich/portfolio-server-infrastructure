@@ -779,6 +779,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         path = self.fixture_path(self.service_dropins)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('[Unit]\nAfter=ssh.socket\nRequires=ssh.socket\n')
+        self.generated_socket_fixture([2222, 2200])
 
     def test_socket_listener_semantics_and_ipv6_binding_policy(self):
         self.assertEqual(info.socket_listeners('0.0.0.0:22 (Stream) [::]:22 (Stream)'),
@@ -849,9 +850,9 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         with self.assertRaisesRegex(ValueError, 'Effective SSH ports/listeners'):
             self.inspect(fake)
         fake.params.update(verify=False, socket_candidate=True)
-        old_live = self.sockets
+        old_live, old_loaded = self.sockets, self.socket_listen
         self.socket_fixture_routes(desired)
-        self.sockets = old_live  # daemon-reload changes the candidate, not the live routes
+        self.sockets, self.socket_listen = old_live, old_loaded  # both retain old routes before restart
         self.generated_socket_fixture(desired)
         allowed = desired + fake.params['tcp_ports']
         self.status = ('Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n' +
@@ -886,7 +887,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         with self.assertRaisesRegex(ValueError, 'Generated socket file differs semantically'):
             self.inspect(fake)
         fake.params.update(verify=False, socket_candidate=True)
-        with self.assertRaisesRegex(ValueError, 'Generated socket file differs semantically'):
+        with self.assertRaisesRegex(ValueError, 'Generated socket listeners differ from desired ports'):
             self.inspect(fake)
         self.socket_fixture_routes([2222, 2200])
         self.generated_socket_fixture([2222, 2200])
@@ -915,6 +916,167 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
                 path.write_text(malformed)
                 with self.assertRaises(ValueError):
                     self.inspect(fake)
+
+    def test_candidate_safety_failures_and_post_restart_drift(self):
+        for failure in ('generated-ports', 'missing', 'unsafe', 'effective', 'ufw4', 'ufw6',
+                        'inactive-ufw', 'current', 'foreign', 'custom-unit', 'custom-dropin'):
+            with self.subTest(failure=failure):
+                fake = self.inspection_fixture()
+                self.enable_socket()
+                self.socket_fixture_routes([2222])
+                self.effective = 'port 2222\nport 2200\npubkeyauthentication yes\n'
+                generated = self.generated_socket_fixture([2222, 2200])
+                fake.params.update(verify=False, socket_candidate=True)
+                if failure == 'generated-ports':
+                    self.generated_socket_fixture([2222])
+                elif failure == 'missing':
+                    generated.unlink()
+                    self.socket_dropins = ''
+                elif failure == 'unsafe':
+                    generated.write_text('[Socket]\nListenStream=\nListenStream=127.0.0.1:2222\n')
+                elif failure == 'effective':
+                    self.effective = 'port 2222\npubkeyauthentication yes\n'
+                elif failure in ('ufw4', 'ufw6'):
+                    family = ' (v6)' if failure == 'ufw6' else ''
+                    self.status = self.status.replace(f'2200/tcp{family} ALLOW IN', f'2200/tcp{family} DENY IN')
+                elif failure == 'inactive-ufw':
+                    self.status = self.status.replace('Status: active', 'Status: inactive')
+                elif failure == 'current':
+                    self.sockets = ''
+                elif failure == 'foreign':
+                    self.sockets += '\nLISTEN 0 128 0.0.0.0:2200 0.0.0.0:* users:(("other",pid=20,fd=4))'
+                else:
+                    path = self.fixture_path('/etc/systemd/system/ssh.socket' +
+                                             ('.d/custom.conf' if failure == 'custom-dropin' else ''))
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text('[Socket]\nListenStream=2200\n')
+                with self.assertRaises(ValueError):
+                    self.inspect(fake)
+                self.assertFalse(any('restart' in call.args[0] for call in fake.run_command.call_args_list))
+        for drift in ('loaded', 'live', 'generated'):
+            with self.subTest(post_restart=drift):
+                fake = self.inspection_fixture()
+                self.enable_socket()
+                self.socket_fixture_routes([2222, 2200])
+                fake.params['verify'] = True
+                if drift == 'loaded':
+                    self.socket_listen = '[::]:2222 (Stream)'
+                elif drift == 'live':
+                    self.sockets = self.sockets.splitlines()[0]
+                else:
+                    self.generated_socket_fixture([2222])
+                with self.assertRaises(ValueError):
+                    self.inspect(fake)
+
+    def test_single_run_socket_transaction_with_real_candidate_and_runtime_inspector(self):
+        # Start exactly where the interrupted live run stopped: owned active UFW,
+        # managed/effective desired SSH config, but old loaded and live listeners.
+        fake = self.inspection_fixture()
+        self.enable_socket()
+        desired_effective = self.effective
+        self.socket_fixture_routes([2222])
+        self.effective = desired_effective
+        generated = self.generated_socket_fixture([2222])
+        fake.params.update(verify=False, report_only=True)
+        before = self.inspect(fake)
+        self.assertTrue(before['ready'], before['report'])
+        self.assertIn('WARN  generated/loaded SSH socket state', before['report'])
+        self.assertIn('WARN  live SSH socket state', before['report'])
+        fake.params['report_only'] = False
+        plan = self.inspect(fake)
+        self.assertTrue(plan['socket_reload_required'])
+
+        # Serialize only mocked read-only command replies for a real local Ansible
+        # invocation. The fixture module runs the production inspector unchanged.
+        replies = {json.dumps(call.args[0]): list(fake.run_command(*call.args, **call.kwargs))
+                   for call in list(fake.run_command.call_args_list)}
+        state = self.directory / 'replies.json'
+        state.write_text(json.dumps(replies))
+        old_generated = generated.read_text()
+        desired_generated = self.generated_socket_fixture([2222, 2200]).read_text()
+        generated.write_text(old_generated)
+        self.socket_fixture_routes([2222, 2200])
+        new_loaded = fake.run_command(['systemctl', 'show', 'ssh.socket',
+            '--property=FragmentPath,DropInPaths,Listen,Accept,Triggers,BindIPv6Only'])
+        new_live = fake.run_command(['ss', '-H', '-ltnp'])
+        library = self.directory / 'library'
+        library.mkdir()
+        code = (ROOT / 'library/portfolio_hardening_info.py').read_text()
+        code = code.replace('from pathlib import Path',
+            f'from pathlib import Path as RealPath\ndef Path(value):\n    return RealPath({str(self.directory)!r}) / str(value).lstrip("/")')
+        code = code.replace('    checks = Findings()\n', f'''    def fixture_command(argv, **kwargs):
+        return json.loads(RealPath({str(state)!r}).read_text())[json.dumps(argv)]
+    module.run_command = fixture_command
+    module.get_bin_path = lambda name: '/usr/sbin/ufw'
+    glob.glob = lambda pattern: []
+    checks = Findings()
+''')
+        (library / 'fixture_info.py').write_text(code)
+        events = self.directory / 'socket-events'
+        spy = self.directory / 'socket-transaction'
+        spy.write_text(f'''#!{ROOT / '.venv/bin/python'}
+import json, sys
+from pathlib import Path
+with Path({str(events)!r}).open('a') as stream:
+    stream.write(sys.argv[1] + '\\n')
+if sys.argv[1] == 'generate':
+    Path({str(generated)!r}).write_text({desired_generated!r})
+elif sys.argv[1] == 'restart':
+    path = Path({str(state)!r})
+    replies = json.loads(path.read_text())
+    replies[{json.dumps(['systemctl', 'show', 'ssh.socket', '--property=FragmentPath,DropInPaths,Listen,Accept,Triggers,BindIPv6Only'])!r}] = {list(new_loaded)!r}
+    replies[{json.dumps(['ss', '-H', '-ltnp'])!r}] = {list(new_live)!r}
+    path.write_text(json.dumps(replies))
+''')
+        spy.chmod(0o700)
+        handlers = yaml.safe_load((ROOT / 'roles/host_hardening/handlers/main.yml').read_text())
+        for handler in handlers:
+            handler.pop('become', None)
+            if 'portfolio_hardening_info' in handler:
+                handler['fixture_info'] = handler.pop('portfolio_hardening_info')
+            elif handler.get('ansible.builtin.systemd_service', {}).get('daemon_reload'):
+                handler.pop('ansible.builtin.systemd_service')
+                handler['ansible.builtin.command'] = {'argv': [str(spy), 'generate']}
+                handler['changed_when'] = False
+            elif handler.get('ansible.builtin.command', {}).get('argv', [None])[0] == 'systemctl':
+                self.assertEqual(handler['ansible.builtin.command']['argv'],
+                                 ['systemctl', 'restart', 'ssh.socket', 'ssh.service'])
+                handler['ansible.builtin.command'] = {'argv': [str(spy), 'restart']}
+            else:
+                handler.pop('ansible.builtin.command', None)
+                handler.pop('ansible.builtin.systemd_service', None)
+                handler['ansible.builtin.command'] = {'argv': [str(spy), 'syntax']}
+        schedule = copy.deepcopy(next(t for t in self.tasks if t['name'].startswith('Schedule socket convergence')))
+        final = copy.deepcopy(self.tasks[-1])
+        final.pop('become')
+        final['fixture_info'] = final.pop('portfolio_hardening_info')
+        self.assertTrue(final['fixture_info']['verify'])
+        playbook = self.directory / 'transaction.yml'
+        def run(reload_required):
+            playbook.write_text(yaml.safe_dump([{'hosts': 'localhost', 'gather_facts': False,
+                'vars': {'ansible_port': 2222, 'ssh_listen_ports': [2222, 2200],
+                         'firewall_allowed_tcp_ports': [80, 443], 'hardening_before': {
+                             'ssh_activation': 'socket', 'socket_reload_required': reload_required}},
+                'tasks': [schedule, {'ansible.builtin.meta': 'flush_handlers'}, final], 'handlers': handlers}]))
+            return subprocess.run([str(ROOT / '.venv/bin/ansible-playbook'), '-i', 'localhost,', '-c', 'local',
+                '-e', json.dumps({'ansible_python_interpreter': str(ROOT / '.venv/bin/python')}), str(playbook)],
+                cwd=ROOT, capture_output=True, text=True, timeout=30,
+                env=dict(os.environ, ANSIBLE_LIBRARY=str(library), ANSIBLE_NOCOLOR='1',
+                         ANSIBLE_HOME=str(self.directory / 'ansible'), ANSIBLE_LOCAL_TEMP=str(self.directory / 'tmp'),
+                         ANSIBLE_REMOTE_TEMP=str(self.directory / 'remote')))
+        first = run(plan['socket_reload_required'])
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(events.read_text().splitlines(), ['syntax', 'generate', 'restart'])
+        fake.params.update(verify=True, report_only=True)
+        after = self.inspect(fake)
+        self.assertTrue(all(f['status'] == 'PASS' for f in after['findings']), after['report'])
+        fake.params.update(verify=False, report_only=False)
+        converged = self.inspect(fake)
+        self.assertFalse(converged['socket_reload_required'])
+        second = run(converged['socket_reload_required'])
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn('changed=0', second.stdout)
+        self.assertEqual(events.read_text().splitlines(), ['syntax', 'generate', 'restart'])
 
     def test_candidate_requires_desired_routes_even_when_generated_and_loaded_agree(self):
         fake = self.inspection_fixture()
@@ -996,8 +1158,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
                 self.inspect(fake)
         path.write_text(generated)
         self.socket_listen = '[::]:2222 (Stream)'
-        with self.assertRaises(ValueError):
-            self.inspect(fake)
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
 
     def test_ambiguous_socket_configuration_stops_readonly(self):
         changes = [lambda: setattr(self, 'socket_enabled', 'disabled'),
@@ -1041,7 +1202,8 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         allow = next(i for i, task in enumerate(self.tasks) if task.get('loop') == '{{ ssh_listen_ports }}')
         config = next(i for i, task in enumerate(self.tasks) if 'ansible.builtin.blockinfile' in task)
         self.assertLess(allow, config)
-        self.assertEqual(self.tasks[-1]['ansible.builtin.meta'], 'flush_handlers')
+        self.assertEqual(self.tasks[-2]['ansible.builtin.meta'], 'flush_handlers')
+        self.assertIs(self.tasks[-1]['portfolio_hardening_info']['verify'], True)
 
     def test_port_assertions_and_absent_ufw_preflight(self):
         task = self.tasks[0]

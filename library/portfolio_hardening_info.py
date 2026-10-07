@@ -373,6 +373,8 @@ def inspect(module):
     checks = Findings()
     verify = module.params['verify']
     candidate = module.params.get('socket_candidate', False)
+    checks.probe('SSH validation phase', lambda: require(not (candidate and verify),
+                 'Select either pre-restart socket candidate or post-restart runtime verification.'))
 
     def run(argv, optional=False):
         rc, stdout, _ = module.run_command(argv, environ_update={'LC_ALL': 'C'})
@@ -555,18 +557,28 @@ def inspect(module):
     if effective_ports is not None and live_ports is not None and ssh_ports is not None:
         checks.convergence('SSH port convergence', effective_ports == set(ssh_ports) == live_ports, verify,
                            'Effective SSH ports/listeners do not match configuration.')
-    if socket_mode and socket_routes is not None and live_routes is not None and desired_routes is not None:
-        coherent = (generated_routes is None or generated_routes == socket_routes) and socket_ports == effective_ports
-        checks.convergence('generated/loaded SSH socket state', coherent, candidate or verify,
+    # Pre-restart validates the generated candidate only. Loaded systemd routes
+    # and inherited live descriptors may legitimately retain the old subset.
+    # Post-restart verification requires all three independent states to agree.
+    if candidate:
+        checks.probe('candidate effective SSH ports', lambda: require(effective_ports == set(ssh_ports),
+            'Candidate effective SSH ports differ from desired ports.'), ssh_ports is not None and effective_ports is not None)
+        checks.probe('generated desired SSH socket routes', lambda: require(
+            generated_routes is not None and generated_routes == desired_routes,
+            'Generated socket listeners differ from desired ports or generated configuration is missing.'),
+            desired_routes is not None)
+        checks.probe('safe live SSH socket subset', lambda: require(live_routes <= desired_routes,
+            'Existing live SSH socket routes must be a safe subset of desired routes.'),
+            live_routes is not None and desired_routes is not None)
+    elif socket_mode and socket_routes is not None and live_routes is not None and desired_routes is not None:
+        coherent = generated_routes == socket_routes and socket_ports == effective_ports
+        checks.convergence('generated/loaded SSH socket state', coherent, verify,
                            'Generated socket file differs semantically from effective listeners or sshd configuration.')
-        if candidate:
-            checks.probe('generated desired SSH socket routes', lambda: require(socket_routes == desired_routes,
-                'Generated socket listeners differ from desired ports.'))
-        else:
-            checks.convergence('live SSH socket state', live_routes == socket_routes, verify,
-                               'Live SSH socket listeners differ semantically from effective configuration.')
-            checks.convergence('desired SSH socket routes', live_routes == desired_routes, verify,
-                               'Live SSH socket listeners differ from desired routes.')
+        checks.convergence('live SSH socket state', live_routes == socket_routes == desired_routes, verify,
+                           'Live SSH socket listeners differ semantically from effective configuration.')
+        checks.convergence('desired SSH socket routes',
+                           generated_routes == socket_routes == live_routes == desired_routes, verify,
+                           'Generated, loaded or live SSH socket listeners differ from desired routes.')
     checks.probe('socket candidate activation mode', lambda: require(not candidate or socket_mode,
                  'Socket candidate requires socket activation.'))
     result = {'ssh_adoption': legacy, 'ssh_sources': sources, 'ufw_installed': installed,
@@ -588,7 +600,7 @@ def inspect(module):
         checks.probe('preserve managed UFW ports', lambda: require(rules <= wanted,
             'Existing managed UFW ports were removed from desired configuration.'), rules is not None and wanted is not None)
     if candidate:
-        checks.probe('firewall prepared for socket activation', lambda: require(installed and status is not None and
+        checks.probe('firewall prepared for socket activation', lambda: require(installed and active is True and status is not None and
             set(ssh_ports) <= runtime_ports(status) and set(ssh_ports) <= runtime_ports(status, ipv6=True),
             'All desired SSH ports must be allowed for IPv4 and IPv6 before socket activation.'), ssh_ports is not None)
     elif not installed:
@@ -667,8 +679,8 @@ def inspect(module):
                                'UFW must be enabled at runtime and boot.')
             checks.convergence('UFW default policies', 'Default: deny (incoming), allow (outgoing),' in status and
                                policies == ('DROP', 'ACCEPT'), verify, 'UFW default policies do not match.')
-            checks.convergence('desired UFW IPv4/IPv6 TCP rules', rules == wanted and wanted <= runtime_ports(status) and
-                               wanted <= runtime_ports(status, ipv6=True), verify,
+            checks.convergence('desired UFW IPv4/IPv6 TCP rules', rules == wanted and wanted == runtime_ports(status) and
+                               wanted == runtime_ports(status, ipv6=True), verify,
                                'Configured TCP ports must be allowed at runtime for IPv4 and IPv6.')
 
     summary = checks.result()
