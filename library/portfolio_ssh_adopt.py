@@ -1,10 +1,10 @@
 #!/usr/bin/python
-"""Validate a complete staged SSH tree before adopting one approved legacy Port."""
+"""Validate a complete staged SSH tree before adopting approved legacy Ports."""
 
 DOCUMENTATION = r'''
 ---
 module: portfolio_ssh_adopt
-short_description: Adopt an exact preflight-approved legacy SSH Port
+short_description: Adopt exact preflight-approved legacy SSH Ports
 description:
   - Preserve unrelated settings and validate staged main configuration and includes before writing.
 options:
@@ -61,11 +61,9 @@ def adopt(module):
     records = module.params['adoption']
     if not records:
         return False
-    require(len(records) == 1)
-    record = records[0]
     wanted = module.params['ssh_ports']
     require(wanted and all(type(p) is int and 1 <= p <= 65535 for p in wanted) and
-            len(wanted) == len(set(wanted)) and record['port'] in wanted)
+            len(wanted) == len(set(wanted)))
     sources = module.params['sources']
     names = [s['path'] for s in sources]
     require(len(names) == len(set(names)) and set(names) == {MAIN, *glob.glob(INCLUDES)})
@@ -76,16 +74,44 @@ def adopt(module):
         data = path.read_bytes()
         require(hashlib.sha256(data).hexdigest() == source['sha256'])
         original[source['path']] = data
-    require(record['path'] in original and BEGIN.encode() not in original[MAIN] and END.encode() not in original[MAIN])
+    require(BEGIN.encode() not in original[MAIN] and END.encode() not in original[MAIN])
+    approved = {}
+    for record in records:
+        require(set(record) == {'path', 'line', 'port'} and record['path'] in original and
+                type(record['line']) is int and record['line'] > 0 and
+                type(record['port']) is int and record['port'] in wanted)
+        location = (record['path'], record['line'])
+        require(location not in approved)
+        approved[location] = record['port']
     candidate = dict(original)
-    lines = candidate[record['path']].decode().splitlines(keepends=True)
-    require(type(record['line']) is int and 1 <= record['line'] <= len(lines))
-    index = record['line'] - 1
-    match = re.fullmatch(r'([ \t]*)Port[ \t]+([0-9]+)[ \t]*(#[^\r\n]*)?(\r?\n)?', lines[index])
-    require(match is not None and int(match[2]) == record['port'])
-    # Keep inline comments, and every unrelated byte, without a generic deletion.
-    lines[index] = (match[1] + match[3] + (match[4] or '')) if match[3] else ''
-    candidate[record['path']] = ''.join(lines).encode()
+    found = set()
+    for name, data in original.items():
+        lines = data.splitlines(keepends=True)
+        matched = False
+        includes = 0
+        for number, line in enumerate(lines, 1):
+            fields = re.split(rb'[\s=]+', line.split(b'#', 1)[0].strip())
+            directive = fields[0].lower()
+            require(directive != b'listenaddress')
+            if directive == b'match':
+                matched = True
+            if directive == b'include':
+                includes += 1
+                require(not matched and name == MAIN and includes == 1 and
+                        re.fullmatch(rb'[ \t]*Include[ \t]+' + re.escape(INCLUDES.encode()) +
+                                     rb'[ \t]*(?:#[^\r\n]*)?(?:\r?\n)?', line, re.I))
+            location = (name, number)
+            if directive != b'port':
+                require(location not in approved)
+                continue
+            match = re.fullmatch(rb'([ \t]*)Port[ \t]+([0-9]+)[ \t]*(#[^\r\n]*)?(\r?\n)?', line)
+            require(not matched and match is not None and location in approved and
+                    int(match[2]) == approved[location])
+            found.add(location)
+            # Preserve every unrelated byte and the approved directive's inline comment.
+            lines[number - 1] = (match[1] + match[3] + (match[4] or b'')) if match[3] else b''
+        candidate[name] = b''.join(lines)
+    require(found == set(approved))
     block = BEGIN + '\n' + ''.join(f'Port {p}\n' for p in sorted(wanted)) + 'PubkeyAuthentication yes\n' + END + '\n'
     candidate[MAIN] = block.encode() + candidate[MAIN]
     with tempfile.TemporaryDirectory(prefix='portfolio-ssh-', dir=module.tmpdir) as directory:
@@ -96,11 +122,11 @@ def adopt(module):
             if name != MAIN:
                 (snippets / Path(name).name).write_bytes(data)
         # The supported Include is redirected only in the validation copy.
-        text = candidate[MAIN].decode()
-        text = re.sub(r'(?im)^(\s*Include[ \t]+)' + re.escape(INCLUDES) + r'([ \t]*(?:#.*)?)$',
-                      lambda m: m[1] + str(snippets / '*.conf') + m[2], text)
+        text = candidate[MAIN]
+        text = re.sub(rb'(?im)^([ \t]*Include[ \t]+)' + re.escape(INCLUDES.encode()) + rb'([ \t]*(?:#[^\r\n]*)?\r?)$',
+                      lambda m: m[1] + str(snippets / '*.conf').encode() + m[2], text)
         validation = stage / 'sshd_config'
-        validation.write_text(text)
+        validation.write_bytes(text)
         rc, _, _ = module.run_command(['/usr/sbin/sshd', '-t', '-f', str(validation)])
         if rc:
             raise ValueError('SSH adoption candidate failed sshd -t; original SSH files are intact.')
@@ -122,13 +148,20 @@ def adopt(module):
                     continue
                 temporary = stage / f'apply-{number}'
                 temporary.write_bytes(candidate[name])
-                module.atomic_move(str(temporary), name)
+                # Include the attempted file: atomic_move can report failure after replacement.
                 applied.append(name)
-        except BaseException:
-            for number, name in enumerate(reversed(applied)):
-                temporary = stage / f'rollback-{number}'
-                temporary.write_bytes(original[name])
                 module.atomic_move(str(temporary), name)
+        except BaseException:
+            rollback_failed = False
+            for number, name in enumerate(reversed(applied)):
+                try:
+                    temporary = stage / f'rollback-{number}'
+                    temporary.write_bytes(original[name])
+                    module.atomic_move(str(temporary), name)
+                except BaseException:
+                    rollback_failed = True
+            if rollback_failed:
+                raise ValueError('SSH adoption rollback failed; inspect files through recovery access.')
             raise
     return True
 

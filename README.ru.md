@@ -322,22 +322,26 @@ dependency drop-in принимается только с точными дир�
 generator Ubuntu. Custom overrides отклоняются. Все текущие live SSH listening
 ports должны оставаться в `ssh_listen_ports`.
 
-Допускается adoption ровно одной обычной legacy-директивы `Port <integer>` из
-основного файла или обычного файла стандартного include directory. Значение должно
-входить в desired list; текущий inventory port должен входить туда и быть live;
-effective SSH ports должны совпадать с legacy port, а live ports не должны содержать
-неизвестных ports. `ListenAddress`, несколько Port declarations (включая duplicates),
-legacy Port рядом с managed block, нестандартные/вложенные/условные или повторные
-Includes, symlinked configuration files и custom systemd/socket ownership по-прежнему
-останавливают роль до mutation. Диагностика указывает тип директивы без вывода SSH config.
+Допускается adoption проверенного набора обычных global legacy-директив `Port <integer>`
+из основного файла и обычных файлов стандартного include directory. Поддерживаются
+несколько разных desired ports и повторные директивы с одинаковым портом. Каждое
+значение должно входить в desired list; текущий inventory port должен входить туда
+и быть live; effective и live SSH ports не должны содержать ports вне desired set.
+`ListenAddress`, Port внутри Match или с unsupported syntax, legacy Port рядом с
+managed block, нестандартные/вложенные/условные или повторные Includes, symlinked
+configuration files и custom systemd/socket ownership по-прежнему останавливают
+роль до mutation. Диагностика указывает тип директивы без вывода SSH config.
 
 Read-only preflight сохраняет точные source path, line number, port и fingerprints
 файлов. После создания UFW rules для всех desired SSH ports `portfolio_ssh_adopt`
-собирает полный main/include candidate с managed block, удаляет только подтверждённую
-директиву, сохраняя inline comment и unrelated settings/comments. До записи выполняются
+собирает полный main/include candidate с managed block из unique sorted desired ports,
+удаляет только подтверждённые exact records, сохраняя inline comments и все unrelated
+bytes/settings. Повторные records с одинаковыми source/line отклоняются. До записи выполняются
 `sshd -t` и проверка effective ports/public-key authentication через `sshd -T`;
-invalid candidate оставляет оригинальные SSH-файлы целыми. Изменения source после
-preflight останавливают adoption. Snippet и main заменяются атомарно по отдельности,
+Effective candidate ports должны точно совпадать с desired set, public-key authentication
+должна быть включена; invalid candidate оставляет оригинальные SSH-файлы целыми.
+Source fingerprints повторно проверяются непосредственно перед записью; изменения
+source после preflight останавливают adoption. Snippet и main заменяются атомарно по отдельности,
 с откатом при обнаруженной ошибке записи; единой filesystem transaction нет, поэтому
 прерванная запись требует проверки через recovery access. Существующие service/socket
 handlers валидируют и активируют установленную конфигурацию, затем wrapper проверяет

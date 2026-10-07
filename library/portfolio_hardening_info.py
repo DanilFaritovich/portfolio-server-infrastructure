@@ -305,11 +305,11 @@ def inspect(module):
     for name in ['/etc/ssh/sshd_config'] + sorted(glob.glob('/etc/ssh/sshd_config.d/*.conf')):
         path = Path(name)
         require(path.is_file() and not path.is_symlink(), 'Unsupported SSH include file type.')
-        text = path.read_text()
+        data = path.read_bytes()
+        text = data.decode()
         records = unmanaged_ssh(text, main=name == '/etc/ssh/sshd_config', adopt=not module.params['verify'])
         legacy.extend(dict(record, path=name) for record in records)
-        sources.append({'path': name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
-    require(len(legacy) <= 1, 'Multiple/conflicting legacy Port directives detected.')
+        sources.append({'path': name, 'sha256': hashlib.sha256(data).hexdigest()})
     require(not legacy or MARKER.format(mark='BEGIN') not in main.read_text(),
             'Legacy Port directive conflicts with managed SSH configuration.')
     require(all(record['port'] in ssh_ports for record in legacy),
@@ -350,8 +350,7 @@ def inspect(module):
         ports([current_port])
         require(current_port in ssh_ports and current_port in live_ports,
                 'Current inventory SSH route must remain live and included in desired ports.')
-    require(not legacy or (current_port is not None and effective_ports <= set(ssh_ports) and
-                          effective_ports == {legacy[0]['port']}),
+    require(not legacy or (current_port is not None and effective_ports <= set(ssh_ports)),
             'Legacy Port directive differs from safe effective SSH ports.')
     for line in sockets.splitlines():
         fields = line.split()

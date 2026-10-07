@@ -321,22 +321,26 @@ its exact `After=ssh.socket` and `Requires=ssh.socket` directives; socket addres
 drop-ins must come from Ubuntu's runtime generator. Custom overrides are rejected.
 All existing live SSH listening ports must remain in `ssh_listen_ports`.
 
-A single plain legacy `Port <integer>` may be adopted from the main file or one
-regular file in the standard include directory. Its value must be desired, the
-current inventory port must be desired and live, and effective SSH ports must
-match that legacy port; live ports must contain no unknown ports. `ListenAddress`,
-multiple Port declarations (including duplicates), a legacy Port alongside the
-managed block, nonstandard/nested/conditional or repeated Includes, symlinked
-configuration files and custom systemd/socket ownership still stop before mutation.
+A verified set of plain global legacy `Port <integer>` directives may be adopted
+from the main file and regular files in the standard include directory. Different
+desired ports and repeated declarations of the same port are supported. Every value
+must be desired, the current inventory port must be desired and live, and effective
+and live SSH ports must contain no ports outside the desired set. `ListenAddress`,
+Match-scoped or unsupported Port syntax, a legacy Port alongside the managed block,
+nonstandard/nested/conditional or repeated Includes, symlinked configuration files
+and custom systemd/socket ownership still stop before mutation.
 Diagnostics identify the directive type without dumping SSH configuration.
 
 Read-only preflight records the exact source path, line number, port and file
 fingerprints. After all desired SSH UFW rules exist, `portfolio_ssh_adopt` stages
-the complete main/include candidate with a managed block, removes only that
-approved directive and retains its inline comment and unrelated settings/comments.
+the complete main/include candidate with a managed block, removes only the
+approved exact records and retains their inline comments and all unrelated bytes/settings.
+Duplicate source/line records are rejected. The managed block contains unique sorted desired ports.
 It validates with `sshd -t` and checks effective ports/public-key authentication
 with `sshd -T` before writing; an invalid candidate leaves original SSH files intact.
-Source changes since preflight abort adoption. Snippet and main replacements are
+Effective candidate ports must exactly equal the desired set, with public-key authentication enabled.
+Source fingerprints are rechecked immediately before writes; source changes since preflight
+abort adoption. Snippet and main replacements are
 atomic per file, with rollback on a reported write failure; they are not one
 filesystem transaction, so interrupted writes require recovery inspection.
 Existing service/socket handlers validate and activate the installed configuration,

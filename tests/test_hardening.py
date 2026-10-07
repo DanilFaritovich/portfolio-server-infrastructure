@@ -741,8 +741,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         for content, diagnostic in (
                 ('Port 2201\n', 'outside desired'),
                 ('ListenAddress 0.0.0.0\n', 'ListenAddress'),
-                ('Port 2222\nPort 2200\n', 'Multiple/conflicting'),
-                ('Port 2222\nPort 2222\n', 'Multiple/conflicting'),
+                ('Match User other\nPort 2222\n', 'legacy Port'),
                 ('Port=2222\n', 'legacy Port'),
                 ('Include /custom/*.conf\n', 'Include'),
                 ('Include /etc/ssh/sshd_config.d/*.conf\nInclude /etc/ssh/sshd_config.d/*.conf\n', 'Include')):
@@ -814,7 +813,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
 
                     def fail_main_once(src, dest):
                         writes.append(dest)
-                        if dest == '/etc/ssh/sshd_config':
+                        if dest == '/etc/ssh/sshd_config' and writes.count(dest) == 1:
                             raise SystemExit('synthetic atomic_move failure')
                         os.replace(src, self.fixture_path(dest))
 
@@ -823,7 +822,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
                         adoption.adopt(module)
                     for name, data in original.items():
                         self.assertEqual(self.fixture_path(name).read_bytes(), data)
-                    self.assertEqual(writes, [source, '/etc/ssh/sshd_config', source])
+                    self.assertEqual(writes, [source, '/etc/ssh/sshd_config', '/etc/ssh/sshd_config', source])
                     module.atomic_move.side_effect = lambda src, dest: os.replace(src, self.fixture_path(dest))
                 self.assertTrue(adoption.adopt(module))
                 self.assertTrue(main.read_text().startswith(adoption.BEGIN))
@@ -840,9 +839,104 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
                     patch.object(info.glob, 'glob', return_value=snippets):
                 self.assertEqual(info.inspect(fake)['ssh_adoption'], [])
 
+    def test_multiple_exact_records_adopt_and_converge(self):
+        for content, snippet_content in (
+                (b'Port 2222\nPort 2200\n', None),
+                (b'Port 2222 # first\r\nPort 2200 # second\n', None),
+                (b'Port 2222 # first\nPort 2222 # second\n', None),
+                (b'Port 2222 # first\n', b'Port 2200 # second\nPort 2222 # duplicate\n')):
+            with self.subTest(content=content, snippet=snippet_content):
+                fake = self.inspection_fixture(managed=False, active=False)
+                main_name = '/etc/ssh/sshd_config'
+                main = self.fixture_path(main_name)
+                snippets = []
+                main.write_bytes(b'# unrelated provider\n' + content +
+                                 b'Include /etc/ssh/sshd_config.d/*.conf\r\nPasswordAuthentication yes\n')
+                if snippet_content is not None:
+                    name = '/etc/ssh/sshd_config.d/50-provider.conf'
+                    path = self.fixture_path(name)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b'# snippet\n' + snippet_content + b'PermitRootLogin yes\n')
+                    snippets.append(name)
+                self.effective = 'port 2222\nport 2200\npubkeyauthentication yes\n'
+                with patch.object(info, 'Path', side_effect=self.fixture_path), patch.object(info, 'STATE', self.marker), \
+                        patch.object(info.glob, 'glob', return_value=snippets):
+                    plan = info.inspect(fake)
+                self.assertEqual(len(plan['ssh_adoption']), 3 if snippets else 2)
+                original = {s['path']: self.fixture_path(s['path']).read_bytes() for s in plan['ssh_sources']}
+                module = Mock(params={'ssh_ports': [2222, 2200], 'sources': plan['ssh_sources'],
+                                      'adoption': plan['ssh_adoption']}, tmpdir=str(self.directory), check_mode=False)
+                def validate(argv):
+                    staged = Path(argv[-1])
+                    text = staged.read_text()
+                    self.assertEqual(text.splitlines()[1:4], ['Port 2200', 'Port 2222', 'PubkeyAuthentication yes'])
+                    self.assertNotIn('Port 2222 #', text)
+                    self.assertNotIn(adoption.INCLUDES, text)
+                    for path in staged.parent.glob('includes/*.conf'):
+                        self.assertNotIn('Port ', path.read_text())
+                    return 0, 'port 2200\nport 2222\npubkeyauthentication yes\n', ''
+                module.run_command.side_effect = validate
+                module.atomic_move.side_effect = lambda src, dest: os.replace(src, self.fixture_path(dest))
+                with patch.object(adoption, 'Path', side_effect=self.fixture_path), \
+                        patch.object(adoption.glob, 'glob', return_value=snippets):
+                    records = module.params['adoption']
+                    for malformed in (records + [records[0]], [records[0] | {'line': True}],
+                                      [records[0] | {'port': 9999}], [records[0] | {'line': 100}],
+                                      [records[0] | {'path': '/custom/sshd_config'}]):
+                        module.params['adoption'] = malformed
+                        with self.assertRaises(ValueError):
+                            adoption.adopt(module)
+                        module.atomic_move.assert_not_called()
+                    module.params['adoption'] = records
+                    # Drift introduced by validation must also abort immediately before writes.
+                    def drift(argv):
+                        result = validate(argv)
+                        if '-T' in argv:
+                            main.write_bytes(original[main_name] + b'# drift\n')
+                        return result
+                    module.run_command.side_effect = drift
+                    with self.assertRaises(ValueError):
+                        adoption.adopt(module)
+                    module.atomic_move.assert_not_called()
+                    main.write_bytes(original[main_name])
+                    module.run_command.side_effect = validate
+                    if snippets:
+                        writes = []
+                        def fail_main(src, dest):
+                            writes.append(dest)
+                            os.replace(src, self.fixture_path(dest))
+                            if dest == main_name and writes.count(dest) == 1:
+                                raise OSError('synthetic failure after replacement')
+                        module.atomic_move.side_effect = fail_main
+                        with self.assertRaises(OSError):
+                            adoption.adopt(module)
+                        self.assertEqual(original, {n: self.fixture_path(n).read_bytes() for n in original})
+                        module.atomic_move.side_effect = lambda src, dest: os.replace(src, self.fixture_path(dest))
+                    self.assertTrue(adoption.adopt(module))
+                    for name, data in original.items():
+                        expected = data
+                        for record in records:
+                            if record['path'] == name:
+                                line = data.splitlines(keepends=True)[record['line'] - 1]
+                                comment = line[line.index(b'#'):] if b'#' in line else b''
+                                expected = expected.replace(line, comment, 1)
+                        if name == main_name:
+                            block = (adoption.BEGIN + '\nPort 2200\nPort 2222\nPubkeyAuthentication yes\n' +
+                                     adoption.END + '\n').encode()
+                            expected = block + expected
+                        self.assertEqual(self.fixture_path(name).read_bytes(), expected)
+                    with patch.object(info, 'Path', side_effect=self.fixture_path), patch.object(info, 'STATE', self.marker), \
+                            patch.object(info.glob, 'glob', return_value=snippets):
+                        refreshed = info.inspect(fake)
+                    self.assertEqual(refreshed['ssh_adoption'], [])
+                    module.params['adoption'] = refreshed['ssh_adoption']
+                    module.atomic_move.reset_mock()
+                    self.assertFalse(adoption.adopt(module))
+                    module.atomic_move.assert_not_called()
+
     def test_adoption_with_real_local_ansible_then_changed_zero(self):
         main = self.directory / 'sshd_config'
-        main.write_text('# provider\nPort 2222 # keep\nPasswordAuthentication yes\n')
+        main.write_text('# provider\nPort 2222 # keep\nPort 2200 # other\nPort 2222 # duplicate\nPasswordAuthentication yes\n')
         main.chmod(0o644)
         snippets = self.directory / 'sshd_config.d'
         snippets.mkdir()
@@ -878,7 +972,8 @@ if '-T' in sys.argv:
                                                   validate=f'{validator} -t -f %s')
         variables = {'ssh_listen_ports': [2222, 2200], 'hardening_before': {
             'ssh_sources': [{'path': str(main), 'sha256': hashlib.sha256(main.read_bytes()).hexdigest()}],
-            'ssh_adoption': [{'path': str(main), 'line': 2, 'port': 2222}]}}
+            'ssh_adoption': [{'path': str(main), 'line': line, 'port': port}
+                             for line, port in ((2, 2222), (3, 2200), (4, 2222))]}}
         original = main.read_bytes()
         invalid = self.directory / 'invalid'
         invalid.touch()
@@ -890,7 +985,7 @@ if '-T' in sys.argv:
         first = self.local_ansible([task, block], variables)
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertIn('changed=1', first.stdout)
-        self.assertTrue(main.read_text().endswith('# provider\n# keep\nPasswordAuthentication yes\n'))
+        self.assertTrue(main.read_text().endswith('# provider\n# keep\n# other\n# duplicate\nPasswordAuthentication yes\n'))
         variables['hardening_before']['ssh_adoption'] = []
         second = self.local_ansible([task, block], variables)
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
