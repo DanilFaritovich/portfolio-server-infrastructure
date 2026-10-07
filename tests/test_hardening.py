@@ -716,7 +716,8 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
                 dropins = self.socket_dropins if name == 'ssh.socket' else self.service_dropins if name == 'ssh.service' else ''
                 text = f'FragmentPath=/usr/lib/systemd/system/{name}\nDropInPaths={dropins}\n'
                 if name == 'ssh.socket':
-                    text += f'Listen={self.socket_listen}\nAccept=no\nTriggers=ssh.service\nBindIPv6Only={self.ipv6_policy}\n'
+                    listen = self.socket_listen.replace(' (Stream) ', ' (Stream)\nListen=')
+                    text += f'Listen={listen}\nAccept=no\nTriggers=ssh.service\nBindIPv6Only={self.ipv6_policy}\n'
                 return 0, text, ''
             if argv[0] == 'systemctl' and argv[2] == 'ssh.socket':
                 state = self.socket if argv[1] == 'is-active' else self.socket_enabled
@@ -811,6 +812,37 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
                         ''.join(f'ListenStream={addr}:{port}\n' for port in ports
                                 for addr in ('0.0.0.0', '[::]')))
         return path
+
+    def test_systemctl_repeated_listen_rows_preserve_all_ipv4_ipv6_routes(self):
+        fake = self.inspection_fixture()
+        self.enable_socket()
+        fake.params.update(ssh_ports=[22, 2222], verify=True, report_only=True)
+        main = self.fixture_path('/etc/ssh/sshd_config')
+        main.write_text(main.read_text().replace('Port 2200', 'Port 22'))
+        self.ipv6_policy = 'ipv6-only'
+        self.socket_fixture_routes([2222, 22])
+        self.generated_socket_fixture([2222, 22])
+        self.status = self.status.replace('2200/tcp', '22/tcp')
+        self.added = self.added.replace('2200/tcp', '22/tcp')
+        result = self.inspect(fake)
+        self.assertTrue(result['ready'], result['report'])
+        for label in ('generated/loaded SSH socket state', 'live SSH socket state', 'desired SSH socket routes'):
+            self.assertIn('PASS  ' + label, result['report'])
+        fake.params.update(report_only=False, verify=False)
+        self.assertFalse(self.inspect(fake)['socket_reload_required'])
+        fake.params['socket_candidate'] = True
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        # A genuine missing loaded IPv4 listener must still fail strict verification.
+        self.socket_listen = self.socket_listen.replace('0.0.0.0:22 (Stream)', '')
+        fake.params.update(socket_candidate=False, verify=True)
+        with self.assertRaises(ValueError):
+            self.inspect(fake)
+
+    def test_systemctl_duplicate_scalar_properties_remain_ambiguous(self):
+        def run(argv):
+            return 0, 'BindIPv6Only=both\nBindIPv6Only=ipv6-only\n'
+        with self.assertRaises(ValueError):
+            info.unit_properties(run, 'ssh.socket', ['BindIPv6Only'])
 
     def test_ubuntu_generated_entries_and_effective_listen_are_semantically_equivalent(self):
         fake = self.inspection_fixture()

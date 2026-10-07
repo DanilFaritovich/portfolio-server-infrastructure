@@ -356,7 +356,8 @@ generated file на диске с уже загруженными listeners ил
 `ListenStream` должен точно совпасть с desired TCP routes и effective ports
 `sshd -T`. Loaded systemd `Listen` и live listeners могут сохранять старый
 безопасный subset до restart. После restart все три множества routes должны
-точно совпасть с desired: address family, wildcard bind и port. Принимается штатная пара
+точно совпасть с desired: address family, wildcard bind и port. Inspector
+объединяет все строки `Listen=` из `systemctl show`. Принимается штатная пара
 Ubuntu `0.0.0.0:<port>` / `[::]:<port>`. Доступность IPv4 через IPv6 wildcard
 определяется `BindIPv6Only`, а при `default` — `/proc/sys/net/ipv6/bindv6only`;
 реальное несовпадение address families отклоняется. См.

@@ -355,7 +355,8 @@ belong to different reload cycles. After `daemon-reload`, generated `ListenStrea
 entries must exactly match desired TCP routes and effective `sshd -T` ports.
 Loaded systemd `Listen` and live listeners may still retain the old safe subset
 until restart. After restart all three route sets must exactly match desired
-routes (address family, wildcard bind and port), including Ubuntu's explicit
+routes (address family, wildcard bind and port). Inspection combines every
+`Listen=` row emitted by `systemctl show`, including Ubuntu's explicit
 `0.0.0.0:<port>` / `[::]:<port>` pair. IPv6 wildcard coverage of IPv4 follows
 `BindIPv6Only` and, for `default`, `/proc/sys/net/ipv6/bindv6only`; a family mismatch
 is still rejected. See [systemd socket binding semantics](https://www.freedesktop.org/software/systemd/man/systemd.socket.html#BindIPv6Only=).

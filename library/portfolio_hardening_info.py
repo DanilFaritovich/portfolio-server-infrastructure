@@ -217,7 +217,18 @@ def listeners(text):
 
 def unit_properties(run, name, properties):
     _, text = run(['systemctl', 'show', name, '--property=' + ','.join(properties)])
-    result = dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
+    result = {}
+    for line in text.splitlines():
+        if '=' not in line:
+            continue
+        prop, value = line.split('=', 1)
+        # systemctl show prints one Listen= row per socket, including separate
+        # IPv4/IPv6 entries. A dict comprehension silently loses every earlier row.
+        if prop == 'Listen' and prop in result:
+            result[prop] += ' ' + value
+        else:
+            require(prop not in result, 'Ambiguous repeated systemd scalar property.')
+            result[prop] = value
     require(all(prop in result for prop in properties), 'Incomplete systemd unit inspection.')
     return result
 
