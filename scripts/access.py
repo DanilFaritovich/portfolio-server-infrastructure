@@ -19,7 +19,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KEY = Path.home() / '.ssh/portfolio-server-infrastructure/ansible_ed25519'
 PASSWORD_CONNECTION = 'portfolio_password'
-HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'ansible_python_interpreter'}
+HARDENING_FIELDS = {'ssh_listen_ports', 'firewall_allowed_tcp_ports'}
+HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'ansible_python_interpreter'} | HARDENING_FIELDS
 SSH_BASE = '-o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=15'
 
 
@@ -58,7 +59,9 @@ def load_host(path):
                 'Use a simple host alias such as portfolio.')
         require(alias != 'localhost', 'Reserve localhost for the controller; use a separate VPS alias.')
         require(isinstance(values, dict) and set(values) <= HOST_FIELDS,
-                'Only host, port, initial user and Python interpreter belong in this inventory.')
+                'Only host, port, initial user, Python interpreter and hardening port lists belong in inventory.')
+        for name in HARDENING_FIELDS & values.keys():
+            validate_ports(values[name], allow_empty=name == 'firewall_allowed_tcp_ports')
         host = values.get('ansible_host')
         port = values.get('ansible_port')
         user = values.get('ansible_user', 'root')
@@ -75,6 +78,24 @@ def load_host(path):
         # Parser exceptions can include inventory contents: do not expose them.
         raise ValueError('Invalid inventory. Use the static example structure without credentials.') from None
     return alias, host, port, user, interpreter
+
+
+def validate_ports(values, allow_empty=False):
+    require(isinstance(values, list) and (allow_empty or values) and
+            all(type(port) is int and 1 <= port <= 65535 for port in values) and
+            len(values) == len(set(values)), 'Hardening ports must be unique integers from 1 to 65535.')
+
+
+def hardening_inputs(path, alias, port):
+    # load_host has already validated the complete static inventory structure.
+    host = yaml.safe_load(path.read_text())['all']['children']['bootstrap']['hosts'][alias]
+    result = {'ssh_listen_ports': host.get('ssh_listen_ports', [port]),
+              'firewall_allowed_tcp_ports': host.get('firewall_allowed_tcp_ports', [80, 443])}
+    for name, values in result.items():
+        validate_ports(values, allow_empty=name == 'firewall_allowed_tcp_ports')
+    require(port in result['ssh_listen_ports'],
+            'Keep current ansible_port in ssh_listen_ports. Add new ports alongside the current route first.')
+    return result
 
 
 def key_path(value):
@@ -224,12 +245,13 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
 
 def live(mode, inventory, key):
     prerequisites(mode)
-    if mode in ('docker-host', 'verify-docker'):
+    if mode in ('docker-host', 'verify-docker', 'harden', 'verify-hardening'):
         try:
             check_key(key)
         except (ValueError, OSError):
             raise ValueError('Managed access is not ready. Run make bootstrap-user first; check the dedicated key pair.') from None
     alias, host, port, user, _ = load_host(inventory)
+    inputs = hardening_inputs(inventory, alias, port) if mode in ('harden', 'verify-hardening') else {}
     known_host(host, port, allow_trust=mode == 'bootstrap-user')
     if mode == 'bootstrap-user':
         require(sys.stdin.isatty(), 'Bootstrap requires an interactive terminal for the Ansible password prompt.')
@@ -265,12 +287,26 @@ def live(mode, inventory, key):
         # Host-level ansible_become=False would override task-level become=True.
         stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
         run_playbook(inventory, alias, stage | {'ansible_become_flags': '-n'}, mode + '.yml')
+    if mode in ('harden', 'verify-hardening'):
+        stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
+        stage['ansible_become_flags'] = '-n'
+        if mode == 'harden':
+            print('LIVE / MUTATING: UFW and SSH listening ports. Keep provider recovery console access.', flush=True)
+            run_playbook(inventory, alias, stage | inputs, 'harden.yml')
+        # Each configured port gets a new independent connection. Reuse the
+        # already trusted host identity via HostKeyAlias; never scan/accept keys.
+        identity = host if port == 22 else f'[{host}]:{port}'
+        for target_port in inputs['ssh_listen_ports']:
+            connection = stage | {'ansible_port': target_port,
+                                  'ansible_ssh_args': stage['ansible_ssh_args'] + f' -o HostKeyAlias={identity}'}
+            run_playbook(inventory, alias, connection, 'verify.yml')
+            run_playbook(inventory, alias, connection | inputs, 'verify-hardening.yml')
     print('Requested stage completed. STOP.')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker'])
+    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=str(DEFAULT_KEY))
     args = parser.parse_args()

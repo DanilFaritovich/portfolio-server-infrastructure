@@ -9,3 +9,6 @@ all:
           ansible_port: 22
           ansible_user: root
           ansible_python_interpreter: /usr/bin/python3
+          # Keep the current port during the first transition, e.g. [22, 2222].
+          ssh_listen_ports: [22]
+          firewall_allowed_tcp_ports: [80, 443]

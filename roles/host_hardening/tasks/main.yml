@@ -1,0 +1,127 @@
+---
+- name: Validate hardening port lists and preserve the current SSH route
+  ansible.builtin.assert:
+    that:
+      - ssh_listen_ports is sequence and ssh_listen_ports is not string
+      - firewall_allowed_tcp_ports is sequence and firewall_allowed_tcp_ports is not string
+      - ssh_listen_ports | length > 0
+      - ssh_listen_ports | unique | length == ssh_listen_ports | length
+      - firewall_allowed_tcp_ports | unique | length == firewall_allowed_tcp_ports | length
+      - ansible_port | int in ssh_listen_ports
+      - (ssh_listen_ports + firewall_allowed_tcp_ports) | select('integer') | list == (ssh_listen_ports + firewall_allowed_tcp_ports)
+      - (ssh_listen_ports + firewall_allowed_tcp_ports) | min >= 1
+      - (ssh_listen_ports + firewall_allowed_tcp_ports) | max <= 65535
+    fail_msg: Use unique integer port lists and include the current ansible_port; retain recovery console access.
+    quiet: true
+
+- name: Inspect SSH and firewall safety before any mutation
+  portfolio_hardening_info:
+    ssh_ports: "{{ ssh_listen_ports }}"
+    tcp_ports: "{{ firewall_allowed_tcp_ports }}"
+  become: true
+  register: hardening_before
+
+- name: Install the Ubuntu firewall without upgrading existing packages
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+    update_cache: true
+  become: true
+  when: not hardening_before.ufw_installed
+
+- name: Inspect installed UFW before adopting its pristine configuration
+  portfolio_hardening_info:
+    ssh_ports: "{{ ssh_listen_ports }}"
+    tcp_ports: "{{ firewall_allowed_tcp_ports }}"
+  become: true
+  register: hardening_firewall
+
+- name: Record ownership of pristine UFW base configuration
+  ansible.builtin.copy:
+    content: "{{ hardening_firewall.baseline | to_nice_json }}\n"
+    dest: /etc/ufw/portfolio-hardening.json
+    owner: root
+    group: root
+    mode: '0600'
+  become: true
+  when: not hardening_firewall.marker_exists
+
+# UFW's CLI is itself idempotent. No new collection is needed; report actual
+# rule additions/updates only, and never reset/delete an existing ruleset.
+- name: Allow all configured SSH ports before enabling or tightening the firewall
+  ansible.builtin.command:
+    argv: [ufw, allow, in, "{{ item }}/tcp", comment, portfolio-host-hardening]
+  environment:
+    LC_ALL: C
+  loop: "{{ ssh_listen_ports }}"
+  become: true
+  register: hardening_ssh_allow
+  changed_when: "'Rule added' in hardening_ssh_allow.stdout or 'Rule updated' in hardening_ssh_allow.stdout"
+
+- name: Allow additional incoming TCP ports
+  ansible.builtin.command:
+    argv: [ufw, allow, in, "{{ item }}/tcp", comment, portfolio-host-hardening]
+  environment:
+    LC_ALL: C
+  loop: "{{ firewall_allowed_tcp_ports }}"
+  become: true
+  register: hardening_tcp_allow
+  changed_when: "'Rule added' in hardening_tcp_allow.stdout or 'Rule updated' in hardening_tcp_allow.stdout"
+
+- name: Deny incoming traffic by default after SSH rules exist
+  ansible.builtin.command:
+    argv: [ufw, default, deny, incoming]
+  become: true
+  changed_when: true
+  when: hardening_firewall.incoming != 'DROP'
+
+- name: Allow outgoing traffic by default
+  ansible.builtin.command:
+    argv: [ufw, default, allow, outgoing]
+  become: true
+  changed_when: true
+  when: hardening_firewall.outgoing != 'ACCEPT'
+
+- name: Enable UFW only after all SSH allow rules exist
+  ansible.builtin.command:
+    argv: [ufw, --force, enable]
+  become: true
+  changed_when: true
+  when: not hardening_firewall.ufw_active
+
+- name: Read fingerprints after role-owned firewall changes
+  portfolio_hardening_info:
+    ssh_ports: "{{ ssh_listen_ports }}"
+    tcp_ports: "{{ firewall_allowed_tcp_ports }}"
+    refresh_rules: true
+  become: true
+  register: hardening_after_firewall
+
+- name: Record the resulting managed firewall rule fingerprints
+  ansible.builtin.copy:
+    content: "{{ hardening_after_firewall.baseline | to_nice_json }}\n"
+    dest: /etc/ufw/portfolio-hardening.json
+    owner: root
+    group: root
+    mode: '0600'
+  become: true
+
+- name: Configure SSH ports and public-key authentication with full candidate validation
+  ansible.builtin.blockinfile:
+    path: /etc/ssh/sshd_config
+    marker: '# {mark} ANSIBLE PORTFOLIO SSH PORTS'
+    insertbefore: BOF
+    block: |
+      {% for port in ssh_listen_ports | sort %}
+      Port {{ port }}
+      {% endfor %}
+      PubkeyAuthentication yes
+    validate: /usr/sbin/sshd -t -f %s
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  notify: Reload SSH after validated configuration changes
+
+- name: Apply validated SSH configuration before independent connection verification
+  ansible.builtin.meta: flush_handlers

@@ -1,0 +1,13 @@
+---
+- name: Validate installed SSH configuration immediately before reload
+  ansible.builtin.command:
+    argv: [/usr/sbin/sshd, -t]
+  become: true
+  changed_when: false
+  listen: Reload SSH after validated configuration changes
+
+- name: Reload SSH after validated configuration changes
+  ansible.builtin.systemd_service:
+    name: ssh.service
+    state: reloaded
+  become: true

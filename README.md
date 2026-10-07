@@ -6,12 +6,13 @@ Host provisioning through Ansible for an Ubuntu VPS. The pipeline is:
 
 ```text
 local setup -> bootstrap managed ansible user -> verify access
--> provision Docker host -> verify Docker -> STOP
+-> provision Docker host -> verify Docker
+-> firewall + validated SSH host ports -> verify hardening -> STOP
 ```
 
 Docker Engine, Compose and Buildx are prepared for future workloads. Caddy,
 application networks/Compose files, Vue, domains/TLS, GHCR authentication,
-deployment/CD, firewall, SSH/root/password-login hardening, fail2ban and
+deployment/CD, human/admin access and final root/password-login policy, fail2ban and
 automatic upgrades belong to separate stages.
 
 ## Quick Start
@@ -36,6 +37,9 @@ make bootstrap-user
 make verify-access
 make docker-host
 make verify-docker
+# Review hardening settings and provider recovery/network access below.
+make harden
+make verify-hardening
 ```
 
 `make setup` verifies minimal system tools, installs checksum-verified pinned
@@ -155,6 +159,8 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make verify-access` | Verify existing key-only ansible access | **LIVE / verification**, no managed configuration changes |
 | `make docker-host` | Provision Docker packages, logging policy and services | **LIVE / MUTATING**, managed key-only access |
 | `make verify-docker` | Check Docker/services and run a disposable container | **LIVE / verification**, transient container/image-cache changes |
+| `make harden` | Configure UFW and validated SSH listening ports | **LIVE / MUTATING**, managed key-only access |
+| `make verify-hardening` | Verify all configured SSH ports, UFW and active Docker/containerd | **LIVE / verification**, no managed state changes |
 | `make check` | YAML/Ansible lint, syntax, actionlint, wrapper tests | **OFFLINE** |
 | `make ci` | Same offline checks as `make check` | **OFFLINE** |
 
@@ -177,7 +183,7 @@ isolation, preflight failure before provisioning, example inventory rejection,
 Make/CI offline boundaries, unchanged probes and guaranteed smoke cleanup.
 Selected safety assertions and daemon-policy convergence run with real Ansible
 on temporary local fixtures with network connections blocked. Syntax checks
-cover all four entry-point playbooks; lint includes both roles.
+cover all six entry-point playbooks; lint includes all three roles.
 
 Checks always use `inventories/production.example.yml`, never production
 inventory, keys, passwords or VPS connections. Wrapper tests use temporary
@@ -273,6 +279,106 @@ The second `make docker-host` should report `changed=0` if external state has no
 changed. Live access, installation, runtime behavior and full host idempotency
 must be verified manually; the agent has not run these commands against the VPS.
 
+## Host hardening stage (Stage 3)
+
+Stage 3 starts from a verified Docker-ready host. It creates no human/admin users
+or personal keys and leaves `PermitRootLogin`, `PasswordAuthentication` and
+`KbdInteractiveAuthentication` unchanged. Final access policy belongs to Stage 4.
+Before invoking `make harden`, keep a working human/recovery SSH session and verify
+provider-console access. Provider security groups must allow every intended SSH
+port; Ansible cannot configure the provider's network controls.
+
+Declare port lists under the existing host in the local inventory. Existing
+inventories are preserved by setup, so add these fields yourself if needed:
+
+```yaml
+ansible_port: 22
+ssh_listen_ports: [22, 2222]
+firewall_allowed_tcp_ports: [80, 443]
+```
+
+The role has no fixed SSH port: omitted `ssh_listen_ports` defaults to the current
+`ansible_port`. Web ports default to 80 and 443; Caddy is not installed. Both lists
+accept multiple unique integers from 1 to 65535; the additional TCP list may be
+empty. The first transition must include the currently verified `ansible_port`.
+Thus moving from 22 to 2222 starts with `[22, 2222]`, preserving the working route.
+A host already reached on 2222 can use `[2222]` directly. Do not remove the last
+human/recovery route before Stage 4. A later inventory-port change also requires
+independently verified `known_hosts` trust for that port; this stage never saves
+new trust or edits the inventory. Existing UFW rules excluded from the desired
+lists cause a safety stop and require deliberate manual migration.
+
+`playbooks/harden.yml` calls `roles/host_hardening`. Safety inspection precedes
+mutation: active/enabled `ssh.socket`, custom SSH/UFW service units/drop-ins,
+unmanaged `Port`/`ListenAddress` directives or nonstandard SSH Include hierarchies,
+occupied SSH ports, inactive Docker/containerd and ambiguous UFW state stop the
+role. Supported SSH input is the regular `/etc/ssh/sshd_config` with the standard
+`/etc/ssh/sshd_config.d/*.conf` include and role-owned listening directives.
+Socket-activated hosts require a separate deliberate migration to `ssh.service`
+through existing administrative/recovery access; the role never disables a
+socket or restarts SSH automatically.
+
+Absent UFW is installed with `state: present`. Existing UFW must be inactive,
+without user rules and with package-original base configuration before first
+adoption. The role records fingerprints in `/etc/ufw/portfolio-hardening.json`;
+subsequent runs reject unrelated base/raw-rule changes and unknown rules. No
+reset, rule deletion or unmanaged configuration replacement is performed.
+Interrupted firewall mutation can leave the ownership snapshot stale; inspect
+actual state and reconcile it deliberately through recovery access before retrying.
+The focused read-only `library/portfolio_hardening_info.py` module performs these
+checks. UFW CLI commands are used without an additional collection; their rule
+operations are idempotent and report actual additions/updates.
+
+All SSH allow rules precede default incoming deny, default outgoing allow and
+UFW enable. Both IPv4 and IPv6 must be enabled and verified. The role prepends a
+managed SSH port/public-key block while preserving the rest of the file. The full
+candidate is validated with `sshd -t -f` before atomic replacement; only a changed
+block notifies the handler, which repeats `sshd -t` before a narrow SSH reload.
+See [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
+and [OpenSSH configuration](https://man.openbsd.org/sshd_config).
+
+Both public targets first verify existing independent `ansible` key-only access
+and `sudo -n`. After provisioning, the wrapper opens fresh connections on **each**
+configured SSH port and repeats access/sudo and hardening checks. It pins the
+already trusted identity using [OpenSSH HostKeyAlias](https://man.openbsd.org/ssh_config#HostKeyAlias),
+with strict checking and connection sharing disabled. A failed connection stops
+immediately; use recovery access, without blindly retrying changes.
+`make verify-hardening` uses the same independent connections and read-only
+inspection: valid/effective SSH configuration and exact daemon listeners, UFW
+active/enabled, deny incoming/allow outgoing, every configured TCP allow rule for
+IPv4/IPv6, unchanged ownership fingerprints, and active Docker/containerd.
+It installs nothing, invokes no handlers and creates no smoke container.
+Transient Ansible module files are cleaned up as in access verification.
+
+Docker's own forwarding rules remain unchanged. UFW host-input policy does not
+by itself constrain future Docker-published container ports; application network
+security remains part of the separate deployment stage. See
+[Docker and UFW](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw).
+
+Offline regression tests use synthetic inventories and opaque keys, mocked
+inspection commands, and real local Ansible with network blocked. They exercise
+preflight failures, managed/controller connection isolation, every-port
+verification, SSH validation before replacement, unchanged fallback policy,
+SSH/UFW convergence, firewall enable ordering and verification without state
+writes. These tests do not establish production runtime success.
+
+Manual live validation on the already Docker-ready host:
+
+```bash
+make setup
+make check
+make verify-access
+make verify-docker
+make harden
+make verify-hardening
+make harden
+make verify-hardening
+```
+
+The second `make harden` must report `changed=0` if external state has not changed.
+The agent runs offline checks only; live safety, listeners and idempotency require
+this manual validation. STOP after Stage 3.
+
 ## Overrides and troubleshooting
 
 Make accepts a local inventory path and an absolute private-key path outside the
@@ -295,7 +401,7 @@ An existing administrator can replace `ansible_user: root` in inventory without
 changing the role. It must support SSH password login and sudo; bootstrap then
 also requests its sudo password through native `--ask-become-pass`. The managed
 user for these Make targets remains `ansible`. Inventory supports only one host
-and the example's host, port, initial user and Python-interpreter fields;
+and the example's host, port, initial user, Python-interpreter and hardening port-list fields;
 credentials and extra runtime variables are rejected.
 
 All generated runtimes/tooling stay in ignored `.tools`, `.venv`, `.ansible`
