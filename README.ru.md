@@ -297,8 +297,18 @@ keys не создаются; `PermitRootLogin`, `PasswordAuthentication` и
 ```yaml
 ansible_port: 22
 ssh_listen_ports: [22, 2222]
+# Необязательно: внешние проверки доступа (по умолчанию все ssh_listen_ports).
+ssh_verify_ports: [22, 2222]
 firewall_allowed_tcp_ports: [80, 443]
 ```
+
+`ssh_verify_ports` — непустой список уникальных integer ports из
+`ssh_listen_ports`. Если сеть компьютера блокирует порт 22, сохраните
+`ssh_listen_ports: [22, 2222]`, используйте доступный `ansible_port: 2222` и задайте
+`ssh_verify_ports: [2222]`. Оба server listeners и IPv4/IPv6 UFW rules остаются
+обязательными; выбранные ports ограничивают только внешние SSH/sudo probes.
+Внешняя доступность порта 22 при этом не подтверждается. Без этой настройки
+проверяются подключения на всех listening ports.
 
 Фиксированного SSH-порта в роли нет: без `ssh_listen_ports` используется текущий
 `ansible_port`. Web ports по умолчанию — 80 и 443; Caddy не устанавливается.
@@ -347,7 +357,7 @@ source после preflight останавливают adoption. Snippet и main
 с откатом при обнаруженной ошибке записи; единой filesystem transaction нет, поэтому
 прерванная запись требует проверки через recovery access. Существующие service/socket
 handlers валидируют и активируют установленную конфигурацию, затем wrapper проверяет
-независимые подключения на каждом desired port. После convergence legacy-директивы
+независимые подключения на каждом порту из `ssh_verify_ports`. После convergence legacy-директивы
 нет, следующий запуск даёт `changed=0`.
 
 Preflight проверяет штатную структуру generator/drop-ins без требования совпадения
@@ -398,7 +408,7 @@ listeners продолжают работать как безопасный subs
 `ssh.service` перезапускаются одной упорядоченной транзакцией. Затем role строго
 проверяет generated, loaded и live routes, effective SSH ports, Docker/containerd
 и active UFW с точными desired IPv4/IPv6 TCP rules. Wrapper проверяет свежий
-key-only SSH и `sudo -n` на каждом desired SSH port. Runtime mismatch завершает
+key-only SSH и `sudo -n` на каждом порту из `ssh_verify_ports`. Runtime mismatch завершает
 запуск ошибкой. Preflight проверяет
 фактические зависимости socket/service и `KillMode=process` для сохранения
 установленных сессий. Несовпадение generated ports останавливает выполнение до
@@ -414,7 +424,7 @@ pre-transition drift generated/loaded/live даёт WARN в `make inspect-harden
 
 Оба public targets сначала проверяют независимый `ansible` key-only access и
 `sudo -n`. После provisioning wrapper открывает новое соединение на **каждом**
-configured SSH port и повторяет access/sudo и hardening checks. Уже доверенная
+порту из `ssh_verify_ports` и повторяет access/sudo и hardening checks. Уже доверенная
 host identity закрепляется через
 [OpenSSH HostKeyAlias](https://man.openbsd.org/ssh_config#HostKeyAlias), с strict
 checking и отключённым connection sharing. Ошибка соединения немедленно
@@ -425,7 +435,8 @@ incoming deny/outgoing allow, все configured TCP allow rules для IPv4/IPv6
 неизменённые ownership fingerprints и active Docker/containerd. Проверка ничего
 не устанавливает, не вызывает handlers и не создаёт smoke container. Временные
 Ansible module files очищаются как при access verification.
-Это post-convergence verification: требуются все configured SSH ports.
+Это post-convergence verification: на сервере обязательны все routes из
+`ssh_listen_ports`; внешний доступ обязателен на каждом порту из `ssh_verify_ports`.
 До первого успешного `make harden` timeout на будущем порту возможен; сам по
 себе он не означает lockout текущего inventory route. Wrapper сообщает failed
 configured port и направляет к `make verify-access` и recovery access.

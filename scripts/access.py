@@ -20,7 +20,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KEY = Path.home() / '.ssh/portfolio-server-infrastructure/ansible_ed25519'
 PASSWORD_CONNECTION = 'portfolio_password'
-HARDENING_FIELDS = {'ssh_listen_ports', 'firewall_allowed_tcp_ports'}
+HARDENING_FIELDS = {'ssh_listen_ports', 'ssh_verify_ports', 'firewall_allowed_tcp_ports'}
 HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'ansible_python_interpreter'} | HARDENING_FIELDS
 SSH_BASE = '-o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=15'
 
@@ -92,10 +92,13 @@ def hardening_inputs(path, alias, port, validate=True):
     host = yaml.safe_load(path.read_text())['all']['children']['bootstrap']['hosts'][alias]
     result = {'ssh_listen_ports': host.get('ssh_listen_ports', [port]),
               'firewall_allowed_tcp_ports': host.get('firewall_allowed_tcp_ports', [80, 443])}
+    result['ssh_verify_ports'] = host.get('ssh_verify_ports', result['ssh_listen_ports'])
     if not validate:
         return result
     for name, values in result.items():
         validate_ports(values, allow_empty=name == 'firewall_allowed_tcp_ports')
+    require(set(result['ssh_verify_ports']) <= set(result['ssh_listen_ports']),
+            'ssh_verify_ports must be a non-empty subset of ssh_listen_ports.')
     require(port in result['ssh_listen_ports'],
             'Keep current ansible_port in ssh_listen_ports. Add new ports alongside the current route first.')
     return result
@@ -334,13 +337,12 @@ def live(mode, inventory, key):
         if mode == 'harden':
             print('LIVE / MUTATING: UFW and SSH listening ports. Keep provider recovery console access.', flush=True)
             run_playbook(inventory, alias, stage | inputs, 'harden.yml')
-        # Each configured port gets a new independent connection. Reuse the
+        # Each selected verification port gets a new independent connection. Reuse the
         # already trusted host identity via HostKeyAlias; never scan/accept keys.
         identity = host if port == 22 else f'[{host}]:{port}'
-        print('LIVE / POST-CONVERGENCE VERIFY: all configured SSH ports are required. '
-              'Before the first successful make harden, future ports may be unavailable; '
-              'this alone does not mean the current inventory route is locked out.', flush=True)
-        for target_port in inputs['ssh_listen_ports']:
+        print('LIVE / POST-CONVERGENCE VERIFY: all ssh_listen_ports are required on the server; '
+              'fresh SSH access is required on every ssh_verify_ports entry.', flush=True)
+        for target_port in inputs['ssh_verify_ports']:
             connection = stage | {'ansible_port': target_port,
                                   'ansible_ssh_args': stage['ansible_ssh_args'] + f' -o HostKeyAlias={identity}'}
             try:

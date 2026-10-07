@@ -434,6 +434,47 @@ class HardeningTests(unittest.TestCase):
                 prepare.assert_not_called()
                 trust.assert_called_once_with('fixture.example.test', 2222, allow_trust=False)
 
+    def test_selected_external_ports_keep_strict_server_listener_verification(self):
+        self.host.update(ssh_listen_ports=[22, 2222], ssh_verify_ports=[2222])
+        self.write_inventory()
+        for mode in ('harden', 'verify-hardening'):
+            calls = []
+            def capture(inventory, alias, variables, playbook):
+                calls.append((playbook, variables))
+            with self.subTest(mode=mode), patch.object(access, 'prerequisites'), \
+                    patch.object(access, 'known_host'), patch.object(access, 'run_playbook', side_effect=capture), \
+                    patch('builtins.print'):
+                access.live(mode, self.inventory, self.key)
+            self.assertTrue(all(values['ansible_port'] == 2222 for _, values in calls[-2:]))
+            self.assertEqual([name for name, _ in calls], ['verify.yml'] +
+                             (['harden.yml'] if mode == 'harden' else []) + ['verify.yml', 'verify-hardening.yml'])
+            for name, values in calls:
+                if name in ('harden.yml', 'verify-hardening.yml'):
+                    self.assertEqual(values['ssh_listen_ports'], [22, 2222])
+                    self.assertEqual(values['ssh_verify_ports'], [2222])
+        # Reducing external probes must never relax the server's strict routes.
+        fake = self.inspection_fixture()
+        fake.params.update(ssh_ports=[22, 2222], verify=True)
+        self.enable_socket()
+        self.socket_fixture_routes([2222])
+        self.generated_socket_fixture([2222])
+        with self.assertRaises(ValueError):
+            self.inspect(fake)
+
+    def test_verify_ports_default_and_invalid_lists_fail_before_live_calls(self):
+        self.assertEqual(access.hardening_inputs(self.inventory, 'fixture', 2222)['ssh_verify_ports'],
+                         self.host['ssh_listen_ports'])
+        for values in ([], [22], [2222, 2222], [True], ['2222'], [0], [65536], '2222'):
+            self.host['ssh_verify_ports'] = values
+            self.write_inventory()
+            for mode in ('harden', 'verify-hardening'):
+                with self.subTest(values=values, mode=mode), patch.object(access, 'prerequisites'), \
+                        patch.object(access, 'run_playbook') as run, patch.object(access, 'known_host') as trust:
+                    with self.assertRaises(ValueError):
+                        access.live(mode, self.inventory, self.key)
+                    run.assert_not_called()
+                    trust.assert_not_called()
+
     def test_invalid_inputs_or_failed_access_stop_before_hardening(self):
         for values in ([], [22], [2222, 2222], [True], ['2222'], [0], [65536], '2222'):
             with self.subTest(values=values):

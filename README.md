@@ -162,7 +162,7 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make verify-docker` | Check Docker/services and run a disposable container | **LIVE / verification**, transient container/image-cache changes |
 | `make inspect-hardening` | Report all Stage 3 safety findings before harden | **LIVE / read-only**, exit 0 for PASS/WARN, non-zero for FAIL |
 | `make harden` | Configure UFW and validated SSH listening ports | **LIVE / MUTATING**, managed key-only access |
-| `make verify-hardening` | Verify all configured SSH ports, UFW and active Docker/containerd | **LIVE / verification**, no managed state changes |
+| `make verify-hardening` | Verify server SSH listeners, selected SSH access ports, UFW and active Docker/containerd | **LIVE / verification**, no managed state changes |
 | `make check` | YAML/Ansible lint, syntax, actionlint, wrapper tests | **OFFLINE** |
 | `make ci` | Same offline checks as `make check` | **OFFLINE** |
 
@@ -296,8 +296,18 @@ inventories are preserved by setup, so add these fields yourself if needed:
 ```yaml
 ansible_port: 22
 ssh_listen_ports: [22, 2222]
+# Optional: external access probes (default: all ssh_listen_ports).
+ssh_verify_ports: [22, 2222]
 firewall_allowed_tcp_ports: [80, 443]
 ```
+
+`ssh_verify_ports` must be a non-empty list of unique integer ports from
+`ssh_listen_ports`. If your controller's network blocks port 22, keep
+`ssh_listen_ports: [22, 2222]`, use the reachable `ansible_port: 2222`, and set
+`ssh_verify_ports: [2222]`. Both server listeners and IPv4/IPv6 UFW rules remain
+mandatory; only external SSH/sudo probes use the selected ports. Port 22's external
+reachability is not established by this selection. Omission preserves checks on
+all listening ports.
 
 The role has no fixed SSH port: omitted `ssh_listen_ports` defaults to the current
 `ansible_port`. Web ports default to 80 and 443; Caddy is not installed. Both lists
@@ -346,7 +356,7 @@ abort adoption. Snippet and main replacements are
 atomic per file, with rollback on a reported write failure; they are not one
 filesystem transaction, so interrupted writes require recovery inspection.
 Existing service/socket handlers validate and activate the installed configuration,
-and the wrapper then verifies independent connections on every desired port.
+and the wrapper then verifies independent connections on every selected `ssh_verify_ports` entry.
 After convergence there is no legacy directive and the next run reports `changed=0`.
 
 Preflight validates stock generator/drop-in structure without requiring the generated
@@ -397,7 +407,7 @@ ports before restarting `ssh.socket` and `ssh.service` in one
 ordered transaction. The role then strictly verifies generated, loaded and live
 routes, effective SSH ports, Docker/containerd and the active UFW with exact desired
 IPv4/IPv6 TCP rules. The wrapper verifies fresh key-only SSH and `sudo -n` on every
-desired SSH port. Runtime mismatch is a hard failure. Preflight checks the actual socket/service dependencies and
+`ssh_verify_ports` entry. Runtime mismatch is a hard failure. Preflight checks the actual socket/service dependencies and
 `KillMode=process` to preserve established sessions. A generated-port mismatch
 stops before listener restart; use recovery access to reconcile configuration
 before retrying. Socket drift also schedules these handlers when the installed
@@ -412,7 +422,7 @@ and [OpenSSH configuration](https://man.openbsd.org/sshd_config).
 
 Both public targets first verify existing independent `ansible` key-only access
 and `sudo -n`. After provisioning, the wrapper opens fresh connections on **each**
-configured SSH port and repeats access/sudo and hardening checks. It pins the
+`ssh_verify_ports` entry and repeats access/sudo and hardening checks. It pins the
 already trusted identity using [OpenSSH HostKeyAlias](https://man.openbsd.org/ssh_config#HostKeyAlias),
 with strict checking and connection sharing disabled. A failed connection stops
 immediately; use recovery access, without blindly retrying changes.
@@ -421,7 +431,8 @@ inspection: valid/effective SSH configuration and exact daemon listeners, UFW
 active/enabled, deny incoming/allow outgoing, every configured TCP allow rule for
 IPv4/IPv6, unchanged ownership fingerprints, and active Docker/containerd.
 It installs nothing, invokes no handlers and creates no smoke container.
-This is post-convergence verification: it requires every configured SSH port.
+This is post-convergence verification: every `ssh_listen_ports` route is required
+on the server; independent external access is required on every `ssh_verify_ports` entry.
 Before the first successful `make harden`, a future port can time out; that failure
 alone does not establish lockout of the current inventory route. The wrapper
 reports the failed configured port and directs you to `make verify-access` and
