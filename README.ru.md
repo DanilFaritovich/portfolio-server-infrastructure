@@ -319,9 +319,12 @@ directives. Поддерживаются штатный Ubuntu active/enabled `s
 listener mode `ssh.service`; переключения activation mode нет. Штатный socket
 dependency drop-in принимается только с точными директивами `After=ssh.socket`
 и `Requires=ssh.socket`; socket address drop-ins должны быть созданы runtime
-generator Ubuntu. Custom overrides отклоняются. Все текущие socket listening
+generator Ubuntu. Custom overrides отклоняются. Все текущие live SSH listening
 ports должны оставаться в `ssh_listen_ports`.
-Generated `ListenStream` и systemd `Listen` сравниваются как множества TCP
+Preflight проверяет штатную структуру generator/drop-ins без требования совпадения
+generated file на диске с уже загруженными listeners или `sshd -T`: эти состояния
+могут относиться к разным reload cycles. После `daemon-reload` generated
+`ListenStream` и systemd `Listen` сравниваются как множества TCP
 listeners: address family, wildcard bind и port. Принимается штатная пара
 Ubuntu `0.0.0.0:<port>` / `[::]:<port>`. Доступность IPv4 через IPv6 wildcard
 определяется `BindIPv6Only`, а при `default` — `/proc/sys/net/ipv6/bindv6only`;
@@ -345,8 +348,8 @@ UFW CLI используется без новой collection; операции 
 Все SSH allow rules создаются до incoming deny, outgoing allow и UFW enable.
 IPv4 и IPv6 должны быть включены и проверены. В начало SSH config добавляется
 managed port/public-key block; остальное содержимое сохраняется. Полный candidate
-проходит `sshd -t -f` до atomic replacement. Только изменённый block вызывает
-handler, который повторяет `sshd -t`. В service mode выполняется узкий reload
+проходит `sshd -t -f` до atomic replacement. Изменённый block или несошедшееся
+socket state вызывает handler, который повторяет `sshd -t`. В service mode выполняется узкий reload
 `ssh.service`. В socket mode выполняется `daemon-reload`, затем generated/effective
 semantic listeners сравниваются между собой, а их ports — с `sshd -T` и desired
 list, пока текущие listeners продолжают работать. Candidate inspection также
@@ -356,7 +359,9 @@ list, пока текущие listeners продолжают работать. C
 фактические зависимости socket/service и `KillMode=process` для сохранения
 установленных сессий. Несовпадение generated ports останавливает выполнение до
 restart listeners; перед повторной попыткой согласуйте конфигурацию через recovery
-access. Handlers запускаются только при изменении SSH block. См.
+access. При socket drift handlers запускаются и с неизменённым установленным SSH
+block, чтобы завершить прерванный transition. Повторный запуск после convergence
+не выполняет reload/restart SSH. См.
 [Ubuntu socket activation](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189),
 [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
 и [OpenSSH configuration](https://man.openbsd.org/sshd_config).
@@ -396,11 +401,11 @@ isolation managed/controller connections, verification каждого порта
 Ручная live validation на уже Docker-ready host:
 
 ```bash
-make verify-access
-make verify-docker
-make harden
-make verify-hardening
-make harden
+make verify-access &&
+make verify-docker &&
+make harden &&
+make verify-hardening &&
+make harden &&
 make verify-hardening
 ```
 

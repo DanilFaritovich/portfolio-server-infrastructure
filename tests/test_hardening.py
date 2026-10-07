@@ -168,7 +168,7 @@ path.write_text(json.dumps(state))
     def test_invalid_ssh_candidate_is_not_installed_or_notified_and_rerun_converges(self):
         original = next(t for t in self.tasks if 'ansible.builtin.blockinfile' in t)
         self.assertEqual(original['ansible.builtin.blockinfile']['validate'], '/usr/sbin/sshd -t -f %s')
-        self.assertEqual(sum('notify' in task for task in self.tasks), 1)
+        self.assertEqual(sum('notify' in task for task in self.tasks), 2)
         handlers = yaml.safe_load((ROOT / 'roles/host_hardening/handlers/main.yml').read_text())
         self.assertEqual(handlers[0]['ansible.builtin.command']['argv'], ['/usr/sbin/sshd', '-t'])
         self.assertIs(handlers[0]['changed_when'], False)
@@ -221,6 +221,8 @@ sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
         validator.chmod(0o700)
 
         handlers = yaml.safe_load((ROOT / 'roles/host_hardening/handlers/main.yml').read_text())
+        reload_task = copy.deepcopy(next(t for t in self.tasks if t.get('name', '').startswith(
+            'Schedule socket convergence')))
         events = self.directory / 'events.jsonl'
         reject_generated = self.directory / 'reject-generated'
         spy = self.directory / 'spy'
@@ -250,10 +252,11 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
                 handler['ansible.builtin.command'] = {'argv': [str(spy), handler['name']]}
                 handler.pop('portfolio_hardening_info')
         playbook = self.directory / 'local.yml'
-        def run(activation, ports):
-            variables = {'ssh_listen_ports': ports, 'hardening_before': {'ssh_activation': activation}}
+        def run(activation, ports, reload_required=False):
+            variables = {'ssh_listen_ports': ports, 'hardening_before': {
+                'ssh_activation': activation, 'socket_reload_required': reload_required}}
             playbook.write_text(yaml.safe_dump([{'name': 'Local hardening fixture', 'hosts': 'localhost',
-                'gather_facts': False, 'vars': variables, 'tasks': [task], 'handlers': handlers}]))
+                'gather_facts': False, 'vars': variables, 'tasks': [task, reload_task], 'handlers': handlers}]))
             return subprocess.run([str(ROOT / '.venv/bin/ansible-playbook'), '-i', 'localhost,', '-c', 'local',
                 '-e', json.dumps({'ansible_python_interpreter': str(ROOT / '.venv/bin/python')}), str(playbook)],
                 cwd=ROOT, capture_output=True, text=True, timeout=30,
@@ -261,24 +264,28 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
                          ANSIBLE_LOCAL_TEMP=str(self.directory / 'tmp'), ANSIBLE_REMOTE_TEMP=str(self.directory / 'remote')))
 
         task['notify'] = handlers[0]['listen']
-        invalid = run('socket', [2222, 99999])
+        reload_task['notify'] = handlers[0]['listen']
+        invalid = run('socket', [2222, 99999], True)
         self.assertNotEqual(invalid.returncode, 0, invalid.stdout + invalid.stderr)
         self.assertFalse(events.exists())
         self.assertEqual(dest.read_text(), 'PermitRootLogin yes\nPasswordAuthentication yes\n')
         reject_generated.touch()
-        rejected = run('socket', [2222, 2200])
+        rejected = run('socket', [2222, 2200], True)
         self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
         self.assertEqual([json.loads(line)[0] for line in events.read_text().splitlines()],
                          [handlers[i]['name'] for i in (0, 2, 3)])
         reject_generated.unlink()
         events.unlink()
-        dest.write_text('PermitRootLogin yes\nPasswordAuthentication yes\n')
-        first = run('socket', [2222, 2200])
+        installed = dest.read_bytes()
+        # Installed block is already converged; reload_required alone schedules
+        # validation, daemon-reload, candidate validation, and listener restart.
+        first = run('socket', [2222, 2200], True)
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(dest.read_bytes(), installed)
         self.assertEqual([json.loads(line)[0] for line in events.read_text().splitlines()],
             [handlers[i]['name'] for i in (0, 2, 3, 4)])
         events.unlink()
-        repeated = run('socket', [2222, 2200])
+        repeated = run('socket', [2222, 2200], False)
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertIn('changed=0', repeated.stdout)
         self.assertFalse(events.exists())
@@ -472,6 +479,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         self.socket_fixture_routes([2222, 2200])
         self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
         self.sockets = self.sockets.splitlines()[0]
+        fake.params['verify'] = True
         with self.assertRaisesRegex(ValueError, 'Live SSH socket listeners differ'):
             self.inspect(fake)
 
@@ -498,14 +506,70 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         self.added = '\n'.join(f"ufw allow {port}/tcp comment 'portfolio-host-hardening'" for port in allowed)
         self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
         fake.params['socket_candidate'] = False
+        fake.params['verify'] = True
         with self.assertRaisesRegex(ValueError, 'Live SSH socket listeners differ'):
             self.inspect(fake)
+        fake.params['verify'] = False
         self.socket_fixture_routes(desired)
         fake.params['verify'] = True
         before = {path: path.read_bytes() for path in self.directory.rglob('*') if path.is_file()}
         self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
         self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
         self.assertEqual(before, {path: path.read_bytes() for path in self.directory.rglob('*') if path.is_file()})
+
+    def test_preflight_allows_socket_reload_drift_but_reports_required(self):
+        fake = self.inspection_fixture()
+        fake.params.update(verify=False, ssh_ports=[2222, 2200])
+        self.enable_socket()
+        self.socket_fixture_routes([2222])
+        self.generated_socket_fixture([2200])
+        # Loaded routes may lag sshd configuration before daemon-reload.
+        self.effective = 'port 2222\nport 2200\npubkeyauthentication yes\n'
+        before = {p: p.read_bytes() for p in self.directory.rglob('*') if p.is_file()}
+        self.assertEqual(self.inspect(fake)['socket_reload_required'], True)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.directory.rglob('*') if p.is_file()})
+        fake.params['verify'] = True
+        with self.assertRaisesRegex(ValueError, 'Generated socket file differs semantically'):
+            self.inspect(fake)
+        fake.params.update(verify=False, socket_candidate=True)
+        with self.assertRaisesRegex(ValueError, 'Generated socket file differs semantically'):
+            self.inspect(fake)
+        self.socket_fixture_routes([2222, 2200])
+        self.generated_socket_fixture([2222, 2200])
+        fake.params.update(socket_candidate=False, verify=True)
+        self.assertFalse(self.inspect(fake)['socket_reload_required'])
+
+    def test_preflight_requires_current_route_and_limits_live_ports_to_desired(self):
+        fake = self.inspection_fixture()
+        fake.params.update(verify=False, ssh_ports=[2222, 2200], current_port=2222)
+        self.enable_socket()
+        self.socket_fixture_routes([2222, 2200, 2022])
+        with self.assertRaisesRegex(ValueError, 'Preserve existing live SSH routes'):
+            self.inspect(fake)
+        self.socket_fixture_routes([2200])
+        with self.assertRaisesRegex(ValueError, 'Current inventory SSH route'):
+            self.inspect(fake)
+
+    def test_preflight_rejects_malformed_generated_socket_dropins(self):
+        fake = self.inspection_fixture()
+        fake.params.update(verify=False, ssh_ports=[2222, 2200])
+        self.enable_socket()
+        path = self.generated_socket_fixture([2222, 2200])
+        for malformed in ('[Socket]\nAccept=yes\n', '[Other]\nListenStream=2222\n',
+                          '[Socket]\nListenStream=not-a-listener\n'):
+            with self.subTest(malformed=malformed):
+                path.write_text(malformed)
+                with self.assertRaises(ValueError):
+                    self.inspect(fake)
+
+    def test_candidate_requires_desired_routes_even_when_generated_and_loaded_agree(self):
+        fake = self.inspection_fixture()
+        fake.params.update(verify=False, socket_candidate=True)
+        self.enable_socket()
+        self.socket_fixture_routes([2222])
+        self.generated_socket_fixture([2222])
+        with self.assertRaisesRegex(ValueError, 'Generated socket listeners differ from desired ports'):
+            self.inspect(fake)
 
     def test_current_route_and_candidate_firewall_failures_are_rejected(self):
         for desired, live in (([2222, 2200], [2200]), ([2200], [2200])):
@@ -639,7 +703,8 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         import shutil
         shutil.rmtree(self.fixture_path('/etc/ufw'))
         self.fixture_path('/etc/default/ufw').unlink()
-        self.assertEqual(self.inspect(fake), {'ufw_installed': False, 'ssh_activation': 'service'})
+        self.assertEqual(self.inspect(fake), {'ufw_installed': False, 'ssh_activation': 'service',
+                                             'socket_reload_required': False})
         self.fixture_path('/etc/default/ufw').write_text('orphan')
         with self.assertRaises(ValueError):
             self.inspect(fake)

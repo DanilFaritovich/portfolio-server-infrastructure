@@ -49,6 +49,10 @@ ssh_activation:
   description: Observed SSH activation mode, socket or service.
   returned: always
   type: str
+socket_reload_required:
+  description: Whether socket state needs regeneration and activation to converge.
+  returned: always
+  type: bool
 baseline:
   description: Fingerprints of protected UFW configuration excluding managed fields.
   returned: when UFW is installed
@@ -170,6 +174,7 @@ def unit_properties(run, name, properties):
 
 
 def stock_unit(unit, name, socket_mode=False, ipv6_only=False):
+    generated = None
     require(unit['FragmentPath'] in ('/usr/lib/systemd/system/' + name, '/lib/systemd/system/' + name),
             'Custom systemd unit detected.')
     for filename in unit['DropInPaths'].split():
@@ -189,10 +194,9 @@ def stock_unit(unit, name, socket_mode=False, ipv6_only=False):
                     all(line.startswith('ListenStream=') and line != 'ListenStream=' for line in lines[2:]),
                     'Custom SSH socket drop-in detected.')
             generated = socket_listeners(' '.join(line.split('=', 1)[1] + ' (Stream)' for line in lines[2:]), ipv6_only)
-            effective = socket_listeners(unit['Listen'], ipv6_only)
-            require(generated == effective, 'Generated socket file differs semantically from effective listeners.')
         else:
             require(False, 'Custom systemd drop-in detected.')
+    return generated
 
 
 def wildcard_listener(address, ipv6_only=False):
@@ -244,6 +248,7 @@ def inspect(module):
     for service in ('ssh.service', 'ufw.service') if installed else ('ssh.service',):
         stock_unit(unit_properties(run, service, ['FragmentPath', 'DropInPaths']), service, socket_mode)
     socket_routes = set()
+    generated_routes = None
     ipv6_only = False
     if not socket_mode:
         # Disabled sockets still must not hide custom overrides for a later boot.
@@ -263,7 +268,7 @@ def inspect(module):
             ipv6_only = default == '1'
         else:
             ipv6_only = policy == 'ipv6-only'
-        stock_unit(unit, 'ssh.socket', True, ipv6_only)
+        generated_routes = stock_unit(unit, 'ssh.socket', True, ipv6_only)
         require(unit['Accept'] == 'no' and unit['Triggers'] == 'ssh.service', 'Unsupported SSH socket activation.')
         socket_routes = socket_listeners(unit['Listen'], ipv6_only)
         service = unit_properties(run, 'ssh.service', ['Requires', 'After', 'KillMode'])
@@ -300,12 +305,16 @@ def inspect(module):
                     live_ports.add(int(port))
                     live_routes.update(wildcard_listener(fields[3], ipv6_only))
     effective_ports = {int(line.split()[1]) for line in effective.splitlines() if line.startswith('port ')}
+    desired_routes = {('tcp', family, '*', port) for port in ssh_ports for family in ('ipv4', 'ipv6')}
     candidate = module.params.get('socket_candidate', False)
-    if socket_mode:
+    if socket_mode and (candidate or module.params['verify']):
+        # Only daemon-reload establishes a common cycle for generated files and
+        # loaded unit properties. Preflight validates their structure separately.
+        require(generated_routes is None or generated_routes == socket_routes,
+                'Generated socket file differs semantically from effective listeners.')
         require(socket_ports == effective_ports, 'Generated socket listeners differ from sshd configuration.')
-        require(socket_ports <= set(ssh_ports), 'Preserve existing SSH socket routes in desired ports.')
         if candidate:
-            require(socket_ports == set(ssh_ports), 'Generated socket listeners differ from desired ports.')
+            require(socket_routes == desired_routes, 'Generated socket listeners differ from desired ports.')
         else:
             require(live_routes == socket_routes, 'Live SSH socket listeners differ semantically from effective configuration.')
     require(not candidate or socket_mode, 'Socket candidate requires socket activation.')
@@ -324,8 +333,13 @@ def inspect(module):
                     'A configured SSH port is occupied by another process.')
     if module.params['verify']:
         require(effective_ports == set(ssh_ports) == live_ports, 'Effective SSH ports/listeners do not match configuration.')
+        if socket_mode:
+            require(live_routes == desired_routes, 'Live SSH socket listeners differ from desired routes.')
 
-    result = {'ufw_installed': installed, 'ssh_activation': 'socket' if socket_mode else 'service'}
+    result = {'ufw_installed': installed, 'ssh_activation': 'socket' if socket_mode else 'service',
+              'socket_reload_required': socket_mode and (
+                  socket_routes != desired_routes or live_routes != desired_routes or
+                  (generated_routes is not None and generated_routes != socket_routes))}
     if candidate:
         require(installed, 'SSH socket activation requires the prepared firewall.')
         _, status = run(['ufw', 'status', 'verbose'])

@@ -126,5 +126,12 @@
   become: true
   notify: Reload SSH after validated configuration changes
 
+- name: Schedule socket convergence when installed configuration is already unchanged
+  ansible.builtin.debug:
+    msg: Regenerate and validate the socket candidate before applying listeners.
+  changed_when: hardening_before.socket_reload_required
+  when: hardening_before.ssh_activation == 'socket'
+  notify: Reload SSH after validated configuration changes
+
 - name: Apply validated SSH configuration before independent connection verification
   ansible.builtin.meta: flush_handlers
