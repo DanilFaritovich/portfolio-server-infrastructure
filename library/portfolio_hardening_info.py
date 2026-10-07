@@ -22,6 +22,10 @@ options:
     description: Require fully converged runtime state.
     type: bool
     default: false
+  socket_candidate:
+    description: Validate generated socket listeners before restarting, without requiring live convergence.
+    type: bool
+    default: false
   refresh_rules:
     description: Read fingerprints after role-owned rule changes; still never writes state.
     type: bool
@@ -38,6 +42,10 @@ ufw_installed:
   description: Whether UFW is installed.
   returned: always
   type: bool
+ssh_activation:
+  description: Observed SSH activation mode, socket or service.
+  returned: always
+  type: str
 baseline:
   description: Fingerprints of protected UFW configuration excluding managed fields.
   returned: when UFW is installed
@@ -63,7 +71,7 @@ PROTECTED = ('/etc/default/ufw', '/etc/ufw/ufw.conf', '/etc/ufw/before.rules',
 
 def require(condition, message):
     if not condition:
-        raise ValueError(message + ' Review and migrate manually; no automatic reset/removal.')
+        raise ValueError(message + ' Review and reconcile manually; no automatic reset/removal.')
 
 
 def ports(values, empty=False):
@@ -150,6 +158,53 @@ def listeners(text):
     return found
 
 
+def unit_properties(run, name, properties):
+    _, text = run(['systemctl', 'show', name, '--property=' + ','.join(properties)])
+    result = dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
+    require(all(prop in result for prop in properties), 'Incomplete systemd unit inspection.')
+    return result
+
+
+def stock_unit(unit, name, socket_mode=False):
+    require(unit['FragmentPath'] in ('/usr/lib/systemd/system/' + name, '/lib/systemd/system/' + name),
+            'Custom systemd unit detected.')
+    for filename in unit['DropInPaths'].split():
+        path = Path(filename)
+        require(path.is_file() and not path.is_symlink(), 'Unsupported systemd drop-in.')
+        lines = [line.strip() for line in path.read_text().splitlines()
+                 if line.strip() and not line.lstrip().startswith('#')]
+        if socket_mode and name == 'ssh.service':
+            require(filename in ('/etc/systemd/system/ssh.service.d/00-socket.conf',
+                                 '/run/systemd/generator/ssh.service.d/00-socket.conf') and
+                    len(lines) == 3 and lines[0] == '[Unit]' and
+                    set(lines[1:]) == {'After=ssh.socket', 'Requires=ssh.socket'},
+                    'Custom SSH service drop-in detected.')
+        elif socket_mode and name == 'ssh.socket':
+            require(filename == '/run/systemd/generator/ssh.socket.d/addresses.conf' and
+                    len(lines) >= 3 and lines[:2] == ['[Socket]', 'ListenStream='] and
+                    all(re.fullmatch(r'ListenStream=(?:0\.0\.0\.0:|\[::\]:|\*:)?[0-9]+', line)
+                        for line in lines[2:]),
+                    'Custom SSH socket drop-in detected.')
+            generated = socket_ports(' '.join(line.split('=', 1)[1] + ' (Stream)' for line in lines[2:]))
+            require(generated == socket_ports(unit['Listen']), 'Generated socket file differs from effective listeners.')
+        else:
+            require(False, 'Custom systemd drop-in detected.')
+
+
+def socket_ports(text):
+    # systemctl show Listen reports effective entries as "address (Stream)".
+    entries = re.findall(r'(\S+) \(Stream\)', text)
+    require(entries and ' '.join(address + ' (Stream)' for address in entries) == text,
+            'Ambiguous SSH socket Listen configuration.')
+    found = set()
+    for address in entries:
+        match = re.fullmatch(r'(?:0\.0\.0\.0:|\[::\]:|\*:)?(\d+)', address)
+        require(match is not None, 'Non-wildcard SSH socket listener detected.')
+        found.add(int(match[1]))
+    ports(list(found))
+    return found
+
+
 def inspect(module):
     ssh_ports = ports(module.params['ssh_ports'])
     tcp_ports = ports(module.params['tcp_ports'], empty=True)
@@ -163,14 +218,34 @@ def inspect(module):
     installed = module.get_bin_path('ufw') is not None
     require(re.search(r'^ID=[\"\']?ubuntu[\"\']?$', Path('/etc/os-release').read_text(), re.M),
             'Hardening supports Ubuntu only.')
+    _, active = run(['systemctl', 'is-active', 'ssh.socket'], optional=True)
+    _, enabled = run(['systemctl', 'is-enabled', 'ssh.socket'], optional=True)
+    socket_mode = active == 'active' and enabled == 'enabled'
+    require(socket_mode or (active in ('inactive', 'not-found') and enabled in ('disabled', 'masked', 'not-found')),
+            'Ambiguous SSH activation mode.')
     for service in ('ssh.service', 'ufw.service') if installed else ('ssh.service',):
-        _, unit = run(['systemctl', 'show', service, '--property=FragmentPath,DropInPaths'])
-        require('DropInPaths=\n' in unit + '\n' and
-                not re.search(r'FragmentPath=/etc/', unit), 'Custom SSH/UFW systemd unit detected.')
-    for state in ('is-active', 'is-enabled'):
-        rc, output = run(['systemctl', state, 'ssh.socket'], optional=True)
-        require(rc != 0 and output in ('inactive', 'disabled', 'masked', 'not-found'),
-                'ssh.socket activation must be migrated to ssh.service first.')
+        stock_unit(unit_properties(run, service, ['FragmentPath', 'DropInPaths']), service, socket_mode)
+    socket_listeners = set()
+    if not socket_mode:
+        # Disabled sockets still must not hide custom overrides for a later boot.
+        unit = unit_properties(run, 'ssh.socket', ['FragmentPath', 'DropInPaths'])
+        if unit['FragmentPath'] in ('', '/dev/null'):
+            require(not unit['DropInPaths'] and enabled in ('masked', 'not-found'),
+                    'Ambiguous disabled SSH socket unit.')
+        else:
+            stock_unit(unit, 'ssh.socket')
+    if socket_mode:
+        unit = unit_properties(run, 'ssh.socket', ['FragmentPath', 'DropInPaths', 'Listen', 'Accept', 'Triggers'])
+        stock_unit(unit, 'ssh.socket', True)
+        require(unit['Accept'] == 'no' and unit['Triggers'] == 'ssh.service', 'Unsupported SSH socket activation.')
+        socket_listeners = socket_ports(unit['Listen'])
+        service = unit_properties(run, 'ssh.service', ['Requires', 'After', 'KillMode'])
+        require('ssh.socket' in service['Requires'].split() and 'ssh.socket' in service['After'].split() and
+                service['KillMode'] == 'process', 'Unsafe SSH socket/service restart relationship.')
+        for directory in ('/etc', '/run'):
+            generator = Path(directory + '/systemd/system-generators/sshd-socket-generator')
+            require(not generator.exists() and not generator.is_symlink(),
+                    'Custom or masked SSH socket generator detected.')
     for service in ('ssh.service', 'docker.service', 'containerd.service'):
         _, output = run(['systemctl', 'is-active', service])
         require(output == 'active', 'SSH/Docker/containerd must remain active.')
@@ -185,16 +260,38 @@ def inspect(module):
     require('pubkeyauthentication yes' in effective.splitlines(), 'Public-key authentication must remain enabled.')
     _, sockets = run(['ss', '-H', '-ltnp'])
     live_ports = listeners(sockets)
+    if socket_mode:
+        # PID 1 can retain socket ownership alongside sshd. Attribute only the
+        # effective ssh.socket ports, never arbitrary systemd listeners.
+        for line in sockets.splitlines():
+            fields = line.split()
+            if len(fields) >= 4 and re.search(r'"systemd",pid=1,', line):
+                port = fields[3].rsplit(':', 1)[1]
+                if port.isdigit() and int(port) in socket_listeners:
+                    live_ports.add(int(port))
+    effective_ports = {int(line.split()[1]) for line in effective.splitlines() if line.startswith('port ')}
+    candidate = module.params.get('socket_candidate', False)
+    if socket_mode:
+        require(socket_listeners == effective_ports, 'Generated socket listeners differ from sshd configuration.')
+        require(socket_listeners <= set(ssh_ports), 'Preserve existing SSH socket routes in desired ports.')
+        if candidate:
+            require(socket_listeners == set(ssh_ports), 'Generated socket listeners differ from desired ports.')
+        else:
+            require(live_ports == socket_listeners, 'Live SSH socket listeners differ from effective configuration.')
+    require(not candidate or socket_mode, 'Socket candidate requires socket activation.')
     for line in sockets.splitlines():
         fields = line.split()
         if len(fields) >= 4 and fields[3].rsplit(':', 1)[1].isdigit():
-            require(int(fields[3].rsplit(':', 1)[1]) not in ssh_ports or re.search(r'"sshd(?:-[^"]*)?"', line),
+            require(int(fields[3].rsplit(':', 1)[1]) not in ssh_ports or re.search(r'"sshd(?:-[^"]*)?"', line) or
+                    (socket_mode and int(fields[3].rsplit(':', 1)[1]) in socket_listeners and
+                     re.search(r'"systemd",pid=1,', line)),
                     'A configured SSH port is occupied by another process.')
     if module.params['verify']:
-        effective_ports = {int(line.split()[1]) for line in effective.splitlines() if line.startswith('port ')}
         require(effective_ports == set(ssh_ports) == live_ports, 'Effective SSH ports/listeners do not match configuration.')
 
-    result = {'ufw_installed': installed}
+    result = {'ufw_installed': installed, 'ssh_activation': 'socket' if socket_mode else 'service'}
+    if candidate:
+        return result
     if not installed:
         require(not Path('/etc/systemd/system/ufw.service').exists() and
                 not Path('/etc/systemd/system/ufw.service.d').exists(), 'Orphan custom UFW unit detected.')
@@ -252,6 +349,7 @@ def main():
         'tcp_ports': {'type': 'list', 'elements': 'int', 'required': True},
         'verify': {'type': 'bool', 'default': False},
         'refresh_rules': {'type': 'bool', 'default': False},
+        'socket_candidate': {'type': 'bool', 'default': False},
     }, supports_check_mode=True)
     try:
         module.exit_json(changed=False, **inspect(module))
@@ -259,7 +357,7 @@ def main():
         # Avoid dumping config, parser input or command stderr into failure output.
         import sys
         error = sys.exc_info()[1]
-        message = str(error) if isinstance(error, ValueError) and 'Review and migrate manually;' in str(error) else \
+        message = str(error) if isinstance(error, ValueError) and 'Review and reconcile manually;' in str(error) else \
             'Cannot safely inspect hardening state. Review configuration manually.'
         module.fail_json(msg=message)
 

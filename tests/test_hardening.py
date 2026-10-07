@@ -204,6 +204,91 @@ sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
         self.assertTrue(dest.read_text().endswith(fallback))
         self.assertIn('Port 2200\nPort 2222\nPubkeyAuthentication yes', dest.read_text())
 
+    def test_real_handler_notifications_order_candidates_and_convergence(self):
+        task = copy.deepcopy(next(t for t in self.tasks if 'ansible.builtin.blockinfile' in t))
+        task.pop('become')
+        task['ansible.builtin.blockinfile'].update(
+            path=str(self.directory / 'sshd_config'), owner=os.getuid(), group=os.getgid(), mode='0600',
+            validate=f'{self.directory / "validate-sshd"} %s')
+        dest = Path(task['ansible.builtin.blockinfile']['path'])
+        dest.write_text('PermitRootLogin yes\nPasswordAuthentication yes\n')
+        validator = self.directory / 'validate-sshd'
+        validator.write_text(f'''#!{ROOT / '.venv/bin/python'}
+import sys
+from pathlib import Path
+sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
+''')
+        validator.chmod(0o700)
+
+        handlers = yaml.safe_load((ROOT / 'roles/host_hardening/handlers/main.yml').read_text())
+        events = self.directory / 'events.jsonl'
+        reject_generated = self.directory / 'reject-generated'
+        spy = self.directory / 'spy'
+        spy.write_text(f'''#!{ROOT / '.venv/bin/python'}
+import json, sys
+from pathlib import Path
+with Path({str(events)!r}).open('a') as stream:
+    stream.write(json.dumps(sys.argv[1:]) + '\\n')
+if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate effective generated socket'):
+    sys.exit(1)
+''')
+        spy.chmod(0o700)
+        # Keep real handler metadata and ordering; substitute only their side-effecting modules.
+        for handler in handlers:
+            handler.pop('become', None)
+            if 'ansible.builtin.command' in handler:
+                handler['ansible.builtin.command'] = {'argv': [str(spy), handler['name']]}
+            elif 'ansible.builtin.systemd_service' in handler:
+                if handler['ansible.builtin.systemd_service'].get('daemon_reload'):
+                    handler['ansible.builtin.command'] = {'argv': [str(spy), handler['name']]}
+                    handler.pop('ansible.builtin.systemd_service')
+                    handler['changed_when'] = False
+                else:
+                    handler['ansible.builtin.command'] = {'argv': [str(spy), handler['name']]}
+                    handler.pop('ansible.builtin.systemd_service')
+            elif 'portfolio_hardening_info' in handler:
+                handler['ansible.builtin.command'] = {'argv': [str(spy), handler['name']]}
+                handler.pop('portfolio_hardening_info')
+        playbook = self.directory / 'local.yml'
+        def run(activation, ports):
+            variables = {'ssh_listen_ports': ports, 'hardening_before': {'ssh_activation': activation}}
+            playbook.write_text(yaml.safe_dump([{'name': 'Local hardening fixture', 'hosts': 'localhost',
+                'gather_facts': False, 'vars': variables, 'tasks': [task], 'handlers': handlers}]))
+            return subprocess.run([str(ROOT / '.venv/bin/ansible-playbook'), '-i', 'localhost,', '-c', 'local',
+                '-e', json.dumps({'ansible_python_interpreter': str(ROOT / '.venv/bin/python')}), str(playbook)],
+                cwd=ROOT, capture_output=True, text=True, timeout=30,
+                env=dict(os.environ, ANSIBLE_NOCOLOR='1', ANSIBLE_HOME=str(self.directory / 'ansible'),
+                         ANSIBLE_LOCAL_TEMP=str(self.directory / 'tmp'), ANSIBLE_REMOTE_TEMP=str(self.directory / 'remote')))
+
+        task['notify'] = handlers[0]['listen']
+        invalid = run('socket', [2222, 99999])
+        self.assertNotEqual(invalid.returncode, 0, invalid.stdout + invalid.stderr)
+        self.assertFalse(events.exists())
+        self.assertEqual(dest.read_text(), 'PermitRootLogin yes\nPasswordAuthentication yes\n')
+        reject_generated.touch()
+        rejected = run('socket', [2222, 2200])
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+        self.assertEqual([json.loads(line)[0] for line in events.read_text().splitlines()],
+                         [handlers[i]['name'] for i in (0, 2, 3)])
+        reject_generated.unlink()
+        events.unlink()
+        dest.write_text('PermitRootLogin yes\nPasswordAuthentication yes\n')
+        first = run('socket', [2222, 2200])
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual([json.loads(line)[0] for line in events.read_text().splitlines()],
+            [handlers[i]['name'] for i in (0, 2, 3, 4)])
+        events.unlink()
+        repeated = run('socket', [2222, 2200])
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertIn('changed=0', repeated.stdout)
+        self.assertFalse(events.exists())
+        dest.write_text('PermitRootLogin yes\nPasswordAuthentication yes\n')
+        events.unlink(missing_ok=True)
+        service = run('service', [2222, 2200])
+        self.assertEqual(service.returncode, 0, service.stdout + service.stderr)
+        self.assertEqual([json.loads(line)[0] for line in events.read_text().splitlines()],
+                         [handlers[i]['name'] for i in (0, 1)])
+
     def test_offline_make_and_verification_have_no_mutation_or_live_calls(self):
         for target in ('harden', 'verify-hardening', 'check', 'ci'):
             result = subprocess.run(['make', '-n', target], cwd=ROOT, capture_output=True, text=True)
@@ -224,7 +309,7 @@ sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
         self.assertNotIn('state: absent', (ROOT / 'roles/host_hardening/tasks/main.yml').read_text())
 
     def fixture_path(self, name):
-        return self.directory / str(name).lstrip('/') if str(name).startswith('/etc/') else Path(name)
+        return self.directory / str(name).lstrip('/') if str(name).startswith(('/etc/', '/run/')) else Path(name)
 
     def inspection_fixture(self, managed=True, active=True):
         files = {'/etc/os-release': 'ID=ubuntu\n', '/etc/ssh/sshd_config': 'Include /etc/ssh/sshd_config.d/*.conf\n',
@@ -243,7 +328,12 @@ sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
                        '\n'.join(f'{p}/tcp{family} ALLOW IN Anywhere{family} # portfolio-host-hardening'
                                  for p in [2222, 2200, 80, 443] for family in ['', ' (v6)'])) if active else 'Status: inactive'
         self.added = '\n'.join(f"ufw allow {p}/tcp comment 'portfolio-host-hardening'" for p in [2222, 2200, 80, 443]) if managed else ''
-        self.socket = 'disabled'
+        self.socket = 'inactive'
+        self.socket_enabled = 'disabled'
+        self.socket_listen = '[::]:2222 (Stream) [::]:2200 (Stream)'
+        self.socket_dropins = ''
+        self.service_dropins = ''
+        self.socket_relationship = 'Requires=ssh.socket\nAfter=ssh.socket\nKillMode=process\n'
         self.service = 'active'
         self.effective = 'port 2222\nport 2200\npubkeyauthentication yes\n'
         self.sockets = '\n'.join(f'LISTEN 0 128 0.0.0.0:{p} 0.0.0.0:* users:(("sshd",pid=10,fd=3))' for p in [2222, 2200])
@@ -255,9 +345,17 @@ sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
             if argv == ['/usr/bin/lsb_release', '-is']:
                 return 0, 'Ubuntu', ''
             if argv[:2] == ['systemctl', 'show']:
-                return 0, 'FragmentPath=/usr/lib/systemd/system/ssh.service\nDropInPaths=\n', ''
+                if argv[3] == '--property=Requires,After,KillMode':
+                    return 0, self.socket_relationship, ''
+                name = argv[2]
+                dropins = self.socket_dropins if name == 'ssh.socket' else self.service_dropins if name == 'ssh.service' else ''
+                text = f'FragmentPath=/usr/lib/systemd/system/{name}\nDropInPaths={dropins}\n'
+                if name == 'ssh.socket':
+                    text += f'Listen={self.socket_listen}\nAccept=no\nTriggers=ssh.service\n'
+                return 0, text, ''
             if argv[0] == 'systemctl' and argv[2] == 'ssh.socket':
-                return (0 if self.socket == 'active' else 1), self.socket, ''
+                state = self.socket if argv[1] == 'is-active' else self.socket_enabled
+                return (0 if state in ('active', 'enabled') else 1), state, ''
             if argv[:2] == ['systemctl', 'is-active']:
                 return (0 if self.service == 'active' else 1), self.service, ''
             if argv == ['/usr/sbin/sshd', '-t']:
@@ -294,7 +392,7 @@ sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
         result = self.inspect(fake)
         self.assertTrue(result['ufw_active'])
         self.assertEqual(before, {p: p.read_bytes() for p in self.directory.rglob('*') if p.is_file()})
-        mutations = [lambda: setattr(self, 'socket', 'active'), lambda: setattr(self, 'service', 'inactive'),
+        mutations = [lambda: setattr(self, 'service', 'inactive'),
                      lambda: setattr(self, 'status', self.status.replace('deny (incoming)', 'allow (incoming)')),
                      lambda: setattr(self, 'status', self.status.replace('80/tcp (v6) ALLOW IN', '80/tcp (v6) DENY IN')),
                      lambda: setattr(self, 'sockets', self.sockets.replace('0.0.0.0:2200', '0.0.0.0:2201')),
@@ -308,6 +406,91 @@ sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
             mutate()
             with self.assertRaises(ValueError):
                 self.inspect(fake)
+
+    def enable_socket(self):
+        self.socket = 'active'
+        self.socket_enabled = 'enabled'
+        self.service_dropins = '/etc/systemd/system/ssh.service.d/00-socket.conf'
+        path = self.fixture_path(self.service_dropins)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('[Unit]\nAfter=ssh.socket\nRequires=ssh.socket\n')
+
+    def test_default_ubuntu_socket_and_multiport_state_are_accepted(self):
+        fake = self.inspection_fixture()
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'service')
+        self.enable_socket()
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        fake.params.update(verify=False, ssh_ports=[22, 2222, 2200])
+        self.socket_listen = '[::]:22 (Stream)'
+        self.effective = 'port 22\npubkeyauthentication yes\n'
+        self.sockets = 'LISTEN 0 128 [::]:22 [::]:* users:(("systemd",pid=1,fd=3),("sshd",pid=10,fd=3))'
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+
+    def test_socket_candidate_validates_generated_ports_before_live_switch(self):
+        fake = self.inspection_fixture()
+        self.enable_socket()
+        fake.params.update(verify=False, socket_candidate=True)
+        self.sockets = self.sockets.splitlines()[0]  # old listener survives daemon-reload
+        self.socket_dropins = '/run/systemd/generator/ssh.socket.d/addresses.conf'
+        path = self.fixture_path(self.socket_dropins)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('[Socket]\nListenStream=\nListenStream=[::]:2222\nListenStream=[::]:2200\n')
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        generated = path.read_text()
+        for invalid in ('[Socket]\nListenStream=\nListenStream=99999\n',
+                        '[Socket]\nListenStream=\nAccept=yes\n',
+                        '[Socket]\nListenStream=\nListenStream=[::]:2222\n'):
+            path.write_text(invalid)
+            with self.assertRaises(ValueError):
+                self.inspect(fake)
+        path.write_text(generated)
+        self.socket_listen = '[::]:2222 (Stream)'
+        with self.assertRaises(ValueError):
+            self.inspect(fake)
+
+    def test_ambiguous_socket_configuration_stops_readonly(self):
+        changes = [lambda: setattr(self, 'socket_enabled', 'disabled'),
+                   lambda: setattr(self, 'socket_listen', '/run/ssh.sock (Stream)'),
+                   lambda: setattr(self, 'socket_listen', '[::]:9999 (Stream)'),
+                   lambda: setattr(self, 'socket_listen', '[::]:2222 (Datagram)'),
+                   lambda: setattr(self, 'socket_relationship', 'Requires=\nAfter=\nKillMode=control-group\n'),
+                   lambda: self.fixture_path(self.service_dropins).write_text('[Unit]\nRequires=ssh.socket\nAfter=ssh.socket\n[Service]\nExecStart=custom\n')]
+        for change in changes:
+            fake = self.inspection_fixture()
+            self.enable_socket()
+            change()
+            before = {p: p.read_bytes() for p in self.directory.rglob('*') if p.is_file()}
+            with self.assertRaises(ValueError):
+                self.inspect(fake)
+            self.assertEqual(before, {p: p.read_bytes() for p in self.directory.rglob('*') if p.is_file()})
+        fake = self.inspection_fixture()
+        self.enable_socket()
+        self.socket_dropins = '/etc/systemd/system/ssh.socket.d/custom.conf'
+        path = self.fixture_path(self.socket_dropins)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('[Socket]\nListenStream=2222\n')
+        with self.assertRaises(ValueError):
+            self.inspect(fake)
+        # The same override is rejected even with service-only activation.
+        self.socket = 'inactive'
+        self.socket_enabled = 'disabled'
+        self.service_dropins = ''
+        with self.assertRaises(ValueError):
+            self.inspect(fake)
+
+    def test_socket_handler_order_and_firewall_before_listener_mutation(self):
+        handlers = yaml.safe_load((ROOT / 'roles/host_hardening/handlers/main.yml').read_text())
+        self.assertEqual(handlers[1]['when'], "hardening_before.ssh_activation == 'service'")
+        self.assertTrue(handlers[2]['ansible.builtin.systemd_service']['daemon_reload'])
+        self.assertTrue(handlers[3]['portfolio_hardening_info']['socket_candidate'])
+        self.assertEqual(handlers[4]['ansible.builtin.command']['argv'], ['systemctl', 'restart', 'ssh.socket', 'ssh.service'])
+        for handler in handlers[2:]:
+            self.assertEqual(handler['when'], "hardening_before.ssh_activation == 'socket'")
+            self.assertEqual(handler['listen'], handlers[0]['listen'])
+        allow = next(i for i, task in enumerate(self.tasks) if task.get('loop') == '{{ ssh_listen_ports }}')
+        config = next(i for i, task in enumerate(self.tasks) if 'ansible.builtin.blockinfile' in task)
+        self.assertLess(allow, config)
+        self.assertEqual(self.tasks[-1]['ansible.builtin.meta'], 'flush_handlers')
 
     def test_port_assertions_and_absent_ufw_preflight(self):
         task = self.tasks[0]
@@ -323,7 +506,7 @@ sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
         import shutil
         shutil.rmtree(self.fixture_path('/etc/ufw'))
         self.fixture_path('/etc/default/ufw').unlink()
-        self.assertEqual(self.inspect(fake), {'ufw_installed': False})
+        self.assertEqual(self.inspect(fake), {'ufw_installed': False, 'ssh_activation': 'service'})
         self.fixture_path('/etc/default/ufw').write_text('orphan')
         with self.assertRaises(ValueError):
             self.inspect(fake)

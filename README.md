@@ -309,14 +309,17 @@ new trust or edits the inventory. Existing UFW rules excluded from the desired
 lists cause a safety stop and require deliberate manual migration.
 
 `playbooks/harden.yml` calls `roles/host_hardening`. Safety inspection precedes
-mutation: active/enabled `ssh.socket`, custom SSH/UFW service units/drop-ins,
-unmanaged `Port`/`ListenAddress` directives or nonstandard SSH Include hierarchies,
-occupied SSH ports, inactive Docker/containerd and ambiguous UFW state stop the
-role. Supported SSH input is the regular `/etc/ssh/sshd_config` with the standard
-`/etc/ssh/sshd_config.d/*.conf` include and role-owned listening directives.
-Socket-activated hosts require a separate deliberate migration to `ssh.service`
-through existing administrative/recovery access; the role never disables a
-socket or restarts SSH automatically.
+mutation: ambiguous activation modes, custom SSH/UFW service/socket units or
+nonstandard drop-ins, unmanaged `Port`/`ListenAddress` directives or nonstandard
+SSH Include hierarchies, occupied SSH ports, inactive Docker/containerd and
+ambiguous UFW state stop the role. Supported SSH input is the regular
+`/etc/ssh/sshd_config` with the standard `/etc/ssh/sshd_config.d/*.conf` include
+and role-owned listening directives. Both Ubuntu's active/enabled `ssh.socket`
+and conventional `ssh.service` listener mode are supported without switching
+activation modes. The standard socket dependency drop-in is accepted only with
+its exact `After=ssh.socket` and `Requires=ssh.socket` directives; socket address
+drop-ins must come from Ubuntu's runtime generator. Custom overrides are rejected.
+All existing socket listening ports must remain in `ssh_listen_ports`.
 
 Absent UFW is installed with `state: present`. Existing UFW must be inactive,
 without user rules and with package-original base configuration before first
@@ -333,7 +336,15 @@ All SSH allow rules precede default incoming deny, default outgoing allow and
 UFW enable. Both IPv4 and IPv6 must be enabled and verified. The role prepends a
 managed SSH port/public-key block while preserving the rest of the file. The full
 candidate is validated with `sshd -t -f` before atomic replacement; only a changed
-block notifies the handler, which repeats `sshd -t` before a narrow SSH reload.
+block notifies the handler, which repeats `sshd -t`. Service mode uses a narrow
+`ssh.service` reload. Socket mode runs `daemon-reload`, validates the generated
+and effective socket ports against `sshd -T` and the desired list while existing
+listeners remain available, then restarts `ssh.socket` and `ssh.service` in one
+ordered transaction. Preflight checks the actual socket/service dependencies and
+`KillMode=process` to preserve established sessions. A generated-port mismatch
+stops before listener restart; use recovery access to reconcile configuration
+before retrying. Only a changed SSH block triggers these handlers.
+See [Ubuntu socket activation](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189).
 See [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
 and [OpenSSH configuration](https://man.openbsd.org/sshd_config).
 
@@ -365,8 +376,6 @@ writes. These tests do not establish production runtime success.
 Manual live validation on the already Docker-ready host:
 
 ```bash
-make setup
-make check
 make verify-access
 make verify-docker
 make harden

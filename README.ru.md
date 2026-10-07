@@ -310,13 +310,17 @@ inventory. Исключение существующих UFW rules из desired 
 stop и требует осознанной ручной миграции.
 
 `playbooks/harden.yml` вызывает `roles/host_hardening`. До изменений проверяются:
-active/enabled `ssh.socket`, custom SSH/UFW units/drop-ins, unmanaged
-`Port`/`ListenAddress`, нестандартные SSH Include hierarchies, занятые SSH-порты,
-неактивные Docker/containerd и неоднозначный UFW state. Поддерживается обычный
-`/etc/ssh/sshd_config` со стандартным include `/etc/ssh/sshd_config.d/*.conf`
-и управляемыми ролью listening directives. Socket-activated host требует
-отдельной осознанной миграции на `ssh.service` через существующий administrative/
-recovery access. Роль не отключает socket и не перезапускает SSH автоматически.
+неоднозначные activation modes, custom SSH/UFW service/socket units и нестандартные
+systemd drop-ins, unmanaged `Port`/`ListenAddress`, нестандартные SSH Include
+hierarchies, занятые SSH-порты, неактивные Docker/containerd и неоднозначный UFW
+state останавливают роль. Поддерживается обычный `/etc/ssh/sshd_config` со
+стандартным include `/etc/ssh/sshd_config.d/*.conf` и управляемыми ролью listening
+directives. Поддерживаются штатный Ubuntu active/enabled `ssh.socket` и обычный
+listener mode `ssh.service`; переключения activation mode нет. Штатный socket
+dependency drop-in принимается только с точными директивами `After=ssh.socket`
+и `Requires=ssh.socket`; socket address drop-ins должны быть созданы runtime
+generator Ubuntu. Custom overrides отклоняются. Все текущие socket listening
+ports должны оставаться в `ssh_listen_ports`.
 
 Отсутствующий UFW устанавливается с `state: present`. При первом adoption
 существующий UFW должен быть inactive, без user rules, с package-original base
@@ -333,7 +337,16 @@ UFW CLI используется без новой collection; операции 
 IPv4 и IPv6 должны быть включены и проверены. В начало SSH config добавляется
 managed port/public-key block; остальное содержимое сохраняется. Полный candidate
 проходит `sshd -t -f` до atomic replacement. Только изменённый block вызывает
-handler; перед узким SSH reload handler повторяет `sshd -t`. См.
+handler, который повторяет `sshd -t`. В service mode выполняется узкий reload
+`ssh.service`. В socket mode выполняется `daemon-reload`, затем generated/effective
+socket ports проверяются относительно `sshd -T` и desired list, пока текущие
+listeners продолжают работать. После успешной проверки `ssh.socket` и
+`ssh.service` перезапускаются одной упорядоченной транзакцией. Preflight проверяет
+фактические зависимости socket/service и `KillMode=process` для сохранения
+установленных сессий. Несовпадение generated ports останавливает выполнение до
+restart listeners; перед повторной попыткой согласуйте конфигурацию через recovery
+access. Handlers запускаются только при изменении SSH block. См.
+[Ubuntu socket activation](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189),
 [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
 и [OpenSSH configuration](https://man.openbsd.org/sshd_config).
 
@@ -366,8 +379,6 @@ isolation managed/controller connections, verification каждого порта
 Ручная live validation на уже Docker-ready host:
 
 ```bash
-make setup
-make check
 make verify-access
 make verify-docker
 make harden
