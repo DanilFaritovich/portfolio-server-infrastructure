@@ -65,7 +65,7 @@ class HardeningTests(unittest.TestCase):
         result = self.inspect(fake)
         self.assertFalse(result['ready'])
         for diagnostic in ('ListenAddress', 'Include hierarchy', 'docker.service', 'containerd.service',
-                           'raw UFW', 'package baseline', 'Unknown existing UFW rule'):
+                           'raw UFW', 'Unknown existing UFW rule'):
             self.assertIn(diagnostic, result['report'])
         for secret in ('secret-', 'sha256', 'ssh_sources'):
             self.assertNotIn(secret, json.dumps(result))
@@ -98,6 +98,118 @@ class HardeningTests(unittest.TestCase):
         result = self.inspect(fake)
         self.assertTrue(result['ready'], result['report'])
         self.assertTrue(all(item['status'] == 'PASS' for item in result['findings']), result['report'])
+
+    def test_effective_ports_normalize_duplicates_without_weakening_inventory(self):
+        fake = self.inspection_fixture(managed=False, active=False)
+        fake.params['report_only'] = True
+        self.fixture_path('/etc/ssh/sshd_config').write_text('Port 2222\nPort 2200\n')
+        self.effective += 'port 2222\nport 2200\n'
+        self.assertEqual(info.effective_ssh_ports(self.effective), {2222, 2200})
+        result = self.inspect(fake)
+        self.assertTrue(result['ready'], result['report'])
+        self.assertIn('PASS  effective SSH ports', result['report'])
+        self.assertIn('PASS  safe SSH adoption', result['report'])
+        fake.params['ssh_ports'] = [2222, 2222, 2200]
+        self.assertIn('FAIL  desired SSH ports', self.inspect(fake)['report'])
+        fake.params['ssh_ports'] = [2222, 2200]
+        for line in ('port 0', 'port 65536', 'port invalid', 'port 22 extra', 'port', 'port -22', 'port 22.0'):
+            with self.subTest(line=line):
+                self.effective = 'port 2222\npubkeyauthentication yes\n' + line + '\n'
+                self.assertIn('FAIL  effective SSH ports', self.inspect(fake)['report'])
+
+    def test_safe_provider_baseline_adoption_preserves_files_and_enforces_drift(self):
+        fake = self.inspection_fixture(managed=False, active=False)
+        fake.params['report_only'] = True
+        pristine = self.inspect(fake)
+        self.assertTrue(pristine['ready'], pristine['report'])
+        self.assertIn('PASS  UFW package baseline', pristine['report'])
+        for name in info.PROTECTED:
+            path = self.fixture_path(name)
+            path.write_text(path.read_text() + '# provider image baseline\n')
+        before = {name: self.fixture_path(name).read_bytes() for name in info.PROTECTED}
+        result = self.inspect(fake)
+        self.assertTrue(result['ready'], result['report'])
+        self.assertEqual(result['report'].count('WARN  UFW package baseline'), 1)
+        self.assertIn('existing safe baseline can be adopted', result['report'])
+        fake.params['report_only'] = False
+        first = self.inspect(fake)
+        task = copy.deepcopy(next(task for task in self.tasks if
+            task.get('ansible.builtin.copy', {}).get('dest') == '/etc/ufw/portfolio-hardening.json'))
+        task['ansible.builtin.copy']['dest'] = str(self.marker)
+        task['ansible.builtin.copy'].pop('owner')
+        task['ansible.builtin.copy'].pop('group')
+        task.pop('become')
+        recorded = self.local_ansible([task], {'hardening_firewall': first})
+        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+        self.assertEqual(json.loads(self.marker.read_text()), first['baseline'])
+        self.assertEqual(before, {name: self.fixture_path(name).read_bytes() for name in info.PROTECTED})
+
+        # Model the role's managed mutations; protected hashes must normalize them.
+        self.fixture_path('/etc/ufw/ufw.conf').write_text('ENABLED=no\n# provider image baseline\n')
+        self.fixture_path('/etc/default/ufw').write_text(
+            'IPV6=yes\nDEFAULT_INPUT_POLICY="REJECT"\nDEFAULT_OUTPUT_POLICY="DROP"\n# provider image baseline\n')
+        self.assertEqual(self.inspect(fake)['baseline']['base'], first['baseline']['base'])
+        self.fixture_path('/etc/ufw/ufw.conf').write_bytes(before['/etc/ufw/ufw.conf'])
+        self.fixture_path('/etc/default/ufw').write_bytes(before['/etc/default/ufw'])
+        self.added = '\n'.join(f"ufw allow {p}/tcp comment 'portfolio-host-hardening'" for p in (2222, 2200, 80, 443))
+        self.status = 'Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n' + '\n'.join(
+            f'{p}/tcp{family} ALLOW IN Anywhere{family} # portfolio-host-hardening'
+            for p in (2222, 2200, 80, 443) for family in ('', ' (v6)'))
+        self.fixture_path('/etc/ufw/user.rules').write_text('-A ufw-user-input -p tcp --dport 2222 -j ACCEPT\n')
+        fake.params['refresh_rules'] = True
+        refreshed = self.inspect(fake)
+        final_task = copy.deepcopy(next(task for task in self.tasks if task['name'] ==
+                                       'Record the resulting managed firewall rule fingerprints'))
+        final_task['ansible.builtin.copy']['dest'] = str(self.marker)
+        final_task['ansible.builtin.copy'].pop('owner')
+        final_task['ansible.builtin.copy'].pop('group')
+        final_task.pop('become')
+        recorded = self.local_ansible([final_task], {'hardening_after_firewall': refreshed})
+        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+        fake.params.update(refresh_rules=False, verify=True)
+        for verify in (False, True):
+            fake.params['verify'] = verify
+            owned = self.inspect(fake)
+            self.assertTrue(owned['marker_exists'])
+            self.assertEqual(owned['baseline']['base'], first['baseline']['base'])
+        repeated = self.local_ansible([final_task], {'hardening_after_firewall': owned})
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertIn('changed=0', repeated.stdout)
+        self.fixture_path('/etc/ufw/before.rules').write_text('# external drift\n')
+        fake.params.update(report_only=True, verify=False)
+        self.assertIn('FAIL  protected UFW base configuration', self.inspect(fake)['report'])
+
+    def test_unsafe_initial_ufw_baselines_remain_blocking(self):
+        for change in ('active', 'unknown-rule', 'raw-rule', 'symlink', 'custom-unit',
+                       'malformed-boot', 'duplicate-boot', 'malformed-policy'):
+            with self.subTest(change=change):
+                fake = self.inspection_fixture(managed=False, active=False)
+                fake.params['report_only'] = True
+                if change == 'active':
+                    self.status = 'Status: active'
+                elif change == 'unknown-rule':
+                    self.added = 'ufw allow 2222/tcp'
+                elif change == 'raw-rule':
+                    self.fixture_path('/etc/ufw/user.rules').write_text('-A ufw-user-input -j ACCEPT\n')
+                elif change == 'symlink':
+                    path = self.fixture_path('/etc/ufw/before.rules')
+                    path.unlink()
+                    path.symlink_to(self.fixture_path('/etc/ufw/after.rules'))
+                elif change == 'custom-unit':
+                    path = self.fixture_path('/etc/systemd/system/ufw.service')
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text('# custom\n')
+                elif change in ('malformed-boot', 'duplicate-boot'):
+                    self.fixture_path('/etc/ufw/ufw.conf').write_text(
+                        'ENABLED=invalid\n' if change == 'malformed-boot' else 'ENABLED=yes\nENABLED=no\n')
+                else:
+                    self.fixture_path('/etc/default/ufw').write_text(
+                        'IPV6=yes\nDEFAULT_INPUT_POLICY="INVALID"\nDEFAULT_OUTPUT_POLICY="ACCEPT"\n')
+                result = self.inspect(fake)
+                self.assertFalse(result['ready'], result['report'])
+                self.assertNotIn('existing safe baseline can be adopted', result['report'])
+                if change == 'symlink':
+                    path.unlink()
 
     def test_inspection_socket_staleness_is_warn_but_custom_overrides_block(self):
         fake = self.inspection_fixture()
@@ -1249,14 +1361,12 @@ if '-T' in sys.argv:
     def test_unmanaged_state_and_socket_activation_fail_before_mutation(self):
         fake = self.inspection_fixture(managed=False, active=False)
         self.assertTrue(self.inspect(fake)['ufw_installed'])
-        for change in ('unknown-rule', 'raw-rule', 'base-config', 'active', 'ssh-ports', 'socket'):
+        for change in ('unknown-rule', 'raw-rule', 'active', 'ssh-ports', 'socket'):
             fake = self.inspection_fixture(managed=False, active=False)
             if change == 'unknown-rule':
                 self.added = 'ufw allow 2222/tcp'
             elif change == 'raw-rule':
                 self.fixture_path('/etc/ufw/user.rules').write_text('-A ufw-user-input -j ACCEPT\n')
-            elif change == 'base-config':
-                self.fixture_path('/etc/ufw/before.rules').write_text('custom base configuration')
             elif change == 'active':
                 self.status = 'Status: active'
             elif change == 'socket':

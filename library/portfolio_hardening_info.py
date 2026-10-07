@@ -94,6 +94,22 @@ def ports(values, empty=False):
     return sorted(values)
 
 
+def effective_ssh_ports(text):
+    """Effective daemon output may repeat ports; desired inventory must not."""
+    values = []
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields or fields[0] != 'port':
+            continue
+        require(len(fields) == 2 and re.fullmatch(r'[0-9]+', fields[1]) is not None,
+                'Malformed effective SSH port.')
+        value = int(fields[1])
+        require(1 <= value <= 65535, 'Effective SSH ports must be integers from 1 to 65535.')
+        values.append(value)
+    require(values, 'No effective SSH ports found.')
+    return set(values)
+
+
 def unmanaged_ssh(text, main=False, adopt=False, findings=None, label="SSH configuration"):
     """Only the role's main-file block owns listening directives."""
     def validate(condition, message):
@@ -482,8 +498,7 @@ def inspect(module):
         effective = effective_result[1]
         checks.probe('SSH public-key authentication', lambda: require(
             'pubkeyauthentication yes' in effective.splitlines(), 'Public-key authentication must remain enabled.'))
-        effective_ports = checks.probe('effective SSH ports', lambda: set(ports(
-            [int(line.split()[1]) for line in effective.splitlines() if line.startswith('port ')])))
+        effective_ports = checks.probe('effective SSH ports', lambda: effective_ssh_ports(effective))
     sockets_result = checks.probe('live SSH listener inspection', lambda: run(['ss', '-H', '-ltnp']))
     live_ports, live_routes = None, None
     socket_ports = {route[3] for route in socket_routes} if socket_routes is not None else set()
@@ -611,16 +626,6 @@ def inspect(module):
                     safe_file(Path(name), 'Unexpected UFW configuration file type.', optional=True)
                     pristine_rules(Path(name))
                 checks.probe('pristine raw UFW rules ' + name, raw_rules)
-            package_result = checks.probe('UFW package baseline available', lambda: run(['dpkg-query', '-W', '-f=${Conffiles}', 'ufw']))
-            package_files = {m[1]: m[2] for line in package_result[1].splitlines()
-                             if (m := re.fullmatch(r'\s*(/\S+) ([0-9a-f]{32})(?: obsolete)?', line))} if package_result else None
-            for index, name in enumerate(PROTECTED, 1):
-                def baseline(name=name):
-                    path = Path(name)
-                    if safe_file(path, 'Unexpected UFW configuration file type.', optional=True):
-                        require(name in package_files and hashlib.md5(path.read_bytes()).hexdigest() == package_files[name],
-                                'Unmanaged UFW base configuration detected; differs from package baseline.')
-                checks.probe('UFW package base file ' + name, baseline, package_files is not None)
         def defaults():
             path = Path('/etc/default/ufw')
             safe_file(path, 'Unexpected UFW configuration file type.')
@@ -629,13 +634,32 @@ def inspect(module):
             incoming = re.findall(r'^DEFAULT_INPUT_POLICY="([A-Z]+)"$', text, re.M)
             outgoing = re.findall(r'^DEFAULT_OUTPUT_POLICY="([A-Z]+)"$', text, re.M)
             require(len(incoming) == len(outgoing) == 1, 'Ambiguous UFW default policy configuration.')
+            require(incoming[0] in ('ACCEPT', 'DROP', 'REJECT') and outgoing[0] in ('ACCEPT', 'DROP', 'REJECT'),
+                    'Unrecognized UFW default policy configuration.')
             return incoming[0], outgoing[0]
         policies = checks.probe('UFW IPv4/IPv6 and default policy configuration', defaults)
         def boot_enabled():
             path = Path('/etc/ufw/ufw.conf')
             safe_file(path, 'Unexpected UFW configuration file type.')
-            return 'ENABLED=yes' in path.read_text().splitlines()
+            enabled = re.findall(r'^ENABLED=(.*)$', path.read_text(), re.M)
+            require(len(enabled) == 1 and enabled[0] in ('yes', 'no'), 'Malformed UFW boot configuration.')
+            return enabled[0] == 'yes'
         boot = checks.probe('UFW boot configuration', boot_enabled)
+        if previous is False and not any(item['status'] == 'FAIL' and
+                ('UFW' in item['check'] or 'ufw.service' in item['check']) for item in checks.items):
+            # Package bytes are provenance only. Adopt the safe current snapshot,
+            # preserving provider files; future runs enforce its normalized hashes.
+            try:
+                package_result = run(['dpkg-query', '-W', '-f=${Conffiles}', 'ufw'], optional=True)
+                package_files = {m[1]: m[2] for line in package_result[1].splitlines()
+                                 if (m := re.fullmatch(r'\s*(/\S+) ([0-9a-f]{32})(?: obsolete)?', line))}
+                identical = package_result[0] == 0 and all(
+                    not Path(name).exists() or hashlib.md5(Path(name).read_bytes()).hexdigest() == package_files.get(name)
+                    for name in PROTECTED)
+            except (OSError, ValueError, UnicodeError):
+                identical = False
+            checks.convergence('UFW package baseline', identical, False,
+                               'Package baseline differs or is unavailable; existing safe baseline can be adopted.')
         if policies is not None and active is not None and rules is not None and wanted is not None:
             result.update(baseline=snapshot, ufw_active=active, marker_exists=isinstance(previous, dict),
                           incoming=policies[0], outgoing=policies[1])

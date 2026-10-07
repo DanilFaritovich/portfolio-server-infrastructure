@@ -30,7 +30,7 @@
   become: true
   when: not hardening_before.ufw_installed
 
-- name: Inspect installed UFW before adopting its pristine configuration
+- name: Inspect installed UFW before adopting its safe existing configuration
   portfolio_hardening_info:
     current_port: "{{ ansible_port | int }}"
     ssh_ports: "{{ ssh_listen_ports }}"
@@ -38,7 +38,7 @@
   become: true
   register: hardening_firewall
 
-- name: Record ownership of pristine UFW base configuration
+- name: Record ownership of the safe existing UFW base configuration
   ansible.builtin.copy:
     content: "{{ hardening_firewall.baseline | to_nice_json }}\n"
     dest: /etc/ufw/portfolio-hardening.json

@@ -361,11 +361,18 @@ Preflight accepts a host listening only on the current inventory SSH port when
 the desired list includes future ports. The current port must remain live and
 present in the desired list.
 
-Absent UFW is installed with `state: present`. Existing UFW must be inactive,
-without user rules and with package-original base configuration before first
-adoption. The role records fingerprints in `/etc/ufw/portfolio-hardening.json`;
+Absent UFW is installed with `state: present`. Before first adoption, existing UFW
+must be inactive, without unknown or unmanaged raw user rules, with regular
+non-symlink base files, parseable IPv4/IPv6/default-policy and boot configuration,
+and stock systemd ownership. Safe provider/image changes to base files are preserved;
+package hash differences produce one provenance WARN and do not block adoption.
+The role records the existing normalized fingerprints in `/etc/ufw/portfolio-hardening.json`;
 subsequent runs reject unrelated base/raw-rule changes and unknown rules. No
 reset, rule deletion or arbitrary unmanaged configuration replacement is performed.
+Managed `ENABLED`, input/output policies and role-updated rule fingerprints continue
+to converge without treating the role's own changes as external drift. Effective
+`sshd -T` ports are compared as a set, including duplicate identical entries;
+the desired inventory port lists must still be unique.
 Interrupted firewall mutation can leave the ownership snapshot stale; inspect
 actual state and reconcile it deliberately through recovery access before retrying.
 The focused read-only `library/portfolio_hardening_info.py` module performs these

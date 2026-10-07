@@ -364,10 +364,17 @@ desired list содержит будущие ports. Текущий порт до
 входить в desired list.
 
 Отсутствующий UFW устанавливается с `state: present`. При первом adoption
-существующий UFW должен быть inactive, без user rules, с package-original base
-configuration. Fingerprints сохраняются в `/etc/ufw/portfolio-hardening.json`;
+существующий UFW должен быть inactive, без unknown или unmanaged raw user rules,
+с regular non-symlink base files, parseable IPv4/IPv6/default-policy и boot
+configuration и stock systemd ownership. Безопасные изменения provider/image
+сохраняются; отличие package hashes даёт один provenance WARN и не блокирует adoption.
+Текущие normalized fingerprints сохраняются в `/etc/ufw/portfolio-hardening.json`;
 повторный запуск отклоняет посторонние изменения base/raw rules и unknown rules.
 Reset, удаление правил и произвольная замена unmanaged configuration не выполняются.
+Managed `ENABLED`, input/output policies и fingerprints изменённых ролью rules
+сходятся без ложного external drift. Effective ports из `sshd -T` сравниваются
+как множество, включая одинаковые повторяющиеся entries; desired inventory port
+lists по-прежнему должны содержать unique ports.
 После прерванного firewall mutation ownership snapshot может устареть: изучите
 реальное состояние и осознанно согласуйте его через recovery access до retry.
 Read-only модуль `library/portfolio_hardening_info.py` выполняет inspection.
