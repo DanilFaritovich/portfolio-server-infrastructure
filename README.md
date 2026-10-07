@@ -320,6 +320,14 @@ activation modes. The standard socket dependency drop-in is accepted only with
 its exact `After=ssh.socket` and `Requires=ssh.socket` directives; socket address
 drop-ins must come from Ubuntu's runtime generator. Custom overrides are rejected.
 All existing socket listening ports must remain in `ssh_listen_ports`.
+Generated `ListenStream` entries and systemd `Listen` are compared as TCP listener
+sets (address family, wildcard bind and port), including Ubuntu's explicit
+`0.0.0.0:<port>` / `[::]:<port>` pair. IPv6 wildcard coverage of IPv4 follows
+`BindIPv6Only` and, for `default`, `/proc/sys/net/ipv6/bindv6only`; a family mismatch
+is still rejected. See [systemd socket binding semantics](https://www.freedesktop.org/software/systemd/man/systemd.socket.html#BindIPv6Only=).
+Preflight accepts a host listening only on the current inventory SSH port when
+the desired list includes future ports. The current port must remain live and
+present in the desired list.
 
 Absent UFW is installed with `state: present`. Existing UFW must be inactive,
 without user rules and with package-original base configuration before first
@@ -338,8 +346,10 @@ managed SSH port/public-key block while preserving the rest of the file. The ful
 candidate is validated with `sshd -t -f` before atomic replacement; only a changed
 block notifies the handler, which repeats `sshd -t`. Service mode uses a narrow
 `ssh.service` reload. Socket mode runs `daemon-reload`, validates the generated
-and effective socket ports against `sshd -T` and the desired list while existing
-listeners remain available, then restarts `ssh.socket` and `ssh.service` in one
+and effective semantic listeners against each other, and their ports against
+`sshd -T` and the desired list while existing listeners remain available. Candidate
+inspection also requires runtime IPv4/IPv6 UFW allow rules for all desired SSH
+ports before restarting `ssh.socket` and `ssh.service` in one
 ordered transaction. Preflight checks the actual socket/service dependencies and
 `KillMode=process` to preserve established sessions. A generated-port mismatch
 stops before listener restart; use recovery access to reconcile configuration
@@ -359,6 +369,12 @@ inspection: valid/effective SSH configuration and exact daemon listeners, UFW
 active/enabled, deny incoming/allow outgoing, every configured TCP allow rule for
 IPv4/IPv6, unchanged ownership fingerprints, and active Docker/containerd.
 It installs nothing, invokes no handlers and creates no smoke container.
+This is post-convergence verification: it requires every configured SSH port.
+Before the first successful `make harden`, a future port can time out; that failure
+alone does not establish lockout of the current inventory route. The wrapper
+reports the failed configured port and directs you to `make verify-access` and
+recovery access. Stop on failure; proceed to the next manual command only after
+the previous command succeeds.
 Transient Ansible module files are cleaned up as in access verification.
 
 Docker's own forwarding rules remain unchanged. UFW host-input policy does not

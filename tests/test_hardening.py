@@ -309,10 +309,11 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         self.assertNotIn('state: absent', (ROOT / 'roles/host_hardening/tasks/main.yml').read_text())
 
     def fixture_path(self, name):
-        return self.directory / str(name).lstrip('/') if str(name).startswith(('/etc/', '/run/')) else Path(name)
+        return self.directory / str(name).lstrip('/') if str(name).startswith(('/etc/', '/run/', '/proc/')) else Path(name)
 
     def inspection_fixture(self, managed=True, active=True):
         files = {'/etc/os-release': 'ID=ubuntu\n', '/etc/ssh/sshd_config': 'Include /etc/ssh/sshd_config.d/*.conf\n',
+                 '/proc/sys/net/ipv6/bindv6only': '0\n',
                  '/etc/default/ufw': 'IPV6=yes\nDEFAULT_INPUT_POLICY="DROP"\nDEFAULT_OUTPUT_POLICY="ACCEPT"\n',
                  '/etc/ufw/ufw.conf': 'ENABLED=yes\n'}
         for name in info.PROTECTED + info.RULE_FILES:
@@ -322,7 +323,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
         fake = Mock(params={'ssh_ports': [2222, 2200], 'tcp_ports': [80, 443], 'verify': managed,
-                            'refresh_rules': False})
+                            'refresh_rules': False, 'current_port': 2222})
         fake.get_bin_path.return_value = '/usr/sbin/ufw'
         self.status = ('Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n' +
                        '\n'.join(f'{p}/tcp{family} ALLOW IN Anywhere{family} # portfolio-host-hardening'
@@ -330,13 +331,16 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         self.added = '\n'.join(f"ufw allow {p}/tcp comment 'portfolio-host-hardening'" for p in [2222, 2200, 80, 443]) if managed else ''
         self.socket = 'inactive'
         self.socket_enabled = 'disabled'
-        self.socket_listen = '[::]:2222 (Stream) [::]:2200 (Stream)'
+        self.socket_listen = '0.0.0.0:2222 (Stream) [::]:2222 (Stream) 0.0.0.0:2200 (Stream) [::]:2200 (Stream)'
         self.socket_dropins = ''
+        self.ipv6_policy = 'both'
         self.service_dropins = ''
         self.socket_relationship = 'Requires=ssh.socket\nAfter=ssh.socket\nKillMode=process\n'
         self.service = 'active'
         self.effective = 'port 2222\nport 2200\npubkeyauthentication yes\n'
-        self.sockets = '\n'.join(f'LISTEN 0 128 0.0.0.0:{p} 0.0.0.0:* users:(("sshd",pid=10,fd=3))' for p in [2222, 2200])
+        self.sockets = '\n'.join(line for p in [2222, 2200] for line in (
+            f'LISTEN 0 128 0.0.0.0:{p} 0.0.0.0:* users:(("sshd",pid=10,fd=3))',
+            f'LISTEN 0 128 [::]:{p} [::]:* users:(("sshd",pid=10,fd=4))'))
 
         package_conffiles = '\n'.join(f' {name} {hashlib.md5(self.fixture_path(name).read_bytes()).hexdigest()}'
                                       for name in info.PROTECTED)
@@ -351,7 +355,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
                 dropins = self.socket_dropins if name == 'ssh.socket' else self.service_dropins if name == 'ssh.service' else ''
                 text = f'FragmentPath=/usr/lib/systemd/system/{name}\nDropInPaths={dropins}\n'
                 if name == 'ssh.socket':
-                    text += f'Listen={self.socket_listen}\nAccept=no\nTriggers=ssh.service\n'
+                    text += f'Listen={self.socket_listen}\nAccept=no\nTriggers=ssh.service\nBindIPv6Only={self.ipv6_policy}\n'
                 return 0, text, ''
             if argv[0] == 'systemctl' and argv[2] == 'ssh.socket':
                 state = self.socket if argv[1] == 'is-active' else self.socket_enabled
@@ -415,14 +419,143 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('[Unit]\nAfter=ssh.socket\nRequires=ssh.socket\n')
 
+    def test_socket_listener_semantics_and_ipv6_binding_policy(self):
+        self.assertEqual(info.socket_listeners('0.0.0.0:22 (Stream) [::]:22 (Stream)'),
+                         {('tcp', 'ipv4', '*', 22), ('tcp', 'ipv6', '*', 22)})
+        self.assertEqual(info.socket_listeners('[0000:0000:0000:0000:0000:0000:0000:0000]:22 (Stream)'),
+                         info.socket_listeners('0.0.0.0:22 (Stream) [::]:22 (Stream)'))
+        self.assertNotEqual(info.socket_listeners('[::]:22 (Stream)', True),
+                            info.socket_listeners('0.0.0.0:22 (Stream) [::]:22 (Stream)', True))
+        self.assertEqual(info.socket_listeners('0.0.0.0:22 (Stream) [::]:22 (Stream)', True),
+                         info.socket_listeners('0.0.0.0:22 (Stream)', True) |
+                         info.socket_listeners('[::]:22 (Stream)', True))
+        for text in ('0.0.0.0:22 (Datagram)', '127.0.0.1:22 (Stream)', '[::1]:22 (Stream)',
+                     '[::]:0 (Stream)', '[::]:65536 (Stream)', '22 (Stream) junk'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                info.socket_listeners(text)
+
+    def socket_fixture_routes(self, ports):
+        self.socket_listen = ' '.join(f'{addr}:{port} (Stream)' for port in ports
+                                      for addr in ('0.0.0.0', '[::]'))
+        self.effective = ''.join(f'port {port}\n' for port in ports) + 'pubkeyauthentication yes\n'
+        self.sockets = '\n'.join(f'LISTEN 0 128 {addr}:{port} {addr}:* users:(("systemd",pid=1,fd=3),("sshd",pid=10,fd=3))'
+                                 for port in ports for addr in ('0.0.0.0', '[::]'))
+
+    def generated_socket_fixture(self, ports):
+        self.socket_dropins = '/run/systemd/generator/ssh.socket.d/addresses.conf'
+        path = self.fixture_path(self.socket_dropins)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('# Automatically generated by sshd-socket-generator\n\n[Socket]\nListenStream=\n' +
+                        ''.join(f'ListenStream={addr}:{port}\n' for port in ports
+                                for addr in ('0.0.0.0', '[::]')))
+        return path
+
+    def test_ubuntu_generated_entries_and_effective_listen_are_semantically_equivalent(self):
+        fake = self.inspection_fixture()
+        self.enable_socket()
+        self.generated_socket_fixture([2222, 2200])
+        for listen in ('2200 (Stream) 2222 (Stream)', '*:2222 (Stream) *:2200 (Stream)',
+                       '[::]:2200 (Stream)   [::]:2222 (Stream)',
+                       '[0:0:0:0:0:0:0:0]:2222 (Stream) [::]:2200 (Stream)', self.socket_listen):
+            with self.subTest(listen=listen):
+                self.socket_listen = listen
+                self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        self.socket_listen = '[::]:2222 (Stream) [::]:2200 (Stream)'
+        self.ipv6_policy = 'default'
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        self.fixture_path('/proc/sys/net/ipv6/bindv6only').write_text('1\n')
+        with self.assertRaisesRegex(ValueError, 'differs semantically'):
+            self.inspect(fake)
+        self.ipv6_policy = 'ipv6-only'
+        with self.assertRaisesRegex(ValueError, 'differs semantically'):
+            self.inspect(fake)
+        self.socket_fixture_routes([2222, 2200])
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        self.sockets = self.sockets.splitlines()[0]
+        with self.assertRaisesRegex(ValueError, 'Live SSH socket listeners differ'):
+            self.inspect(fake)
+
+    def test_current_route_pretransition_candidate_and_final_readonly_convergence(self):
+        fake = self.inspection_fixture()
+        desired = [22, 2222, 2200]
+        fake.params.update(verify=False, ssh_ports=desired)
+        self.enable_socket()
+        self.socket_fixture_routes([2222])
+        self.generated_socket_fixture([2222])
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        fake.params['verify'] = True
+        with self.assertRaisesRegex(ValueError, 'Effective SSH ports/listeners'):
+            self.inspect(fake)
+        fake.params.update(verify=False, socket_candidate=True)
+        old_live = self.sockets
+        self.socket_fixture_routes(desired)
+        self.sockets = old_live  # daemon-reload changes the candidate, not the live routes
+        self.generated_socket_fixture(desired)
+        allowed = desired + fake.params['tcp_ports']
+        self.status = ('Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n' +
+                       '\n'.join(f'{port}/tcp{family} ALLOW IN Anywhere{family} # portfolio-host-hardening'
+                                 for port in allowed for family in ('', ' (v6)')))
+        self.added = '\n'.join(f"ufw allow {port}/tcp comment 'portfolio-host-hardening'" for port in allowed)
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        fake.params['socket_candidate'] = False
+        with self.assertRaisesRegex(ValueError, 'Live SSH socket listeners differ'):
+            self.inspect(fake)
+        self.socket_fixture_routes(desired)
+        fake.params['verify'] = True
+        before = {path: path.read_bytes() for path in self.directory.rglob('*') if path.is_file()}
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        self.assertEqual(before, {path: path.read_bytes() for path in self.directory.rglob('*') if path.is_file()})
+
+    def test_current_route_and_candidate_firewall_failures_are_rejected(self):
+        for desired, live in (([2222, 2200], [2200]), ([2200], [2200])):
+            fake = self.inspection_fixture()
+            fake.params.update(verify=False, ssh_ports=desired)
+            self.socket_fixture_routes(live)
+            with self.assertRaisesRegex(ValueError, 'Current inventory SSH route'):
+                self.inspect(fake)
+        fake = self.inspection_fixture()
+        self.enable_socket()
+        fake.params.update(verify=False, socket_candidate=True)
+        for family in ('', ' (v6)'):
+            original = self.status
+            self.status = self.status.replace(f'2200/tcp{family} ALLOW IN', f'2200/tcp{family} DENY IN')
+            with self.assertRaisesRegex(ValueError, 'All desired SSH ports'):
+                self.inspect(fake)
+            self.status = original
+
+    def test_verify_hardening_wrapper_timeout_reports_route_and_rethrows_without_mutation(self):
+        for mode in ('harden', 'verify-hardening'):
+            with self.subTest(mode=mode), patch.object(access, 'prerequisites'), \
+                    patch.object(access, 'known_host'), patch.object(access, 'prepare_key'), \
+                    patch.object(access.subprocess, 'run') as run, patch('builtins.print') as output:
+                calls = []
+                def timeout(command, **kwargs):
+                    calls.append(Path(command[3]).name)
+                    if command[3].endswith('verify.yml') and len(calls) > (2 if mode == 'harden' else 1):
+                        raise subprocess.CalledProcessError(124, command, stderr='timed out')
+                run.side_effect = timeout
+                with self.assertRaises(subprocess.CalledProcessError) as raised:
+                    access.live(mode, self.inventory, self.key)
+                self.assertEqual(raised.exception.returncode, 124)
+                self.assertEqual(calls, ['verify.yml'] + (['harden.yml'] if mode == 'harden' else []) + ['verify.yml'])
+                messages = ' '.join(str(call.args) for call in output.call_args_list)
+                self.assertIn('Post-convergence access verification failed', messages)
+                self.assertIn('make verify-access on the current inventory route', messages)
+
     def test_default_ubuntu_socket_and_multiport_state_are_accepted(self):
         fake = self.inspection_fixture()
         self.assertEqual(self.inspect(fake)['ssh_activation'], 'service')
         self.enable_socket()
         self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
-        fake.params.update(verify=False, ssh_ports=[22, 2222, 2200])
+        fake.params.update(verify=False, ssh_ports=[22, 2222, 2200], current_port=22)
+        self.socket_fixture_routes([22])
+        self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
+        fake.params['current_port'] = 2222
+        with self.assertRaisesRegex(ValueError, 'Current inventory SSH route'):
+            self.inspect(fake)
+        fake.params['current_port'] = 22
         self.socket_listen = '[::]:22 (Stream)'
-        self.effective = 'port 22\npubkeyauthentication yes\n'
         self.sockets = 'LISTEN 0 128 [::]:22 [::]:* users:(("systemd",pid=1,fd=3),("sshd",pid=10,fd=3))'
         self.assertEqual(self.inspect(fake)['ssh_activation'], 'socket')
 

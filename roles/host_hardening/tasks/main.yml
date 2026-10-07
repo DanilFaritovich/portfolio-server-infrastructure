@@ -16,6 +16,7 @@
 
 - name: Inspect SSH and firewall safety before any mutation
   portfolio_hardening_info:
+    current_port: "{{ ansible_port | int }}"
     ssh_ports: "{{ ssh_listen_ports }}"
     tcp_ports: "{{ firewall_allowed_tcp_ports }}"
   become: true
@@ -31,6 +32,7 @@
 
 - name: Inspect installed UFW before adopting its pristine configuration
   portfolio_hardening_info:
+    current_port: "{{ ansible_port | int }}"
     ssh_ports: "{{ ssh_listen_ports }}"
     tcp_ports: "{{ firewall_allowed_tcp_ports }}"
   become: true
@@ -91,6 +93,7 @@
 
 - name: Read fingerprints after role-owned firewall changes
   portfolio_hardening_info:
+    current_port: "{{ ansible_port | int }}"
     ssh_ports: "{{ ssh_listen_ports }}"
     tcp_ports: "{{ firewall_allowed_tcp_ports }}"
     refresh_rules: true

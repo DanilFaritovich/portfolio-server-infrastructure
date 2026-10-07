@@ -22,6 +22,7 @@
 
 - name: Validate effective generated socket before restarting any SSH listener
   portfolio_hardening_info:
+    current_port: "{{ ansible_port | int }}"
     ssh_ports: "{{ ssh_listen_ports }}"
     tcp_ports: "{{ firewall_allowed_tcp_ports }}"
     socket_candidate: true

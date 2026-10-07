@@ -296,10 +296,19 @@ def live(mode, inventory, key):
         # Each configured port gets a new independent connection. Reuse the
         # already trusted host identity via HostKeyAlias; never scan/accept keys.
         identity = host if port == 22 else f'[{host}]:{port}'
+        print('LIVE / POST-CONVERGENCE VERIFY: all configured SSH ports are required. '
+              'Before the first successful make harden, future ports may be unavailable; '
+              'this alone does not mean the current inventory route is locked out.', flush=True)
         for target_port in inputs['ssh_listen_ports']:
             connection = stage | {'ansible_port': target_port,
                                   'ansible_ssh_args': stage['ansible_ssh_args'] + f' -o HostKeyAlias={identity}'}
-            run_playbook(inventory, alias, connection, 'verify.yml')
+            try:
+                run_playbook(inventory, alias, connection, 'verify.yml')
+            except subprocess.CalledProcessError:
+                print(f'Post-convergence access verification failed on configured SSH port {target_port}. '
+                      'Stop and check make verify-access on the current inventory route and recovery access. '
+                      'A future port may be unavailable until make harden succeeds.', flush=True)
+                raise
             run_playbook(inventory, alias, connection | inputs, 'verify-hardening.yml')
     print('Requested stage completed. STOP.')
 

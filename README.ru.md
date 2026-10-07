@@ -321,6 +321,15 @@ dependency drop-in принимается только с точными дир�
 и `Requires=ssh.socket`; socket address drop-ins должны быть созданы runtime
 generator Ubuntu. Custom overrides отклоняются. Все текущие socket listening
 ports должны оставаться в `ssh_listen_ports`.
+Generated `ListenStream` и systemd `Listen` сравниваются как множества TCP
+listeners: address family, wildcard bind и port. Принимается штатная пара
+Ubuntu `0.0.0.0:<port>` / `[::]:<port>`. Доступность IPv4 через IPv6 wildcard
+определяется `BindIPv6Only`, а при `default` — `/proc/sys/net/ipv6/bindv6only`;
+реальное несовпадение address families отклоняется. См.
+[systemd socket binding semantics](https://www.freedesktop.org/software/systemd/man/systemd.socket.html#BindIPv6Only=).
+Preflight допускает listener только на текущем inventory SSH port, даже если
+desired list содержит будущие ports. Текущий порт должен оставаться live и
+входить в desired list.
 
 Отсутствующий UFW устанавливается с `state: present`. При первом adoption
 существующий UFW должен быть inactive, без user rules, с package-original base
@@ -339,8 +348,10 @@ managed port/public-key block; остальное содержимое сохр�
 проходит `sshd -t -f` до atomic replacement. Только изменённый block вызывает
 handler, который повторяет `sshd -t`. В service mode выполняется узкий reload
 `ssh.service`. В socket mode выполняется `daemon-reload`, затем generated/effective
-socket ports проверяются относительно `sshd -T` и desired list, пока текущие
-listeners продолжают работать. После успешной проверки `ssh.socket` и
+semantic listeners сравниваются между собой, а их ports — с `sshd -T` и desired
+list, пока текущие listeners продолжают работать. Candidate inspection также
+требует runtime UFW allow для всех desired SSH ports в IPv4/IPv6 до restart.
+После успешной проверки `ssh.socket` и
 `ssh.service` перезапускаются одной упорядоченной транзакцией. Preflight проверяет
 фактические зависимости socket/service и `KillMode=process` для сохранения
 установленных сессий. Несовпадение generated ports останавливает выполнение до
@@ -363,6 +374,12 @@ incoming deny/outgoing allow, все configured TCP allow rules для IPv4/IPv6
 неизменённые ownership fingerprints и active Docker/containerd. Проверка ничего
 не устанавливает, не вызывает handlers и не создаёт smoke container. Временные
 Ansible module files очищаются как при access verification.
+Это post-convergence verification: требуются все configured SSH ports.
+До первого успешного `make harden` timeout на будущем порту возможен; сам по
+себе он не означает lockout текущего inventory route. Wrapper сообщает failed
+configured port и направляет к `make verify-access` и recovery access.
+При ошибке остановитесь; выполняйте следующую manual-команду только после
+успешного завершения предыдущей.
 
 Docker forwarding rules сохраняются. UFW host-input policy сама по себе не
 ограничивает будущие Docker-published container ports; application network

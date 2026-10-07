@@ -16,6 +16,7 @@
 
     - name: Verify SSH configuration listeners firewall and runtime services
       portfolio_hardening_info:
+        current_port: "{{ ansible_port | int }}"
         ssh_ports: "{{ ssh_listen_ports | default([ansible_port | int]) }}"
         tcp_ports: "{{ firewall_allowed_tcp_ports | default([80, 443]) }}"
         verify: true

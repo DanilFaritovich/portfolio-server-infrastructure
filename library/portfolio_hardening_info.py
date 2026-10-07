@@ -26,6 +26,9 @@ options:
     description: Validate generated socket listeners before restarting, without requiring live convergence.
     type: bool
     default: false
+  current_port:
+    description: Current inventory SSH route that must survive the transition.
+    type: int
   refresh_rules:
     description: Read fingerprints after role-owned rule changes; still never writes state.
     type: bool
@@ -54,6 +57,7 @@ baseline:
 
 import glob
 import hashlib
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -165,7 +169,7 @@ def unit_properties(run, name, properties):
     return result
 
 
-def stock_unit(unit, name, socket_mode=False):
+def stock_unit(unit, name, socket_mode=False, ipv6_only=False):
     require(unit['FragmentPath'] in ('/usr/lib/systemd/system/' + name, '/lib/systemd/system/' + name),
             'Custom systemd unit detected.')
     for filename in unit['DropInPaths'].split():
@@ -182,26 +186,40 @@ def stock_unit(unit, name, socket_mode=False):
         elif socket_mode and name == 'ssh.socket':
             require(filename == '/run/systemd/generator/ssh.socket.d/addresses.conf' and
                     len(lines) >= 3 and lines[:2] == ['[Socket]', 'ListenStream='] and
-                    all(re.fullmatch(r'ListenStream=(?:0\.0\.0\.0:|\[::\]:|\*:)?[0-9]+', line)
-                        for line in lines[2:]),
+                    all(line.startswith('ListenStream=') and line != 'ListenStream=' for line in lines[2:]),
                     'Custom SSH socket drop-in detected.')
-            generated = socket_ports(' '.join(line.split('=', 1)[1] + ' (Stream)' for line in lines[2:]))
-            require(generated == socket_ports(unit['Listen']), 'Generated socket file differs from effective listeners.')
+            generated = socket_listeners(' '.join(line.split('=', 1)[1] + ' (Stream)' for line in lines[2:]), ipv6_only)
+            effective = socket_listeners(unit['Listen'], ipv6_only)
+            require(generated == effective, 'Generated socket file differs semantically from effective listeners.')
         else:
             require(False, 'Custom systemd drop-in detected.')
 
 
-def socket_ports(text):
-    # systemctl show Listen reports effective entries as "address (Stream)".
-    entries = re.findall(r'(\S+) \(Stream\)', text)
-    require(entries and ' '.join(address + ' (Stream)' for address in entries) == text,
+def wildcard_listener(address, ipv6_only=False):
+    """Normalize TCP reachability, including IPv4 coverage of a dual-stack socket."""
+    match = re.fullmatch(r'(?:(0\.0\.0\.0|\*|\[[0-9a-fA-F:]+\]):)?([0-9]+)', address)
+    require(match is not None, 'Non-wildcard SSH socket listener detected.')
+    host, port = match[1], int(match[2])
+    ports([port])
+    if host == '0.0.0.0':
+        return {('tcp', 'ipv4', '*', port)}
+    if host not in (None, '*'):
+        require(ipaddress.IPv6Address(host[1:-1]).is_unspecified,
+                'Non-wildcard SSH socket listener detected.')
+    found = {('tcp', 'ipv6', '*', port)}
+    if not ipv6_only:
+        found.add(('tcp', 'ipv4', '*', port))
+    return found
+
+
+def socket_listeners(text, ipv6_only=False):
+    # systemctl's property is a whitespace-separated list, not a unit-file serialization.
+    entries = re.findall(r'(\S+)\s+\(Stream\)', text)
+    require(entries and ' '.join(address + ' (Stream)' for address in entries) == ' '.join(text.split()),
             'Ambiguous SSH socket Listen configuration.')
     found = set()
     for address in entries:
-        match = re.fullmatch(r'(?:0\.0\.0\.0:|\[::\]:|\*:)?(\d+)', address)
-        require(match is not None, 'Non-wildcard SSH socket listener detected.')
-        found.add(int(match[1]))
-    ports(list(found))
+        found.update(wildcard_listener(address, ipv6_only))
     return found
 
 
@@ -225,7 +243,8 @@ def inspect(module):
             'Ambiguous SSH activation mode.')
     for service in ('ssh.service', 'ufw.service') if installed else ('ssh.service',):
         stock_unit(unit_properties(run, service, ['FragmentPath', 'DropInPaths']), service, socket_mode)
-    socket_listeners = set()
+    socket_routes = set()
+    ipv6_only = False
     if not socket_mode:
         # Disabled sockets still must not hide custom overrides for a later boot.
         unit = unit_properties(run, 'ssh.socket', ['FragmentPath', 'DropInPaths'])
@@ -235,10 +254,18 @@ def inspect(module):
         else:
             stock_unit(unit, 'ssh.socket')
     if socket_mode:
-        unit = unit_properties(run, 'ssh.socket', ['FragmentPath', 'DropInPaths', 'Listen', 'Accept', 'Triggers'])
-        stock_unit(unit, 'ssh.socket', True)
+        unit = unit_properties(run, 'ssh.socket', ['FragmentPath', 'DropInPaths', 'Listen', 'Accept', 'Triggers', 'BindIPv6Only'])
+        require(unit['BindIPv6Only'] in ('default', 'both', 'ipv6-only'), 'Ambiguous IPv6 socket binding policy.')
+        policy = unit['BindIPv6Only']
+        if policy == 'default':
+            default = Path('/proc/sys/net/ipv6/bindv6only').read_text().strip()
+            require(default in ('0', '1'), 'Ambiguous system IPv6 binding policy.')
+            ipv6_only = default == '1'
+        else:
+            ipv6_only = policy == 'ipv6-only'
+        stock_unit(unit, 'ssh.socket', True, ipv6_only)
         require(unit['Accept'] == 'no' and unit['Triggers'] == 'ssh.service', 'Unsupported SSH socket activation.')
-        socket_listeners = socket_ports(unit['Listen'])
+        socket_routes = socket_listeners(unit['Listen'], ipv6_only)
         service = unit_properties(run, 'ssh.service', ['Requires', 'After', 'KillMode'])
         require('ssh.socket' in service['Requires'].split() and 'ssh.socket' in service['After'].split() and
                 service['KillMode'] == 'process', 'Unsafe SSH socket/service restart relationship.')
@@ -260,30 +287,39 @@ def inspect(module):
     require('pubkeyauthentication yes' in effective.splitlines(), 'Public-key authentication must remain enabled.')
     _, sockets = run(['ss', '-H', '-ltnp'])
     live_ports = listeners(sockets)
+    socket_ports = {route[3] for route in socket_routes}
+    live_routes = set()
     if socket_mode:
         # PID 1 can retain socket ownership alongside sshd. Attribute only the
         # effective ssh.socket ports, never arbitrary systemd listeners.
         for line in sockets.splitlines():
             fields = line.split()
-            if len(fields) >= 4 and re.search(r'"systemd",pid=1,', line):
+            if len(fields) >= 4 and (re.search(r'"sshd(?:-[^"]*)?"', line) or re.search(r'"systemd",pid=1,', line)):
                 port = fields[3].rsplit(':', 1)[1]
-                if port.isdigit() and int(port) in socket_listeners:
+                if port.isdigit() and (int(port) in socket_ports or re.search(r'"sshd(?:-[^"]*)?"', line)):
                     live_ports.add(int(port))
+                    live_routes.update(wildcard_listener(fields[3], ipv6_only))
     effective_ports = {int(line.split()[1]) for line in effective.splitlines() if line.startswith('port ')}
     candidate = module.params.get('socket_candidate', False)
     if socket_mode:
-        require(socket_listeners == effective_ports, 'Generated socket listeners differ from sshd configuration.')
-        require(socket_listeners <= set(ssh_ports), 'Preserve existing SSH socket routes in desired ports.')
+        require(socket_ports == effective_ports, 'Generated socket listeners differ from sshd configuration.')
+        require(socket_ports <= set(ssh_ports), 'Preserve existing SSH socket routes in desired ports.')
         if candidate:
-            require(socket_listeners == set(ssh_ports), 'Generated socket listeners differ from desired ports.')
+            require(socket_ports == set(ssh_ports), 'Generated socket listeners differ from desired ports.')
         else:
-            require(live_ports == socket_listeners, 'Live SSH socket listeners differ from effective configuration.')
+            require(live_routes == socket_routes, 'Live SSH socket listeners differ semantically from effective configuration.')
     require(not candidate or socket_mode, 'Socket candidate requires socket activation.')
+    require(live_ports <= set(ssh_ports), 'Preserve existing live SSH routes in desired ports.')
+    current_port = module.params.get('current_port')
+    if current_port is not None:
+        ports([current_port])
+        require(current_port in ssh_ports and current_port in live_ports,
+                'Current inventory SSH route must remain live and included in desired ports.')
     for line in sockets.splitlines():
         fields = line.split()
         if len(fields) >= 4 and fields[3].rsplit(':', 1)[1].isdigit():
             require(int(fields[3].rsplit(':', 1)[1]) not in ssh_ports or re.search(r'"sshd(?:-[^"]*)?"', line) or
-                    (socket_mode and int(fields[3].rsplit(':', 1)[1]) in socket_listeners and
+                    (socket_mode and int(fields[3].rsplit(':', 1)[1]) in socket_ports and
                      re.search(r'"systemd",pid=1,', line)),
                     'A configured SSH port is occupied by another process.')
     if module.params['verify']:
@@ -291,6 +327,10 @@ def inspect(module):
 
     result = {'ufw_installed': installed, 'ssh_activation': 'socket' if socket_mode else 'service'}
     if candidate:
+        require(installed, 'SSH socket activation requires the prepared firewall.')
+        _, status = run(['ufw', 'status', 'verbose'])
+        require(set(ssh_ports) <= runtime_ports(status) and set(ssh_ports) <= runtime_ports(status, ipv6=True),
+                'All desired SSH ports must be allowed for IPv4 and IPv6 before socket activation.')
         return result
     if not installed:
         require(not Path('/etc/systemd/system/ufw.service').exists() and
@@ -350,6 +390,7 @@ def main():
         'verify': {'type': 'bool', 'default': False},
         'refresh_rules': {'type': 'bool', 'default': False},
         'socket_candidate': {'type': 'bool', 'default': False},
+        'current_port': {'type': 'int'},
     }, supports_check_mode=True)
     try:
         module.exit_json(changed=False, **inspect(module))
