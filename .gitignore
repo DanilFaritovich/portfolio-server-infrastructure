@@ -12,3 +12,8 @@ inventories/*
 *.pub
 .env
 .env.*
+secrets/
+*_ed25519
+id_ed25519
+id_rsa
+id_ecdsa

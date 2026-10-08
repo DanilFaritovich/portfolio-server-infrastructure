@@ -1,0 +1,94 @@
+---
+- name: Validate human account and explicit privilege policy
+  ansible.builtin.assert:
+    that:
+      - ansible_user == 'ansible'
+      - ansible_connection == 'ssh'
+      - human_access_user_name is match('^[a-z_][a-z0-9_-]{0,30}$')
+      - human_access_user_name not in ['root', 'ansible']
+      - human_access_user_groups is sequence and human_access_user_groups is not string
+      - human_access_user_groups | unique | length == human_access_user_groups | length
+      - human_access_user_groups | intersect(['root', 'ansible', 'docker', 'lxd', 'disk', 'shadow']) | length == 0
+      - human_access_user_sudo in ['none', 'admin', 'restricted']
+      - human_access_user_sudo == 'admin' or human_access_user_groups | intersect(['sudo', 'admin']) | length == 0
+      - human_access_user_sudo != 'admin' or human_access_user_sudo_commands == ['ALL']
+      - human_access_user_sudo != 'none' or human_access_user_sudo_commands | length == 0
+      - human_access_user_sudo != 'restricted' or human_access_user_sudo_commands | length > 0
+    fail_msg: Use a separate human account and an explicit supported group/sudo policy.
+    quiet: true
+
+- name: Validate each supplementary group name
+  ansible.builtin.assert:
+    that: item is match('^[a-z_][a-z0-9_-]{0,30}$')
+    quiet: true
+  loop: "{{ human_access_user_groups }}"
+
+- name: Validate restricted sudo executable paths without syntax injection
+  ansible.builtin.assert:
+    that:
+      - item is match('^/[a-zA-Z0-9_./-]+$')
+      - "'..' not in item.split('/')"
+    quiet: true
+  loop: "{{ human_access_user_sudo_commands }}"
+  when: human_access_user_sudo == 'restricted'
+
+- name: Load the public key using the shared bootstrap controller validation
+  ansible.builtin.include_role:
+    name: bootstrap_user
+    tasks_from: controller_key
+    apply:
+      delegate_to: localhost
+      become: false
+  vars:
+    bootstrap_user_public_key_path: "{{ human_access_user_public_key_path }}"
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+- name: Inspect account ownership and privilege state before mutation
+  portfolio_human_info:
+    name: "{{ human_access_user_name }}"
+    groups: "{{ human_access_user_groups }}"
+    sudo: "{{ human_access_user_sudo }}"
+    commands: "{{ human_access_user_sudo_commands }}"
+  become: true
+
+- name: Use the shared account and authorized-key implementation
+  ansible.builtin.include_role:
+    name: bootstrap_user
+    tasks_from: account
+  vars:
+    bootstrap_user_name: "{{ human_access_user_name }}"
+    bootstrap_user_home: "/home/{{ human_access_user_name }}"
+    bootstrap_user_shell: /bin/bash
+    bootstrap_user_groups: "{{ human_access_user_groups }}"
+    bootstrap_user_allow_passwordless_sudo: "{{ human_access_user_sudo != 'none' }}"
+    bootstrap_user_sudo_commands: "{{ human_access_user_sudo_commands }}"
+    bootstrap_user_sudo_path: "/etc/sudoers.d/portfolio-human-{{ human_access_user_name }}"
+
+- name: Protect managed human account records
+  ansible.builtin.file:
+    path: /var/lib/portfolio-human-access
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  become: true
+
+- name: Read the completed account identity for its protected ownership record
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ human_access_user_name }}"
+  become: true
+
+- name: Record the completed managed account without key material
+  ansible.builtin.copy:
+    dest: "/var/lib/portfolio-human-access/{{ human_access_user_name }}.json"
+    content: >-
+      {{ {'name': human_access_user_name, 'groups': human_access_user_groups, 'sudo': human_access_user_sudo,
+      'commands': human_access_user_sudo_commands,
+      'uid': getent_passwd[human_access_user_name][1] | int,
+      'gid': getent_passwd[human_access_user_name][2] | int} | to_nice_json }}
+    owner: root
+    group: root
+    mode: '0600'
+  become: true

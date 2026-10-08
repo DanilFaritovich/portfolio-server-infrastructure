@@ -7,12 +7,13 @@ Provisioning VPS на Ubuntu через Ansible. Pipeline:
 ```text
 local setup -> bootstrap managed ansible user -> verify access
 -> provision Docker host -> verify Docker
--> firewall + validated SSH host ports -> verify hardening -> STOP
+-> firewall + validated SSH host ports -> verify hardening
+-> human access -> verify users -> final SSH policy -> verify SSH security -> STOP
 ```
 
 Docker Engine, Compose и Buildx готовят хост к будущим workloads. Caddy,
 application networks/Compose files, Vue, domains/TLS, GHCR authentication,
-deployment/CD, human/admin access и окончательная root/password-login policy, fail2ban и
+deployment/CD, fail2ban и
 automatic upgrades остаются отдельными следующими этапами.
 
 ## Quick Start
@@ -526,7 +527,7 @@ make verify-hardening
 
 Второй `make harden` должен дать `changed=0`, если external state не изменился.
 Агент выполняет только offline checks; live safety, listeners и идемпотентность
-подтверждаются вручную. После Stage 3 — STOP.
+подтверждаются вручную. После Stage 3 — STOP до отдельного запуска Stage 4.
 
 ## Подтверждённая перезагрузка хоста
 
@@ -556,7 +557,7 @@ password authentication и sudo prompts запрещены.
 Docker smoke test может изменить image cache; firewall/SSH provisioning не запускается.
 При ошибке возвращается non-zero status с указанием failed phase, последующие проверки
 не выполняются. Reboot уже мог произойти: используйте recovery console и не повторяйте
-его вслепую. Human-access policy и application deployment остаются отдельными stages.
+его вслепую. Human-access policy реализуется отдельно в Stage 4 ниже; application deployment остаётся отдельным.
 
 Offline-тесты подменяют все remote/reboot вызовы; `make check`/CI выполняют только
 syntax-check этого playbook и локальные проверки. Агент не выполнял реальный reboot.
@@ -611,3 +612,134 @@ shell exports и активация environment больше не нужны.
 ## Лицензия
 
 См. [LICENSE](LICENSE). Существующая лицензия сохранена.
+
+## Пользователи и финальная защита SSH (Stage 4)
+
+Запускайте отдельно после успешной проверки Stage 3. Все четыре команды —
+**LIVE**. `add-user` и `secure-ssh` изменяют сервер; verification создаёт свежие
+SSH-сессии и выполняет read-only проверки аккаунтов/policy. Root-пароли не
+используются, host trust не изменяется. Сохраняйте прежние локальные inventory и
+`AUTOMATION_KEY`: каждая команда сначала проверяет ключевой доступ `ansible`,
+`sudo -n` и завершение Stage 3 на каждом маршруте `ssh_verify_ports`.
+
+```bash
+# Отдельный локальный Ed25519-ключ; администратор с root-equivalent NOPASSWD.
+make add-user HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
+make verify-user HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
+# Оставьте сессию operator открытой; интерактивно подтвердите доступность console recovery.
+make secure-ssh HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
+make verify-ssh-security HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
+```
+
+Ключ человека по умолчанию: `~/.ssh/portfolio-infra/<HUMAN_USER>_ed25519`, отдельно
+от automation key. `HUMAN_KEY` меняет путь. В репозитории разрешён только
+`./secrets/portfolio-infra/`, например:
+
+```bash
+make add-user HUMAN_USER=reader HUMAN_GROUPS=readers HUMAN_SUDO=none \
+  HUMAN_KEY="$PWD/secrets/portfolio-infra/reader_ed25519"
+# Импорт одного public key без генерации/копирования private key.
+make add-user HUMAN_USER=operator2 HUMAN_SUDO=admin \
+  HUMAN_PUBLIC_KEY="$HOME/.ssh/operator2.pub"
+# Владелец проверяет доступ с соответствующей локальной private/public парой.
+make verify-user HUMAN_USER=operator2 HUMAN_SUDO=admin \
+  HUMAN_KEY="$HOME/.ssh/operator2" HUMAN_PUBLIC_KEY="$HOME/.ssh/operator2.pub"
+# Ограниченный sudo: путь разрешает любые аргументы поддерживаемой программы.
+make add-user HUMAN_USER=auditor HUMAN_SUDO=restricted \
+  HUMAN_SUDO_COMMANDS=/usr/bin/id
+```
+
+`HUMAN_USER` обязателен; `HUMAN_SUDO` по умолчанию `none`. `admin` устанавливает
+`NOPASSWD: ALL`; `restricted` требует абсолютные пути программ через запятую в
+`HUMAN_SUDO_COMMANDS`, без аргументов, wildcard и синтаксиса sudoers. Shell,
+интерпретатор или service manager даже с таким grant могут дать полный root.
+Restricted executables должны иметь canonical path, root ownership и execute bit,
+с защищёнными root-owned parents; mutable files и symlinks запрещены.
+`HUMAN_GROUPS` — добавляемые группы через запятую; отсутствующие создаются.
+Root/system и распространённые runtime privilege groups запрещены; `sudo`/`admin`
+требуют admin policy. Права custom groups проверяйте отдельно. `none` не добавляет
+sudo fragment; verification требует отсутствия non-interactive sudo grant.
+
+Новые ключи создаются без passphrase, каталоги имеют `0700`, private keys — `0600`
+или строже. Существующие пары сохраняются; неполные пары, symlinks, небезопасные
+permissions и совпадение пути с automation key блокируют операцию. Wrapper не
+читает private-key bytes и не отправляет их на сервер. Существующие зашифрованные
+human keys могут использовать уже разблокированный SSH agent с
+`IdentitiesOnly=yes` и выбранным identity; automation не зависит от agent.
+Public-only импорт без доступного локального private key отмечается **UNVERIFIED**
+и не разрешает финальную защиту. Используйте отдельный ключ для каждого человека;
+защищайте резервные копии как пароли. `secrets/` и распространённые имена ключей
+исключены из Git/Docker context; ignore rules не заменяют review staged files.
+Секреты и public keys не должны попадать в inventory, вывод или committed config.
+
+### Типичная ошибка preflight
+
+В стандартной системе у пользователя `operator` может уже существовать системная
+группа с GID 37, конфликтующая с созданием нового human account с таким именем.
+Раньше общее сообщение preflight скрывало причину. Выберите свободное имя
+`HUMAN_USER`; не удаляйте и не принимайте существующих пользователей, группы,
+домашние каталоги, sudo fragments, записи состояния и ключи вслепую. Уже созданный
+ключ `operator` сохраняется. Из оставленной recovery-сессии оператор может
+проверить аккаунт и sudo validator:
+
+```bash
+getent passwd operator
+getent group operator
+sudo -n /usr/sbin/visudo -c
+sudo -n namei -l /usr/sbin/visudo
+```
+
+Symlinks по-прежнему запрещены. Не заменяйте системные бинарные файлы ради обхода
+preflight; передайте диагноз на отдельную проверку совместимости.
+
+Роль использует общие bootstrap-задачи аккаунта/controller key, сохраняет другие
+`authorized_keys`, защищает home/SSH files и валидирует sudo candidate через
+`visudo -cf`. Существующие unmanaged аккаунты/primary groups, unsafe homes,
+конфликтующие sudo fragments, orphan records и смена privilege policy блокируют
+мутации. Завершённые аккаунты записываются root-owned в
+`/var/lib/portfolio-human-access/`. Добавление групп/ключей поддерживается;
+удаление, adoption, миграция sudo и удаление старых ключей/групп — отдельная работа.
+Прерванное создание без completion record требует recovery inspection вместо
+автоматического adoption. Повторный успешный запуск сохраняет ключи и приводит
+аккаунт к прежнему состоянию без замены доступа.
+
+`secure-ssh` заново проверяет выбранного **admin** и `ansible`: свежий key-only
+SSH и non-interactive root sudo, затем запрашивает подтверждение recovery с
+default deny. Роль также перепроверяет обе учётные записи непосредственно перед
+работой с policy. Устанавливаются `PermitRootLogin no`, `PasswordAuthentication no`
+и `KbdInteractiveAuthentication no` отдельным блоком после Stage 3 port block,
+перед standard includes. Порты, firewall и activation mode сохраняются. Любой
+`Match` и неподдерживаемый Include tree блокируют операцию. Полный snapshot,
+syntax validation, сравнение effective policy и fingerprints предшествуют atomic
+installation; изменяться могут только три authentication settings. Валидированный
+reload `ssh.service` применяет authentication в service/socket modes без restart
+listeners. При неизменённой конфигурации сервис не перезагружается.
+
+После применения независимые SSH/sudo проверки администратора и automation
+повторяются на каждом выбранном маршруте. Read-only verification проверяет
+effective policy и предлагаемые сервером authentication methods с existing host
+trust, запрещая password/keyboard-interactive. Запрет root подтверждается effective
+global policy без условных исключений; root credential для отрицательного login
+не используется. Runtime probes покрывают выбранные verification routes; server
+listener checks по-прежнему требуют все `ssh_listen_ports`.
+
+При любой ошибке остановитесь: policy могла уже примениться. Не закрывайте
+сохранённую сессию и не повторяйте запуск вслепую.
+`/etc/ssh/portfolio-security.pending` блокирует применение/verification при
+прерванной установке/reload. Через сохранённую sudo-сессию или проверенную provider
+console изучите managed block, source files и pending receipt, выполните `sshd -t`
+и проверьте `sshd -T`, затем явно перезагрузите проверенную конфигурацию и
+подтвердите свежий доступ. Удаляйте receipt только после recovery/convergence.
+Возврат нужного fallback policy — отдельное решение через console, без automatic
+rollback. После hardening добавляйте людей теми же `add-user`/`verify-user` через
+`ansible`: root/password fallback не включается. Stage 3 и maintenance сохраняют
+финальный блок. Application deployment остаётся отдельным этапом.
+
+Порядок ручной проверки: offline `make check` (включая новые synthetic/mocked
+Stage 4 regressions), review кода и локальных inputs, затем отдельное разрешение
+live Stage 3 verification, `add-user`, `verify-user`, `secure-ssh`,
+`verify-ssh-security` именно в таком порядке. Повторите создание и secure operation
+для проверки идемпотентности, затем добавьте/проверьте обычного пользователя после
+hardening. Отказы (denied confirmation, bad key, unmanaged account, sudo conflict,
+Match/include, interrupted activation) проверяйте только в disposable fixtures
+или на тестовом VPS с рабочим recovery.

@@ -1,0 +1,68 @@
+---
+- name: Create the managed primary group
+  ansible.builtin.group:
+    name: "{{ bootstrap_user_name }}"
+    state: present
+  become: true
+
+- name: Create additional managed groups
+  ansible.builtin.group:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ bootstrap_user_groups | default([]) }}"
+  become: true
+
+- name: Create the managed automation user
+  ansible.builtin.user:
+    name: "{{ bootstrap_user_name }}"
+    group: "{{ bootstrap_user_name }}"
+    groups: "{{ bootstrap_user_groups | default([]) }}"
+    append: true
+    home: "{{ bootstrap_user_home }}"
+    shell: "{{ bootstrap_user_shell }}"
+    create_home: true
+    state: present
+  become: true
+
+- name: Protect the managed home directory
+  ansible.builtin.file:
+    path: "{{ bootstrap_user_home }}"
+    state: directory
+    owner: "{{ bootstrap_user_name }}"
+    group: "{{ bootstrap_user_name }}"
+    mode: "0750"
+  become: true
+
+- name: Add the controller public key while preserving other authorized keys
+  ansible.posix.authorized_key:
+    user: "{{ bootstrap_user_name }}"
+    key: "{{ bootstrap_user_public_key }}"
+    state: present
+    exclusive: false
+    manage_dir: true
+  become: true
+  no_log: true
+
+- name: Protect the managed SSH directory and authorized keys
+  ansible.builtin.file:
+    path: "{{ bootstrap_user_home }}/{{ item.path }}"
+    owner: "{{ bootstrap_user_name }}"
+    group: "{{ bootstrap_user_name }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - path: .ssh
+      mode: "0700"
+    - path: .ssh/authorized_keys
+      mode: "0600"
+  become: true
+
+- name: Install a validated sudo policy for the managed user
+  ansible.builtin.copy:
+    dest: "{{ bootstrap_user_sudo_path | default('/etc/sudoers.d/' ~ bootstrap_user_name) }}"
+    content: "{{ bootstrap_user_name }} ALL=(ALL:ALL) NOPASSWD: {{ bootstrap_user_sudo_commands | default(['ALL']) | join(', ') }}\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+  become: true
+  when: bootstrap_user_allow_passwordless_sudo

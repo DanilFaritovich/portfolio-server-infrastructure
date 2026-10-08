@@ -432,7 +432,7 @@ class AccessTests(unittest.TestCase):
                 self.assertNotIn('Create the managed automation user', output)
                 if state == 'regular':
                     self.assertEqual(result.returncode, 0, output)
-                    self.assertIn('ok=5', output)
+                    self.assertIn('ok=6', output)
                 else:
                     self.assertNotEqual(result.returncode, 0, output)
                     self.assertIn('controller public key must be a readable regular', output)

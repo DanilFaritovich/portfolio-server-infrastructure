@@ -1,0 +1,7 @@
+---
+- name: Add one managed human account without changing SSH policy
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - role: human_access

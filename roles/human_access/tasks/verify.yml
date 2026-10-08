@@ -1,0 +1,36 @@
+---
+- name: Require the intended human login
+  ansible.builtin.assert:
+    that:
+      - human_access_user_name is defined
+      - human_access_user_name not in ['root', 'ansible']
+      - ansible_user == human_access_user_name
+      - human_access_user_sudo in ['none', 'admin', 'restricted']
+    quiet: true
+
+- name: Verify the fresh SSH login identity
+  ansible.builtin.command: id -un
+  changed_when: false
+  register: human_access_login
+  failed_when: human_access_login.rc != 0 or human_access_login.stdout != human_access_user_name
+
+- name: Verify administrator non-interactive root access
+  ansible.builtin.command: sudo -n id -u
+  changed_when: false
+  register: human_access_root
+  failed_when: human_access_root.rc != 0 or human_access_root.stdout != '0'
+  when: human_access_user_sudo == 'admin'
+
+- name: Verify each restricted sudo executable without running it
+  ansible.builtin.command:
+    argv: [sudo, -n, -l, "{{ item }}"]
+  changed_when: false
+  loop: "{{ human_access_user_sudo_commands }}"
+  when: human_access_user_sudo == 'restricted'
+
+- name: Require no non-interactive sudo for ordinary users
+  ansible.builtin.command: sudo -n -l
+  changed_when: false
+  register: human_access_no_sudo
+  failed_when: human_access_no_sudo.rc == 0
+  when: human_access_user_sudo == 'none'

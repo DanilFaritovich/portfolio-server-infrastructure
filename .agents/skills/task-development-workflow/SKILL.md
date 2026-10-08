@@ -86,10 +86,13 @@ Inspect only relevant source, tests, interfaces, configuration, analogous implem
 For large repositories, continuations, noisy commands, large diffs, or optional delegated
 execution workers, read [references/context-efficiency.md](./references/context-efficiency.md).
 
-An execution worker is an optional capability, not a project dependency. Use it only when
-it is available and its advertised tool/server instructions fit the bounded task. If it
-is unavailable, continue directly without treating that as an error or changing the
-project to install it.
+An execution worker is an optional capability, not a project dependency. When
+`codex-free-worker-mcp` is available, prefer its `inspect_task` for bounded
+high-output inspection/diagnostics and `fix_task` for unambiguous mechanical
+diagnose/fix/rerun loops when delegation will materially reduce primary-model context.
+Follow [references/context-efficiency.md](./references/context-efficiency.md) for routing
+and safety boundaries. If that MCP is unavailable, continue directly without treating
+that as an error or changing the project to install/configure it.
 
 ## Determine and implement scope
 
