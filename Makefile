@@ -8,7 +8,10 @@ export ANSIBLE_HOME := $(CURDIR)/.ansible
 # Subprocesses must find the same pinned Ansible tools as the invoking interpreter.
 export PATH := $(abspath $(VENV))/bin:$(PATH)
 
-.PHONY: deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
+.PHONY: deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
+
+# Human account inputs are supplied by the caller; USER is intentionally untouched.
+export HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
 
 # Dependency setup uses registries; checks below use installed dependencies offline.
 deps:
@@ -58,6 +61,26 @@ reboot-host:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py reboot-host --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
 
+# LIVE / MUTATING: add a human account using explicitly supplied HUMAN_* inputs.
+add-user:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py add-user --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
+# LIVE verification: verify the human account using explicitly supplied HUMAN_* inputs.
+verify-user:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py verify-user --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
+# LIVE / MUTATING: secure SSH using explicitly supplied HUMAN_* inputs.
+secure-ssh:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py secure-ssh --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
+# LIVE verification: verify SSH security using explicitly supplied HUMAN_* inputs.
+verify-ssh-security:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py verify-ssh-security --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
 # Strictly offline, including wrapper tests with temporary fixtures and mocked processes.
 check: lint-yaml lint-ansible syntax-check lint-workflows test-access
 
@@ -77,6 +100,10 @@ syntax-check:
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/harden.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/verify-hardening.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/reboot-host.yml
+	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/add-user.yml
+	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/verify-user.yml
+	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/secure-ssh.yml
+	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/verify-ssh-security.yml
 
 lint-workflows:
 	@$(ACTIONLINT) -shellcheck="" .github/workflows/ci.yml

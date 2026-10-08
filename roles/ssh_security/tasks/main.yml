@@ -1,0 +1,57 @@
+---
+- name: Require verified administrator and explicit recovery confirmation
+  ansible.builtin.assert:
+    that:
+      - ansible_user == 'ansible'
+      - ansible_connection == 'ssh'
+      - human_access_user_name is defined
+      - human_access_user_name not in ['ansible', 'root']
+      - human_access_user_sudo == 'admin'
+      - ssh_security_confirmed | default(false) | bool
+    fail_msg: Use make secure-ssh after independent administrator SSH/sudo verification and recovery confirmation.
+    quiet: true
+
+- name: Verify non-interactive automation root access immediately before policy work
+  ansible.builtin.command: sudo -n id -u
+  changed_when: false
+  register: security_automation_root
+  failed_when: security_automation_root.rc != 0 or security_automation_root.stdout != '0'
+
+- name: Re-prove human administrator access with a separate connection before policy work
+  ansible.builtin.include_role:
+    name: human_access
+    tasks_from: verify
+    apply:
+      become: false
+  # These are Ansible SSH plugin options scoped to this human-admin verification include;
+  # renaming them would leave the automation connection settings in effect.
+  vars:
+    ansible_user: "{{ human_access_user_name }}"
+    ansible_private_key_file: "{{ human_access_user_private_key_path }}"  # noqa: var-naming[no-role-prefix]
+    ansible_ssh_args: "{{ human_access_user_ssh_args }}"  # noqa: var-naming[no-role-prefix]
+
+- name: Require completed Stage 3 before final SSH policy changes
+  portfolio_hardening_info:
+    current_port: "{{ ansible_port | int }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+    tcp_ports: "{{ firewall_allowed_tcp_ports }}"
+    verify: true
+  register: security_before
+  become: true
+
+- name: Validate complete final SSH candidate before mutation
+  portfolio_ssh_security:
+    sources: "{{ security_before.ssh_sources }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+  become: true
+
+- name: Install the validated final SSH authentication policy
+  portfolio_ssh_security:
+    operation: apply
+    sources: "{{ security_before.ssh_sources }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+  become: true
+  notify: Reload final SSH authentication policy
+
+- name: Activate validated authentication policy before controller verification
+  ansible.builtin.meta: flush_handlers

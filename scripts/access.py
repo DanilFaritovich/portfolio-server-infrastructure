@@ -11,6 +11,7 @@ import re
 import shutil
 import shlex
 import stat
+import socket
 import subprocess
 import sys
 import tempfile
@@ -124,7 +125,7 @@ def check_key(path):
     require(path.stat().st_mode & 0o077 == 0, 'Private key permissions must be 0600 or stricter.')
 
 
-def prepare_key(path):
+def prepare_key(path, label='automation'):
     """Only inspect private-key metadata; ssh-keygen creates new material locally."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.parent.stat()
@@ -135,12 +136,13 @@ def prepare_key(path):
     with os.fdopen(descriptor, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         public = Path(str(path) + '.pub')
+        require(not path.is_symlink() and not public.is_symlink(), 'Key files must not be symlinks.')
         if not path.exists() and not public.exists():
             subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C',
-                            'portfolio-server-infrastructure automation', '-f', str(path)], check=True)
-            print('Dedicated automation key created locally (without passphrase).')
+                            'portfolio-server-infrastructure ' + label, '-f', str(path)], check=True)
+            print(f'Dedicated {label} key created locally (without passphrase).')
         else:
-            print('Existing automation key preserved.')
+            print(f'Existing {label} key preserved.')
         check_key(path)
 
 
@@ -393,9 +395,181 @@ def live(mode, inventory, key):
     print('Requested stage completed. STOP.')
 
 
+
+def human_inputs(environment=None):
+    env = os.environ if environment is None else environment
+    name = env.get('HUMAN_USER', '')
+    require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', name or '') and name not in ('root', 'ansible'),
+            'Set HUMAN_USER to a separate non-root Ubuntu username.')
+    policy = env.get('HUMAN_SUDO') or 'none'
+    require(policy in ('none', 'admin', 'restricted'), 'HUMAN_SUDO must be none, admin or restricted.')
+    groups = [value.strip() for value in env.get('HUMAN_GROUPS', '').split(',') if value.strip()]
+    require(len(groups) == len(set(groups)) and all(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', g) for g in groups),
+            'HUMAN_GROUPS must be unique comma-separated Ubuntu group names.')
+    require(not set(groups) & {'root', 'ansible', 'docker', 'lxd', 'disk', 'shadow'},
+            'Root-equivalent/system groups are not supported for human accounts.')
+    require(policy == 'admin' or not set(groups) & {'sudo', 'admin'},
+            'sudo/admin group membership requires HUMAN_SUDO=admin.')
+    commands = [value.strip() for value in env.get('HUMAN_SUDO_COMMANDS', '').split(',') if value.strip()]
+    require(policy == 'restricted' or not commands, 'HUMAN_SUDO_COMMANDS is only for restricted sudo.')
+    require(policy != 'restricted' or (commands and len(commands) == len(set(commands)) and
+            all(re.fullmatch(r'/[a-zA-Z0-9_./-]+', c) and '..' not in Path(c).parts for c in commands)),
+            'Restricted sudo requires comma-separated absolute executable paths without arguments or wildcards.')
+    return {'human_access_user_name': name, 'human_access_user_groups': groups,
+            'human_access_user_sudo': policy,
+            'human_access_user_sudo_commands': ['ALL'] if policy == 'admin' else commands}
+
+
+def human_key_path(value, name):
+    path = Path(value or Path.home() / '.ssh/portfolio-infra' / (name + '_ed25519')).expanduser().absolute()
+    require(not any(p.is_symlink() for p in [path, *path.parents]), 'Human key paths must not use symlinks.')
+    require(not path.resolve().is_relative_to(ROOT) or
+            path.resolve().is_relative_to(ROOT / 'secrets/portfolio-infra'),
+            'Repository human keys are allowed only under secrets/portfolio-infra/.')
+    return path
+
+
+def public_key_file(value):
+    path = Path(value).expanduser().absolute()
+    require(path.suffix == '.pub' and not any(p.is_symlink() for p in [path, *path.parents]),
+            'Import a regular .pub file without symlinks.')
+    info = path.stat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_size <= 16384,
+            'Public key must be a small regular file owned by you.')
+    require(info.st_mode & 0o022 == 0, 'Public key must not be writable by group or others.')
+    content = path.read_text().strip()
+    require(len(content.splitlines()) == 1 and re.fullmatch(
+        r'(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,3}( [^\r\n]*)?', content),
+        'Import exactly one plain OpenSSH public key without authorized_keys options.')
+    result = subprocess.run(['ssh-keygen', '-l', '-f', str(path)], capture_output=True, check=False)
+    require(result.returncode == 0, 'Public key is invalid.')
+    return path
+
+
+def verify_human(inventory, alias, host, port, managed, inputs, human, key):
+    check_key(key)
+    public_key_file(str(key) + '.pub')
+    identity = host if port == 22 else f'[{host}]:{port}'
+    for target in inputs['ssh_verify_ports']:
+        connection = managed | {'ansible_user': human['human_access_user_name'],
+                                'ansible_private_key_file': str(key), 'ansible_port': target,
+                                # Human encrypted keys may use their existing agent; only this identity is eligible.
+                                'ansible_ssh_args': managed['ansible_ssh_args'].replace(' -o IdentityAgent=none', '')
+                                + f' -o HostKeyAlias={identity}'}
+        run_playbook(inventory, alias, connection | human, 'verify-user.yml')
+
+
+
+def verify_auth_methods(host, port, user, trust_name):
+    """Probe offered authentication without sending a password or private key."""
+    import paramiko
+
+    trusted = paramiko.HostKeys()
+    trusted.load(str(Path.home() / '.ssh/known_hosts'))
+    transport = None
+    try:
+        with socket.create_connection((host, port), timeout=15) as connection:
+            transport = paramiko.Transport(connection)
+            entries = trusted.lookup(trust_name)
+            require(entries, 'SSH runtime probe requires existing verified host trust.')
+            options = transport.get_security_options()
+            options.key_types = tuple(kind for kind in options.key_types if kind in entries or
+                                      (kind.startswith('rsa-sha2-') and 'ssh-rsa' in entries))
+            require(options.key_types, 'No supported trusted SSH host-key algorithm for runtime probe.')
+            transport.start_client(timeout=15)
+            transport.auth_timeout = 15
+            remote_key = transport.get_remote_server_key()
+            require(entries and remote_key.get_name() in entries and entries[remote_key.get_name()] == remote_key,
+                    'SSH security probe host key does not match existing trust.')
+            try:
+                transport.auth_none(user)
+            except paramiko.BadAuthenticationType as error:
+                methods = set(error.allowed_types)
+            else:
+                raise ValueError('Unexpected authentication response; cannot prove final SSH runtime policy.')
+            require('publickey' in methods and not methods & {'password', 'keyboard-interactive'},
+                    'Running SSH daemon still offers password or keyboard-interactive authentication.')
+    except (paramiko.SSHException, socket.timeout):
+        raise ValueError('SSH runtime authentication probe failed; stop and retain recovery access.') from None
+    finally:
+        if transport is not None:
+            transport.close()
+
+
+def human_access(mode, inventory, automation_key):
+    human = human_inputs()
+    name = human['human_access_user_name']
+    key = human_key_path(os.environ.get('HUMAN_KEY'), name)
+    require(key.resolve() != automation_key.resolve(), 'Use separate human and automation SSH keys.')
+    imported = os.environ.get('HUMAN_PUBLIC_KEY', '')
+    public = public_key_file(imported) if imported else Path(str(key) + '.pub')
+    prerequisites(mode)
+    check_key(automation_key)
+    alias, host, port, _, _ = load_host(inventory)
+    inputs = hardening_inputs(inventory, alias, port)
+    known_host(host, port)
+    managed = {
+        'ansible_connection': 'ssh', 'ansible_user': 'ansible', 'ansible_host_key_checking': True,
+        'ansible_private_key_file': str(automation_key), 'ansible_become_flags': '-n',
+        'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
+        'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
+                            ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
+                            ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
+    }
+    if imported and (mode != 'add-user' or key.exists() or Path(str(key) + '.pub').exists()):
+        check_key(key)
+        pair_public = public_key_file(str(key) + '.pub')
+        require(public.read_text().split()[:2] == pair_public.read_text().split()[:2],
+                'HUMAN_KEY must correspond to HUMAN_PUBLIC_KEY for independent verification.')
+    # No cached receipt: re-prove automation access and completed Stage 3 on every selected route.
+    verify_hardening(inventory, alias, host, port, managed, inputs)
+    if mode == 'add-user':
+        if not imported:
+            if key.is_relative_to(ROOT):
+                for directory in (ROOT / 'secrets', ROOT / 'secrets/portfolio-infra'):
+                    directory.mkdir(mode=0o700, exist_ok=True)
+                    require(directory.stat().st_uid == os.getuid() and directory.stat().st_mode & 0o077 == 0,
+                            'Local secrets directories must be owned by you with permissions 0700.')
+            prepare_key(key, label='human ' + name)
+            public = public_key_file(str(key) + '.pub')
+        run_playbook(inventory, alias, managed | human | {'human_access_user_public_key_path': str(public)}, 'add-user.yml')
+        if imported and not key.exists():
+            print('Public key installed. Access is UNVERIFIED: its owner must run make verify-user with the matching key.')
+            return
+    if mode == 'secure-ssh':
+        require(human['human_access_user_sudo'] == 'admin', 'Final hardening requires HUMAN_SUDO=admin.')
+        require(sys.stdin.isatty(), 'Final SSH hardening requires interactive recovery confirmation.')
+    verify_human(inventory, alias, host, port, managed, inputs, human, key)
+    if mode == 'secure-ssh':
+        print('LIVE / MUTATING: disable root, password and keyboard-interactive SSH login. '
+              'Keep an administrator session open and provider console available.', flush=True)
+        try:
+            answer = input('Provider console recovery tested and available; secure SSH now? [y/N] ')
+        except (EOFError, KeyboardInterrupt):
+            answer = ''
+        require(answer.strip().lower() in ('y', 'yes'), 'Final hardening declined; no SSH policy was changed.')
+        try:
+            confirmation = {'ssh_security_confirmed': True, 'human_access_user_private_key_path': str(key),
+                            'human_access_user_ssh_args': managed['ansible_ssh_args'].replace(' -o IdentityAgent=none', '')}
+            run_playbook(inventory, alias, managed | inputs | human | confirmation, 'secure-ssh.yml')
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            raise ValueError('SSH policy application failed; it may already be installed. Stop and use the retained '
+                             'administrator session/provider console; do not retry blindly.') from None
+    if mode in ('secure-ssh', 'verify-ssh-security'):
+        require(human['human_access_user_sudo'] == 'admin', 'SSH security verification requires HUMAN_SUDO=admin.')
+        verify_hardening(inventory, alias, host, port, managed, inputs)
+        verify_human(inventory, alias, host, port, managed, inputs, human, key)
+        run_playbook(inventory, alias, managed | inputs, 'verify-ssh-security.yml')
+        identity = host if port == 22 else f'[{host}]:{port}'
+        for target in inputs['ssh_verify_ports']:
+            for login in ('ansible', name):
+                verify_auth_methods(host, target, login, identity)
+    print('Requested human access stage completed. STOP.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host'])
+    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=str(DEFAULT_KEY))
     args = parser.parse_args()
@@ -404,6 +578,8 @@ def main():
     try:
         if args.mode == 'setup':
             setup_inventory(inventory)
+        elif args.mode in ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'):
+            human_access(args.mode, inventory, key_path(args.key))
         else:
             live(args.mode, inventory, key_path(args.key))
     except ValueError as error:

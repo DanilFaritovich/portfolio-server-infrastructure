@@ -1,0 +1,41 @@
+---
+- name: Require an absolute controller public-key path
+  ansible.builtin.assert:
+    that:
+      - bootstrap_user_public_key_path is string
+      - bootstrap_user_public_key_path is match('^/.+\.pub$')
+    quiet: true
+
+- name: Check the public key file on the controller without reading it
+  ansible.builtin.stat:
+    path: "{{ bootstrap_user_public_key_path }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: bootstrap_user_key_file
+
+- name: Require a readable regular public key file without symlinks
+  ansible.builtin.assert:
+    that:
+      - bootstrap_user_key_file.stat.exists
+      - bootstrap_user_key_file.stat.isreg | default(false)
+      - bootstrap_user_key_file.stat.readable | default(false)
+    fail_msg: The controller public key must be a readable regular .pub file.
+    quiet: true
+
+- name: Read the public key on the controller
+  ansible.builtin.set_fact:
+    bootstrap_user_public_key: >-
+      {{ lookup('ansible.builtin.file', bootstrap_user_public_key_path) | trim }}
+  no_log: true
+
+- name: Require a single OpenSSH public key
+  ansible.builtin.assert:
+    that:
+      - >-
+        bootstrap_user_public_key is match(
+        '^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,3}( [^\r\n]*)?$')
+      - bootstrap_user_public_key.splitlines() | length == 1
+    fail_msg: The selected .pub file must contain one OpenSSH public key.
+    quiet: true
+  no_log: true

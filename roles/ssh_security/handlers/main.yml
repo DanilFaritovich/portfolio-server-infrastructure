@@ -1,0 +1,54 @@
+---
+- name: Validate final installed SSH syntax before authentication reload
+  ansible.builtin.command:
+    argv: [/usr/sbin/sshd, -t]
+  changed_when: false
+  become: true
+  listen: Reload final SSH authentication policy
+
+- name: Inspect final sources immediately before reload
+  portfolio_hardening_info:
+    current_port: "{{ ansible_port | int }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+    tcp_ports: "{{ firewall_allowed_tcp_ports }}"
+    verify: true
+  register: security_reload_sources
+  become: true
+  listen: Reload final SSH authentication policy
+
+- name: Require the exact installed policy and protected receipt before reload
+  portfolio_ssh_security:
+    operation: installed
+    sources: "{{ security_reload_sources.ssh_sources }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+  become: true
+  listen: Reload final SSH authentication policy
+
+# Authentication changes do not alter ports or socket descriptors. Both supported
+# activation modes reload the already active consumer without restarting listeners.
+- name: Reload final SSH authentication policy
+  ansible.builtin.systemd_service:
+    name: ssh.service
+    state: reloaded
+  become: true
+  listen: Reload final SSH authentication policy
+
+# Complete the receipt only within the changed-policy notification, after reload
+# and runtime inspection succeed. Any earlier failure retains recovery evidence.
+- name: Read the installed SSH fingerprints after activation
+  portfolio_hardening_info:
+    current_port: "{{ ansible_port | int }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+    tcp_ports: "{{ firewall_allowed_tcp_ports }}"
+    verify: true
+  register: security_after
+  become: true
+  listen: Reload final SSH authentication policy
+
+- name: Complete the protected reload receipt
+  portfolio_ssh_security:
+    operation: complete
+    sources: "{{ security_after.ssh_sources }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+  become: true
+  listen: Reload final SSH authentication policy
