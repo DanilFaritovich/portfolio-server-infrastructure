@@ -203,7 +203,7 @@ class DockerTests(unittest.TestCase):
         self.assertNotIn('\nverify:', makefile)
         for filename in ('README.md', 'README.ru.md', 'AGENTS.md', 'Makefile', 'scripts/access.py'):
             self.assertNotRegex((ROOT / filename).read_text(), r'make (bootstrap|verify)(?=\s|`|$)')
-        for target in ('bootstrap-user', 'verify-access', 'docker-host', 'verify-docker'):
+        for target in ('bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'reboot-host'):
             result = subprocess.run(['make', '-n', target], cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f'scripts/access.py {target} ', result.stdout)
@@ -212,7 +212,7 @@ class DockerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn('scripts/access.py', result.stdout)
             self.assertNotIn('inventories/production.yml', result.stdout)
-            for playbook in ('bootstrap.yml', 'verify.yml', 'docker-host.yml', 'verify-docker.yml'):
+            for playbook in ('bootstrap.yml', 'verify.yml', 'docker-host.yml', 'verify-docker.yml', 'reboot-host.yml'):
                 self.assertIn(f'--syntax-check -i inventories/production.example.yml playbooks/{playbook}', result.stdout)
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertNotIn('scripts/access.py', workflow)

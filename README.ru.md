@@ -6,12 +6,13 @@ Provisioning VPS на Ubuntu через Ansible. Pipeline:
 
 ```text
 local setup -> bootstrap managed ansible user -> verify access
--> provision Docker host -> verify Docker -> STOP
+-> provision Docker host -> verify Docker
+-> firewall + validated SSH host ports -> verify hardening -> STOP
 ```
 
 Docker Engine, Compose и Buildx готовят хост к будущим workloads. Caddy,
 application networks/Compose files, Vue, domains/TLS, GHCR authentication,
-deployment/CD, firewall, SSH/root/password-login hardening, fail2ban и
+deployment/CD, human/admin access и окончательная root/password-login policy, fail2ban и
 automatic upgrades остаются отдельными следующими этапами.
 
 ## Quick Start
@@ -36,6 +37,10 @@ make bootstrap-user
 make verify-access
 make docker-host
 make verify-docker
+# Проверьте hardening settings, recovery console и сетевые правила провайдера ниже.
+make inspect-hardening
+make harden
+make verify-hardening
 ```
 
 `make setup` проверяет минимальные system tools, устанавливает pinned uv
@@ -154,6 +159,10 @@ password prompts и agent. Paramiko используется только для
 | `make verify-access` | Проверить существующий key-only доступ ansible | **LIVE / verification**, без изменений managed configuration |
 | `make docker-host` | Установить Docker, logging policy и настроить services | **LIVE / MUTATING**, managed key-only access |
 | `make verify-docker` | Проверить Docker/services и disposable container | **LIVE / verification**, временные container/image-cache changes |
+| `make inspect-hardening` | Собрать все Stage 3 safety findings перед harden | **LIVE / read-only**, exit 0 для PASS/WARN, non-zero для FAIL |
+| `make harden` | Настроить UFW и validated SSH listening ports | **LIVE / MUTATING**, managed key-only access |
+| `make verify-hardening` | Проверить все SSH-порты, UFW и active Docker/containerd | **LIVE / verification**, без изменения managed state |
+| `make reboot-host` | Проверить доступ, подтвердить reboot, дождаться восстановления и проверить access/Docker/hardening | **LIVE / MUTATING**, интерактивное подтверждение, возможны изменения image cache |
 | `make check` | YAML/Ansible lint, syntax, actionlint, wrapper tests | **OFFLINE** |
 | `make ci` | Те же offline checks, что у `make check` | **OFFLINE** |
 
@@ -174,8 +183,8 @@ Docker regression tests проверяют managed key-only orchestration, isola
 connection overlay, остановку при preflight failure, отклонение example inventory,
 Make/CI offline boundaries, unchanged probes и smoke cleanup. Выбранные safety
 assertions и convergence daemon policy выполняются реальным Ansible на временных
-local fixtures с заблокированной сетью. Syntax-check покрывает все четыре
-playbooks; lint проверяет обе роли.
+local fixtures с заблокированной сетью. Syntax-check покрывает все семь
+playbooks; lint проверяет все три роли.
 
 Checks всегда используют `inventories/production.example.yml`, никогда —
 production inventory, ключи, пароли или соединения с VPS. Wrapper tests используют
@@ -274,6 +283,284 @@ make verify-docker
 изменилось. Live access, installation, runtime behavior и полная host idempotency
 проверяются вручную; агент эти команды против VPS не запускал.
 
+## Host hardening (Stage 3)
+
+Stage 3 начинается с проверенного Docker-ready host. Human/admin users и personal
+keys не создаются; `PermitRootLogin`, `PasswordAuthentication` и
+`KbdInteractiveAuthentication` сохраняются. Окончательная access policy — Stage 4.
+Перед `make harden` сохраните рабочую human/recovery SSH-сессию и убедитесь в
+доступности provider console. Внешние security groups должны разрешать каждый
+нужный SSH-порт; Ansible не управляет сетевыми правилами провайдера.
+
+Добавьте настройки под существующим host в локальном inventory. Setup сохраняет
+имеющийся inventory, поэтому новые поля при необходимости добавьте вручную:
+
+```yaml
+ansible_port: 22
+ssh_listen_ports: [22, 2222]
+# Необязательно: внешние проверки доступа (по умолчанию все ssh_listen_ports).
+ssh_verify_ports: [22, 2222]
+firewall_allowed_tcp_ports: [80, 443]
+```
+
+`ssh_verify_ports` — непустой список уникальных integer ports из
+`ssh_listen_ports` и обязательно включает текущий `ansible_port`. Если сеть компьютера блокирует порт 22, сохраните
+`ssh_listen_ports: [22, 2222]`, используйте доступный `ansible_port: 2222` и задайте
+`ssh_verify_ports: [2222]`. Оба server listeners и IPv4/IPv6 UFW rules остаются
+обязательными; выбранные ports ограничивают только внешние SSH/sudo probes.
+Внешняя доступность порта 22 при этом не подтверждается. Без этой настройки
+проверяются подключения на всех listening ports.
+
+Фиксированного SSH-порта в роли нет: без `ssh_listen_ports` используется текущий
+`ansible_port`. Web ports по умолчанию — 80 и 443; Caddy не устанавливается.
+Списки поддерживают несколько уникальных целых чисел 1–65535; additional TCP
+list может быть пустым. Первый переход обязан сохранить текущий проверенный
+`ansible_port`: переход 22 → 2222 начинается с `[22, 2222]`. Если доступ уже работает
+на 2222, допустимо `[2222]`. Не удаляйте последний human/recovery route до Stage 4.
+Последующая смена inventory port требует отдельно проверенного доверия
+`known_hosts` для этого порта: Stage 3 не сохраняет новое доверие и не редактирует
+inventory. Исключение существующих UFW rules из desired lists вызывает safety
+stop и требует осознанной ручной миграции.
+
+`playbooks/harden.yml` вызывает `roles/host_hardening`. До изменений проверяются:
+неоднозначные activation modes, custom SSH/UFW service/socket units и нестандартные
+systemd drop-ins, unsupported legacy `Port`/unmanaged `ListenAddress`, нестандартные SSH Include
+hierarchies, занятые SSH-порты, неактивные Docker/containerd и неоднозначный UFW
+state останавливают роль. Поддерживается обычный `/etc/ssh/sshd_config` со
+стандартным include `/etc/ssh/sshd_config.d/*.conf` и управляемыми ролью listening
+directives. Поддерживаются штатный Ubuntu active/enabled `ssh.socket` и обычный
+listener mode `ssh.service`; переключения activation mode нет. Для Ubuntu 24.04
+socket support рассчитан на штатный layout systemd SSH generator; service mode тоже
+обязан пройти preflight. Это поддержка проверяемых конфигураций, а не любых Ubuntu
+images, старых migration overrides или custom systemd layouts. Проверки выполняются
+offline с synthetic fixtures и local Ansible; успешный acceptance run на Ubuntu 24.04
+VM/VPS не заявляется. Штатный socket
+dependency drop-in принимается только с точными директивами `After=ssh.socket`
+и `Requires=ssh.socket`; socket address drop-ins должны быть созданы runtime
+generator Ubuntu. Custom overrides отклоняются. Все текущие live SSH listening
+ports должны оставаться в `ssh_listen_ports`.
+
+Допускается adoption проверенного набора обычных global legacy-директив `Port <integer>`
+из основного файла и обычных файлов стандартного include directory. Поддерживаются
+несколько разных desired ports и повторные директивы с одинаковым портом. Каждое
+значение должно входить в desired list; текущий inventory port должен входить туда
+и быть live; effective и live SSH ports не должны содержать ports вне desired set.
+`ListenAddress`, Port внутри Match или с unsupported syntax, legacy Port рядом с
+managed block, нестандартные/вложенные/условные или повторные Includes, symlinked
+configuration files и custom systemd/socket ownership по-прежнему останавливают
+роль до mutation. Диагностика указывает тип директивы без вывода SSH config.
+
+Read-only preflight сохраняет точные source path, line number, port и fingerprints
+файлов. После создания UFW rules для всех desired SSH ports `portfolio_ssh_adopt`
+собирает полный main/include candidate с managed block из unique sorted desired ports,
+удаляет только подтверждённые exact records, сохраняя inline comments и все unrelated
+bytes/settings. Повторные records с одинаковыми source/line отклоняются. До записи выполняются
+`sshd -t` и проверка effective ports/public-key authentication через `sshd -T`;
+Effective candidate ports должны точно совпадать с desired set, public-key authentication
+должна быть включена; invalid candidate оставляет оригинальные SSH-файлы целыми.
+Source fingerprints повторно проверяются непосредственно перед записью; изменения
+source после preflight останавливают adoption. Snippet и main заменяются атомарно по отдельности,
+с откатом при обнаруженной ошибке записи; единой filesystem transaction нет, поэтому
+прерванная запись требует проверки через recovery access.
+До замены adoption сохраняет `/etc/ssh/portfolio-adoption.pending` с mode 0600.
+Uncatchable termination, failed rollback или ошибка удаления marker оставляют этот
+сигнал; preflight и прямой adoption блокируют retry. Live listeners могут использовать
+старую конфигурацию, пока main/includes на диске заменены частично. Через recovery
+access восстановите или завершите согласованный tree, сохраните текущий route и
+human authentication policy, проверьте `sshd -t` и effective desired ports, и только
+после этого удаляйте marker. Нельзя вслепую выполнять reload SSH или удалять marker. Существующие service/socket
+handlers валидируют и активируют установленную конфигурацию, затем wrapper проверяет
+независимые подключения на каждом порту из `ssh_verify_ports`. После convergence legacy-директивы
+нет, следующий запуск даёт `changed=0`.
+
+Preflight проверяет штатную структуру generator/drop-ins без требования совпадения
+generated file на диске с уже загруженными listeners или `sshd -T`: эти состояния
+могут относиться к разным reload cycles. После `daemon-reload` generated
+`ListenStream` должен точно совпасть с desired TCP routes и effective ports
+`sshd -T`. Loaded systemd `Listen` и live listeners могут сохранять старый
+безопасный subset до restart. После restart все три множества routes должны
+точно совпасть с desired: address family, wildcard bind и port. Inspector
+объединяет все строки `Listen=` из `systemctl show`. Принимается штатная пара
+Ubuntu `0.0.0.0:<port>` / `[::]:<port>`. Доступность IPv4 через IPv6 wildcard
+определяется `BindIPv6Only`, а при `default` — `/proc/sys/net/ipv6/bindv6only`;
+реальное несовпадение address families отклоняется. См.
+[systemd socket binding semantics](https://www.freedesktop.org/software/systemd/man/systemd.socket.html#BindIPv6Only=).
+Preflight допускает listener только на текущем inventory SSH port, даже если
+desired list содержит будущие ports. Текущий порт должен оставаться live и
+входить в desired list.
+
+Отсутствующий UFW устанавливается с `state: present`. При первом adoption
+существующий UFW должен быть inactive, без unknown или unmanaged raw user rules,
+с regular non-symlink base files, parseable IPv4/IPv6/default-policy и boot
+configuration и stock systemd ownership. Безопасные изменения provider/image
+сохраняются; отличие package hashes даёт один provenance WARN и не блокирует adoption.
+Текущие normalized fingerprints сохраняются в `/etc/ufw/portfolio-hardening.json`;
+повторный запуск отклоняет посторонние изменения base/raw rules и unknown rules.
+Reset, удаление правил и произвольная замена unmanaged configuration не выполняются.
+Managed `ENABLED`, input/output policies и fingerprints изменённых ролью rules
+сходятся без ложного external drift. Effective ports из `sshd -T` сравниваются
+как множество, включая одинаковые повторяющиеся entries; desired inventory port
+lists по-прежнему должны содержать unique ports.
+Перед UFW mutation роль сохраняет exact raw fingerprints, разрешённые порты,
+normalized recovery fingerprints и правила, уже присутствующие в каждой address
+family. После прерывания процесса `harden` продолжает только точные разрешённые
+TCP allow additions с комментарием роли и её input/output/boot policy changes.
+Распознаётся штатный UFW 0.36 empty-template rewrite при `LOGLEVEL=low/off` и стандартном
+forward policy, включая IPv6 rate-limit capability variants. Остальные bytes,
+неизвестные tuples/raw rules, дубликаты, удаление правил и protected base drift
+блокируют продолжение. Отсутствующие raw files и неподдерживаемые initial template/logging
+layouts дают fail-closed; предполагаемых rewrites и reset нет. Старый ownership marker
+обновляется лишь при совпадении исходных fingerprints и не разрешает уже устаревший
+ruleset. Standalone verification отклоняет stale raw fingerprints, пока `harden` не
+сохранит завершённое состояние. После ошибки сначала изучите read-only report и
+recovery access; не удаляйте ownership markers для обхода проверки.
+SSH/UFW configuration, systemd units/drop-ins и их parent directories должны принадлежать
+root с root group без group/other write permission. Symlink/type guards сохранены;
+штатный Ubuntu alias `/lib` → `/usr/lib` принимается строго для package units.
+UFW ownership marker дополнительно запрещает group/other access (0600 или строже).
+Небезопасные ownership/modes останавливают inspection до configuration mutation.
+Read-only модуль `library/portfolio_hardening_info.py` выполняет inspection.
+UFW CLI используется без новой collection; операции с rules идемпотентны и
+отмечают фактические additions/updates.
+
+Все SSH allow rules создаются до incoming deny, outgoing allow и UFW enable.
+IPv4 и IPv6 должны быть включены и проверены. В начало SSH config добавляется
+managed port/public-key block; остальное содержимое сохраняется. Полный candidate
+проходит `sshd -t -f` до atomic replacement. Изменённый block или несошедшееся
+socket state вызывает handler, который повторяет `sshd -t`. В service mode выполняется узкий reload
+`ssh.service`. В socket mode выполняется `daemon-reload`, затем generated
+candidate routes и `sshd -T` сравниваются с desired list, пока loaded/live
+listeners продолжают работать как безопасный subset. Candidate validation требует
+наличия generated file со штатной поддерживаемой структурой. Candidate inspection также
+требует runtime UFW allow для всех desired SSH ports в IPv4/IPv6 до restart.
+После успешной проверки `ssh.socket` и
+`ssh.service` перезапускаются одной упорядоченной транзакцией. Затем role строго
+проверяет generated, loaded и live routes, effective SSH ports, Docker/containerd
+и active UFW с точными desired IPv4/IPv6 TCP rules. Wrapper проверяет свежий
+key-only SSH и `sudo -n` на каждом порту из `ssh_verify_ports`. Runtime mismatch завершает
+запуск ошибкой. Preflight проверяет
+фактические зависимости socket/service и `KillMode=process` для сохранения
+установленных сессий. Несовпадение generated ports останавливает выполнение до
+restart listeners; перед повторной попыткой согласуйте конфигурацию через recovery
+access. При socket drift handlers запускаются и с неизменённым установленным SSH
+block, чтобы завершить прерванный transition за один `make harden`. Безопасный
+pre-transition drift generated/loaded/live даёт WARN в `make inspect-hardening`,
+который остаётся READY; после convergence эти проверки дают PASS. Повторный запуск после convergence
+не выполняет reload/restart SSH. См.
+[Ubuntu socket activation](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189),
+[UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
+и [OpenSSH configuration](https://man.openbsd.org/sshd_config).
+
+Оба public targets сначала проверяют независимый `ansible` key-only access и
+`sudo -n`. После provisioning wrapper открывает новое соединение на **каждом**
+порту из `ssh_verify_ports` и повторяет access/sudo и hardening checks. Уже доверенная
+host identity закрепляется через
+[OpenSSH HostKeyAlias](https://man.openbsd.org/ssh_config#HostKeyAlias), с strict
+checking и отключённым connection sharing. Ошибка соединения немедленно
+останавливает stage; используйте recovery access без слепого повторения изменений.
+`make verify-hardening` выполняет те же независимые подключения и read-only
+inspection: SSH config/effective ports/exact daemon listeners, UFW active/enabled,
+incoming deny/outgoing allow, все configured TCP allow rules для IPv4/IPv6,
+неизменённые ownership fingerprints и active Docker/containerd. Проверка ничего
+не устанавливает, не вызывает handlers и не создаёт smoke container. Временные
+Ansible module files очищаются как при access verification.
+Это post-convergence verification: на сервере обязательны все routes из
+`ssh_listen_ports`; внешний доступ обязателен на каждом порту из `ssh_verify_ports`.
+До первого успешного `make harden` timeout на будущем порту возможен; сам по
+себе он не означает lockout текущего inventory route. Wrapper сообщает failed
+configured port и направляет к `make verify-access` и recovery access.
+При ошибке остановитесь; выполняйте следующую manual-команду только после
+успешного завершения предыдущей.
+
+Docker forwarding rules сохраняются. UFW host-input policy сама по себе не
+ограничивает будущие Docker-published container ports; application network
+security относится к отдельному deployment stage. Stage 3 не меняет управление
+Docker iptables, не создаёт application networks и не публикует контейнеры.
+До application deployment отдельно проверяются provider-side rules и политика
+Docker-published ports; открытия host-input ports здесь недостаточно. См.
+[Docker and UFW](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw).
+
+Offline-регрессии используют synthetic inventories, opaque keys, mocked commands
+и real local Ansible с заблокированной сетью. Проверяются preflight failures,
+isolation managed/controller connections, verification каждого порта, validation
+перед заменой SSH config, сохранение fallback policy, SSH/UFW convergence,
+порядок firewall enable и verification без записи managed state. Эти проверки
+не доказывают работоспособность production host.
+
+`make inspect-hardening` — read-only preflight всего Stage 3. Он проверяет managed
+key-only access и `sudo -n` по текущему inventory route, затем собирает независимые
+SSH, systemd, Docker/containerd и UFW safety findings одним компактным отчётом.
+Проверяются desired/effective/live ports, supported SSH files и legacy Port adoption,
+activation mode, disk/generated/loaded socket state, unit overrides, UFW package
+baseline, ownership, raw rules и unsafe file types. Содержимое конфигов, credentials,
+command stderr и ownership fingerprints не выводятся.
+
+`PASS` означает подходящее состояние. `WARN` означает, что harden умеет безопасно
+adopt/converge его: например, supported legacy Ports, отсутствующий или inactive
+pristine UFW, stale stock socket state. `FAIL` блокирует harden. Exit code равен 0
+при отсутствии FAIL, включая WARN-only отчёты, и non-zero при blocking findings.
+Перед harden исправьте все FAIL; повторные запуски harden не заменяют диагностику.
+Проверки, которым нужны недоступные или небезопасные данные, отмечаются как
+unavailable; остальные безопасные проверки продолжаются. Без managed access/sudo
+remote inspection продолжить нельзя. Будущие SSH-порты проверяются без требования
+их сетевой доступности до convergence.
+
+Inspection передаёт общую с harden и verify-hardening implementation
+`portfolio_hardening_info.py` через SSH stdin с `sudo -n` и Python `-B`, без remote
+payload/temp files. Он не устанавливает пакеты, не пишет файлы, не меняет firewall
+или systemd, не делает daemon-reload и SSH reload/restart, не запускает handlers.
+Существующее strict host trust сохраняется. READY — snapshot текущего состояния;
+harden повторяет safety checks перед mutation, а verification требует runtime
+convergence.
+
+Ручная live validation на уже Docker-ready host:
+
+```bash
+make verify-access &&
+make inspect-hardening &&
+make harden &&
+make verify-hardening &&
+make harden &&
+make verify-hardening
+```
+
+Второй `make harden` должен дать `changed=0`, если external state не изменился.
+Агент выполняет только offline checks; live safety, listeners и идемпотентность
+подтверждаются вручную. После Stage 3 — STOP.
+
+## Подтверждённая перезагрузка хоста
+
+После успешной проверки Stage 3 можно отдельно выполнить `make reboot-host`.
+Это явная операция обслуживания, а не автоматический шаг provisioning. Перед
+запуском проверьте provider-console/recovery access и provider-side SSH rules:
+reboot прервёт текущие SSH sessions. Используйте те же overrides, что при остальных
+проверках:
+
+```bash
+make reboot-host INVENTORY=/path/to/local-inventory.yml AUTOMATION_KEY=/path/to/automation-key
+```
+
+Wrapper сначала проверяет key-only SSH как `ansible` и `sudo -n` на текущем inventory
+порту. Затем в интерактивном терминале спрашивает `Reboot this host now? [y/N]`.
+Только `y`/`yes` разрешают reboot; пустой ответ, отказ, EOF или Ctrl-C останавливают
+команду. Без TTY запуск отклоняется до обращения к хосту; unattended/force режима нет.
+Существующие inventory, ключ и host trust сохраняются; новые ключи не создаются,
+password authentication и sudo prompts запрещены.
+
+`playbooks/reboot-host.yml` использует `ansible.builtin.reboot` с `reboot_timeout: 300`,
+`connect_timeout: 10` и `post_reboot_delay: 5`. Ansible отдельно ограничивает ожидание
+нового boot ID и readiness test: возможны примерно 600 секунд ожидания плюс задержка
+и SSH/Ansible overhead. После восстановления последовательно выполняются проверки
+`verify-access`, `verify-docker`, `verify-hardening` с теми же inventory и ключом,
+включая независимый доступ на каждом `ssh_verify_ports` и все server listeners.
+Docker smoke test может изменить image cache; firewall/SSH provisioning не запускается.
+При ошибке возвращается non-zero status с указанием failed phase, последующие проверки
+не выполняются. Reboot уже мог произойти: используйте recovery console и не повторяйте
+его вслепую. Human-access policy и application deployment остаются отдельными stages.
+
+Offline-тесты подменяют все remote/reboot вызовы; `make check`/CI выполняют только
+syntax-check этого playbook и локальные проверки. Агент не выполнял реальный reboot.
+
 ## Переопределения и troubleshooting
 
 Make поддерживает local inventory path и абсолютный private-key path вне
@@ -297,7 +584,7 @@ non-interactive verification этого wrapper. Права существующ
 без изменений роли. Нужны SSH password login и sudo; bootstrap тогда также
 запросит sudo password через штатный `--ask-become-pass`. Managed user этих Make
 targets остаётся `ansible`. Inventory поддерживает один хост и только поля host,
-port, initial user и Python interpreter из example; credentials и дополнительные
+port, initial user, Python interpreter и hardening port lists из example; credentials и дополнительные
 runtime variables отклоняются.
 
 Все generated runtimes/tooling находятся в ignored `.tools`, `.venv`, `.ansible`

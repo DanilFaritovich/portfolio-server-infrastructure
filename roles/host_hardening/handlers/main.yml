@@ -1,0 +1,42 @@
+---
+- name: Validate installed SSH configuration immediately before reload
+  ansible.builtin.command:
+    argv: [/usr/sbin/sshd, -t]
+  become: true
+  changed_when: false
+  listen: Reload SSH after validated configuration changes
+
+- name: Reload SSH after validated configuration changes
+  ansible.builtin.systemd_service:
+    name: ssh.service
+    state: reloaded
+  become: true
+  when: hardening_before.ssh_activation == 'service'
+
+- name: Regenerate Ubuntu SSH socket configuration without changing live listeners
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  become: true
+  when: hardening_before.ssh_activation == 'socket'
+  listen: Reload SSH after validated configuration changes
+
+- name: Validate effective generated socket before restarting any SSH listener
+  portfolio_hardening_info:
+    current_port: "{{ ansible_port | int }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+    tcp_ports: "{{ firewall_allowed_tcp_ports }}"
+    socket_candidate: true
+  become: true
+  when: hardening_before.ssh_activation == 'socket'
+  listen: Reload SSH after validated configuration changes
+
+# Restart in one ordered transaction: the running daemon retains inherited
+# descriptors, so restarting the socket alone cannot reliably rebind them.
+# Preflight verifies Requires/After and KillMode=process to retain sessions.
+- name: Apply validated socket listeners and restart their SSH consumer together
+  ansible.builtin.command:
+    argv: [systemctl, restart, ssh.socket, ssh.service]
+  become: true
+  changed_when: true
+  when: hardening_before.ssh_activation == 'socket'
+  listen: Reload SSH after validated configuration changes

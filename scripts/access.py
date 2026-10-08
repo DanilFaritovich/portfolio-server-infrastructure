@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -19,7 +20,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KEY = Path.home() / '.ssh/portfolio-server-infrastructure/ansible_ed25519'
 PASSWORD_CONNECTION = 'portfolio_password'
-HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'ansible_python_interpreter'}
+HARDENING_FIELDS = {'ssh_listen_ports', 'ssh_verify_ports', 'firewall_allowed_tcp_ports'}
+HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'ansible_python_interpreter'} | HARDENING_FIELDS
 SSH_BASE = '-o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=15'
 
 
@@ -40,7 +42,7 @@ def setup_inventory(path):
         print('Inventory created. Edit ansible_host and ansible_port before bootstrap.')
 
 
-def load_host(path):
+def load_host(path, validate_hardening=True):
     require(path.is_file() and path.resolve() != ROOT / 'inventories/production.example.yml',
             'Real local inventory required. Run make setup, then edit host and port.')
     try:
@@ -58,7 +60,9 @@ def load_host(path):
                 'Use a simple host alias such as portfolio.')
         require(alias != 'localhost', 'Reserve localhost for the controller; use a separate VPS alias.')
         require(isinstance(values, dict) and set(values) <= HOST_FIELDS,
-                'Only host, port, initial user and Python interpreter belong in this inventory.')
+                'Only host, port, initial user, Python interpreter and hardening port lists belong in inventory.')
+        for name in HARDENING_FIELDS & values.keys() if validate_hardening else ():
+            validate_ports(values[name], allow_empty=name == 'firewall_allowed_tcp_ports')
         host = values.get('ansible_host')
         port = values.get('ansible_port')
         user = values.get('ansible_user', 'root')
@@ -75,6 +79,30 @@ def load_host(path):
         # Parser exceptions can include inventory contents: do not expose them.
         raise ValueError('Invalid inventory. Use the static example structure without credentials.') from None
     return alias, host, port, user, interpreter
+
+
+def validate_ports(values, allow_empty=False):
+    require(isinstance(values, list) and (allow_empty or values) and
+            all(type(port) is int and 1 <= port <= 65535 for port in values) and
+            len(values) == len(set(values)), 'Hardening ports must be unique integers from 1 to 65535.')
+
+
+def hardening_inputs(path, alias, port, validate=True):
+    # load_host has already validated the complete static inventory structure.
+    host = yaml.safe_load(path.read_text())['all']['children']['bootstrap']['hosts'][alias]
+    result = {'ssh_listen_ports': host.get('ssh_listen_ports', [port]),
+              'firewall_allowed_tcp_ports': host.get('firewall_allowed_tcp_ports', [80, 443])}
+    result['ssh_verify_ports'] = host.get('ssh_verify_ports', result['ssh_listen_ports'])
+    if not validate:
+        return result
+    for name, values in result.items():
+        validate_ports(values, allow_empty=name == 'firewall_allowed_tcp_ports')
+    require(set(result['ssh_verify_ports']) <= set(result['ssh_listen_ports']),
+            'ssh_verify_ports must be a non-empty subset of ssh_listen_ports.')
+    require(port in result['ssh_listen_ports'],
+            'Keep current ansible_port in ssh_listen_ports. Add new ports alongside the current route first.')
+    require(port in result['ssh_verify_ports'], 'Keep current ansible_port in ssh_verify_ports.')
+    return result
 
 
 def key_path(value):
@@ -222,15 +250,75 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
         subprocess.run(command, cwd=ROOT, check=True, env=environment)
 
 
+def inspect_host(host, port, interpreter, key, inputs):
+    """Read-only SSH transport avoids Ansible's remote payload/tempfile writes."""
+    ssh = ['ssh'] + shlex.split(SSH_BASE) + [
+        '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
+        '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
+        '-o', 'KbdInteractiveAuthentication=no', '-o', 'IdentityAgent=none',
+        '-i', str(key), '-p', str(port), 'ansible@' + host,
+    ]
+    login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False)
+    if login.returncode or login.stdout.strip() != 'ansible':
+        print('Hardening preflight\nFAIL  managed SSH access\n'
+              'FAIL  host inspection unavailable without managed key-only access\n\nResult: NOT READY')
+        raise ValueError('Managed SSH access failed; remaining host checks cannot run safely.')
+    params = {'current_port': port, 'ssh_ports': inputs['ssh_listen_ports'],
+              'tcp_ports': inputs['firewall_allowed_tcp_ports'], 'verify': False,
+              'refresh_rules': False, 'socket_candidate': False, 'report_only': True}
+    # Python receives code through stdin. -I isolates imports; -B prevents bytecode-cache writes;
+    # imports are standard-library only. No copy, temp files, modules or handlers.
+    payload = '__name__ = "portfolio_inspection"\n' + (ROOT / 'library/portfolio_hardening_info.py').read_text()
+    payload += '\ninspect_stream(json.loads(' + repr(json.dumps(params)) + '))\n'
+    process = subprocess.run(ssh + ['sudo -n ' + shlex.quote(interpreter) + ' -I -B -'],
+                             input=payload, capture_output=True, text=True, check=False)
+    try:
+        require(process.returncode == 0, 'Managed sudo or host inspection failed.')
+        result = json.loads(process.stdout)
+        require(type(result['ready']) is bool and isinstance(result['report'], str), 'Invalid inspection result.')
+    except (ValueError, KeyError, TypeError):
+        # Never dump SSH stderr, sudo errors, parser input or captured stdout.
+        print('Hardening preflight\nPASS  managed SSH login\n'
+              'FAIL  managed sudo or read-only inspection unavailable\n\nResult: NOT READY')
+        raise ValueError('Cannot safely complete host inspection; check managed sudo and Python.') from None
+    print(result['report'].replace('Hardening preflight', 'Hardening preflight\nPASS  managed SSH access', 1))
+    require(result['ready'], 'Resolve all FAIL findings before make harden. WARN findings can converge safely.')
+
+
+def verify_hardening(inventory, alias, host, port, stage, inputs):
+    # Each selected verification port gets a new independent connection. Reuse the
+    # already trusted host identity via HostKeyAlias; never scan/accept keys.
+    identity = host if port == 22 else f'[{host}]:{port}'
+    print('LIVE / POST-CONVERGENCE VERIFY: all ssh_listen_ports are required on the server; '
+          'fresh SSH access is required on every ssh_verify_ports entry.', flush=True)
+    for target_port in inputs['ssh_verify_ports']:
+        connection = stage | {'ansible_port': target_port,
+                              'ansible_ssh_args': stage['ansible_ssh_args'] + f' -o HostKeyAlias={identity}'}
+        try:
+            run_playbook(inventory, alias, connection, 'verify.yml')
+        except subprocess.CalledProcessError:
+            print(f'Post-convergence access verification failed on configured SSH port {target_port}. '
+                  'Stop and check make verify-access on the current inventory route and recovery access. '
+                  'A future port may be unavailable until make harden succeeds.', flush=True)
+            raise
+        run_playbook(inventory, alias, connection | inputs, 'verify-hardening.yml')
+
+
 def live(mode, inventory, key):
     prerequisites(mode)
-    if mode in ('docker-host', 'verify-docker'):
+    if mode in ('docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host'):
         try:
             check_key(key)
         except (ValueError, OSError):
             raise ValueError('Managed access is not ready. Run make bootstrap-user first; check the dedicated key pair.') from None
-    alias, host, port, user, _ = load_host(inventory)
+    alias, host, port, user, interpreter = load_host(inventory, validate_hardening=mode != 'inspect-hardening')
+    inputs = hardening_inputs(inventory, alias, port, validate=mode != 'inspect-hardening') if mode in ('harden', 'verify-hardening', 'inspect-hardening', 'reboot-host') else {}
+    if mode == 'reboot-host':
+        require(sys.stdin.isatty(), 'Reboot requires an interactive terminal; no reboot was requested.')
     known_host(host, port, allow_trust=mode == 'bootstrap-user')
+    if mode == 'inspect-hardening':
+        inspect_host(host, port, interpreter, key, inputs)
+        return
     if mode == 'bootstrap-user':
         require(sys.stdin.isatty(), 'Bootstrap requires an interactive terminal for the Ansible password prompt.')
         print('LIVE / MUTATING: creates ansible and approves unrestricted NOPASSWD sudo.', flush=True)
@@ -258,19 +346,56 @@ def live(mode, inventory, key):
                             ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
                             ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
     }
-    run_playbook(inventory, alias, managed, 'verify.yml')
+    try:
+        run_playbook(inventory, alias, managed, 'verify.yml')
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        if mode == 'reboot-host':
+            raise ValueError('Pre-reboot key-only SSH/sudo verification failed; no reboot was requested. '
+                             'Stop and check make verify-access and recovery access.') from None
+        raise
+    if mode == 'reboot-host':
+        print(f'LIVE / MUTATING: reboot {host}:{port}. Keep provider console/recovery access. '
+              'Docker verification afterward may change the image cache.', flush=True)
+        try:
+            answer = input('Reboot this host now? [y/N] ')
+        except (EOFError, KeyboardInterrupt):
+            answer = ''
+        require(answer.strip().lower() in ('y', 'yes'), 'Reboot declined; no reboot was requested.')
+        stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
+        stage['ansible_become_flags'] = '-n'
+        phase = 'reboot and bounded SSH recovery'
+        try:
+            run_playbook(inventory, alias, stage | {'reboot_host_confirmed': True}, 'reboot-host.yml')
+            phase = 'verify-access after reboot'
+            run_playbook(inventory, alias, managed, 'verify.yml')
+            phase = 'verify-docker after reboot'
+            run_playbook(inventory, alias, stage, 'verify-docker.yml')
+            phase = 'verify-hardening after reboot'
+            verify_hardening(inventory, alias, host, port, stage, inputs)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            raise ValueError(f'{phase} failed; the host may already have rebooted. Stop and use provider '
+                             'console/recovery access; do not repeat reboot blindly. No later checks ran.') from None
+        print('Reboot and access/Docker/hardening verification completed. STOP.')
+        return
     if mode in ('docker-host', 'verify-docker'):
         print('LIVE / MUTATING: Docker host provisioning.' if mode == 'docker-host' else
               'LIVE / VERIFY: Docker checks and disposable runtime smoke test (image cache may change).', flush=True)
         # Host-level ansible_become=False would override task-level become=True.
         stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
         run_playbook(inventory, alias, stage | {'ansible_become_flags': '-n'}, mode + '.yml')
+    if mode in ('harden', 'verify-hardening'):
+        stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
+        stage['ansible_become_flags'] = '-n'
+        if mode == 'harden':
+            print('LIVE / MUTATING: UFW and SSH listening ports. Keep provider recovery console access.', flush=True)
+            run_playbook(inventory, alias, stage | inputs, 'harden.yml')
+        verify_hardening(inventory, alias, host, port, stage, inputs)
     print('Requested stage completed. STOP.')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker'])
+    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=str(DEFAULT_KEY))
     args = parser.parse_args()

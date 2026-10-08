@@ -155,6 +155,181 @@ class AccessTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[3], 'verify.yml')
             self.assertEqual(run.call_args.args[2]['ansible_user'], 'ansible')
 
+    def test_reboot_handoff_preflights_then_confirms_and_verifies_in_order(self):
+        self.pair()
+        events = []
+        def run(*args, **kwargs):
+            events.append(('playbook', args[3], args[2], kwargs))
+        with patch.object(access, 'prerequisites', side_effect=lambda mode: events.append(('prerequisites', mode))), \
+                patch.object(access, 'known_host', side_effect=lambda *a, **k: events.append(('trust', a, k))), \
+                patch.object(access, 'run_playbook', side_effect=run) as playbook, \
+                patch.object(access, 'verify_hardening', side_effect=lambda *a: events.append(('hardening', a))), \
+                patch.object(access.sys.stdin, 'isatty', return_value=True), \
+                patch('builtins.input', side_effect=lambda prompt: (events.append(('prompt', prompt)), 'yes')[1]):
+            access.live('reboot-host', self.inventory, self.key)
+        self.assertEqual([event[0] for event in events],
+                         ['prerequisites', 'trust', 'playbook', 'prompt', 'playbook',
+                          'playbook', 'playbook', 'hardening'])
+        calls = [event for event in events if event[0] == 'playbook']
+        self.assertEqual([event[1] for event in calls],
+                         ['verify.yml', 'reboot-host.yml', 'verify.yml', 'verify-docker.yml'])
+        preflight = calls[0][2]
+        self.assertEqual(preflight['ansible_user'], 'ansible')
+        self.assertEqual(preflight['ansible_private_key_file'], str(self.key))
+        self.assertFalse(preflight['ansible_become'])
+        reboot_vars = calls[1][2]
+        self.assertTrue(reboot_vars['reboot_host_confirmed'])
+        self.assertEqual(reboot_vars['ansible_private_key_file'], str(self.key))
+        self.assertEqual(reboot_vars['ansible_become_flags'], '-n')
+        self.assertNotIn('ansible_become', reboot_vars)
+        self.assertEqual(calls[1][3], {})
+        self.assertEqual(calls[2][2], preflight)
+        self.assertEqual(calls[3][2]['ansible_private_key_file'], str(self.key))
+        self.assertEqual(calls[3][2]['ansible_become_flags'], '-n')
+        hardening = next(event[1] for event in events if event[0] == 'hardening')
+        self.assertEqual(hardening[0:4], (self.inventory, 'portfolio', 'fixture.example.test', 2222))
+        self.assertEqual(hardening[4], calls[3][2])
+        self.assertEqual(hardening[5]['ssh_listen_ports'], [2222])
+
+    def test_reboot_refusal_inputs_stop_after_successful_preflight(self):
+        self.pair()
+        for answer in ('', 'n', 'invalid', EOFError(), KeyboardInterrupt()):
+            with self.subTest(answer=type(answer).__name__ if isinstance(answer, Exception) else answer), \
+                    patch.object(access, 'prerequisites'), patch.object(access, 'known_host'), \
+                    patch.object(access, 'run_playbook') as run, \
+                    patch.object(access.sys.stdin, 'isatty', return_value=True), \
+                    patch('builtins.input', side_effect=type(answer) if isinstance(answer, BaseException) else None,
+                          return_value=answer):
+                with self.assertRaisesRegex(ValueError, 'Reboot declined'):
+                    access.live('reboot-host', self.inventory, self.key)
+                self.assertEqual([call.args[3] for call in run.call_args_list], ['verify.yml'])
+
+    def test_reboot_non_tty_and_preflight_failure_never_prompt_or_reboot(self):
+        self.pair()
+        with patch.object(access, 'prerequisites'), patch.object(access, 'known_host'), \
+                patch.object(access, 'run_playbook') as run, patch.object(access.sys.stdin, 'isatty', return_value=False), \
+                patch('builtins.input') as prompt:
+            with self.assertRaisesRegex(ValueError, 'interactive terminal'):
+                access.live('reboot-host', self.inventory, self.key)
+            run.assert_not_called()
+            prompt.assert_not_called()
+        with patch.object(access, 'prerequisites'), patch.object(access, 'known_host'), \
+                patch.object(access, 'run_playbook', side_effect=subprocess.CalledProcessError(1, 'offline')) as run, \
+                patch.object(access.sys.stdin, 'isatty', return_value=True), patch('builtins.input') as prompt:
+            with self.assertRaisesRegex(ValueError, 'Pre-reboot key-only SSH/sudo verification failed'):
+                access.live('reboot-host', self.inventory, self.key)
+            self.assertEqual(run.call_count, 1)
+            prompt.assert_not_called()
+
+    def test_reboot_post_stage_failures_stop_later_stages(self):
+        self.pair()
+        stages = ('reboot-host.yml', 'verify.yml', 'verify-docker.yml')
+        for failed in stages:
+            with self.subTest(failed=failed), patch.object(access, 'prerequisites'), \
+                    patch.object(access, 'known_host'), patch.object(access.sys.stdin, 'isatty', return_value=True), \
+                    patch('builtins.input', return_value='y'), patch.object(access, 'verify_hardening') as hardening:
+                calls = []
+                def run(inventory, alias, variables, playbook, **kwargs):
+                    calls.append(playbook)
+                    if playbook == failed and (failed != 'verify.yml' or calls.count('verify.yml') == 2):
+                        raise subprocess.TimeoutExpired(playbook, 300)
+                with patch.object(access, 'run_playbook', side_effect=run):
+                    expected = {'reboot-host.yml': 'reboot and bounded SSH recovery',
+                                'verify.yml': 'verify-access after reboot',
+                                'verify-docker.yml': 'verify-docker after reboot'}[failed]
+                    with self.assertRaisesRegex(ValueError, expected):
+                        access.live('reboot-host', self.inventory, self.key)
+                self.assertEqual(calls, ['verify.yml', 'reboot-host.yml'] if failed == stages[0] else
+                                 ['verify.yml', 'reboot-host.yml', 'verify.yml'] if failed == stages[1] else
+                                 ['verify.yml', 'reboot-host.yml', 'verify.yml', 'verify-docker.yml'])
+                hardening.assert_not_called()
+
+    def test_reboot_checks_every_selected_port_and_stops_on_hardening_failure(self):
+        self.pair()
+        self.host.update(ssh_listen_ports=[2222, 2200], ssh_verify_ports=[2222, 2200])
+        self.write_inventory()
+        for failed in (None, 'verify.yml', 'verify-hardening.yml'):
+            calls = []
+            def run(inventory, alias, variables, playbook, **kwargs):
+                self.assertEqual(inventory, self.inventory)
+                self.assertEqual(variables['ansible_private_key_file'], str(self.key))
+                for option in ('BatchMode=yes', 'IdentitiesOnly=yes', 'PasswordAuthentication=no',
+                               'KbdInteractiveAuthentication=no', 'StrictHostKeyChecking=yes', 'ControlMaster=no'):
+                    self.assertIn(option, variables['ansible_ssh_args'])
+                calls.append((playbook, variables.get('ansible_port', 2222)))
+                if playbook == failed and variables.get('ansible_port') == 2200:
+                    raise subprocess.CalledProcessError(1, 'offline')
+            with self.subTest(failed=failed), patch.object(access, 'prerequisites'), \
+                    patch.object(access, 'known_host'), patch.object(access, 'run_playbook', side_effect=run), \
+                    patch.object(access.sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value='yes'):
+                if failed:
+                    with self.assertRaisesRegex(ValueError, 'verify-hardening after reboot failed'):
+                        access.live('reboot-host', self.inventory, self.key)
+                    self.assertEqual(calls[-1], (failed, 2200))
+                else:
+                    access.live('reboot-host', self.inventory, self.key)
+                    self.assertEqual(calls, [('verify.yml', 2222), ('reboot-host.yml', 2222),
+                        ('verify.yml', 2222), ('verify-docker.yml', 2222), ('verify.yml', 2222),
+                        ('verify-hardening.yml', 2222), ('verify.yml', 2200), ('verify-hardening.yml', 2200)])
+
+    def test_reboot_cli_returns_failure_for_denial_or_prerequisite_error(self):
+        with patch.object(access, 'live', side_effect=ValueError('synthetic refusal')), \
+                patch('sys.argv', ['access.py', 'reboot-host', '--inventory', str(self.inventory),
+                                   '--key', str(self.key)]), patch('builtins.print'):
+            self.assertEqual(access.main(), 1)
+
+    def test_reboot_prerequisites_hardening_ports_and_trust_fail_before_contact(self):
+        with patch.object(access, 'prerequisites'), patch.object(access, 'run_playbook') as run:
+            with self.assertRaisesRegex(ValueError, 'Managed access is not ready'):
+                access.live('reboot-host', self.inventory, self.key)
+            run.assert_not_called()
+        self.pair()
+        for ports in ([2222, 2222], [0], [2200]):
+            with self.subTest(ports=ports):
+                self.host['ssh_listen_ports'] = ports
+                self.write_inventory()
+                with patch.object(access, 'prerequisites'), patch.object(access, 'known_host') as trust, \
+                        patch.object(access, 'run_playbook') as run, patch.object(access.sys.stdin, 'isatty', return_value=True):
+                    with self.assertRaises(ValueError):
+                        access.live('reboot-host', self.inventory, self.key)
+                    trust.assert_not_called()
+                    run.assert_not_called()
+        self.host.pop('ssh_listen_ports', None)
+        self.write_inventory()
+        with patch.object(access, 'prerequisites', side_effect=ValueError('missing prerequisite')) as prereq, \
+                patch.object(access, 'known_host') as trust, patch.object(access, 'run_playbook') as run:
+            with self.assertRaisesRegex(ValueError, 'missing prerequisite'):
+                access.live('reboot-host', self.inventory, self.key)
+            prereq.assert_called_once()
+            trust.assert_not_called()
+            run.assert_not_called()
+        self.pair()
+        with patch.object(access, 'prerequisites'), patch.object(access, 'known_host', side_effect=ValueError('untrusted')) as trust, \
+                patch.object(access, 'run_playbook') as run, patch.object(access.sys.stdin, 'isatty', return_value=True):
+            with self.assertRaisesRegex(ValueError, 'untrusted'):
+                access.live('reboot-host', self.inventory, self.key)
+            trust.assert_called_once()
+            run.assert_not_called()
+
+    def test_reboot_make_dry_run_and_playbook_confirmation_assertion(self):
+        make = subprocess.run(['make', '-n', 'reboot-host', 'INVENTORY=/fixture/inventory.yml',
+                               'AUTOMATION_KEY=/fixture/key'], cwd=access.ROOT, capture_output=True, text=True)
+        self.assertEqual(make.returncode, 0, make.stderr)
+        self.assertIn('--inventory "$INVENTORY" --key "$AUTOMATION_KEY"', make.stdout)
+        self.assertIn('scripts/access.py reboot-host', make.stdout)
+        for target in ('check', 'ci'):
+            result = subprocess.run(['make', '-n', target], cwd=access.ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('scripts/access.py reboot-host', result.stdout)
+            self.assertIn('playbooks/reboot-host.yml', result.stdout)
+        tasks = yaml.safe_load((access.ROOT / 'playbooks/reboot-host.yml').read_text())[0]['tasks']
+        self.assertIn('reboot_host_confirmed | default(false) | bool', tasks[0]['ansible.builtin.assert']['that'])
+        reboot = tasks[1]
+        self.assertEqual(reboot['ansible.builtin.reboot'], {
+            'reboot_timeout': 300, 'connect_timeout': 10, 'post_reboot_delay': 5})
+        self.assertTrue(reboot['become'])
+        self.assertNotIn('shell', reboot)
+
     def test_ansible_command_uses_native_prompt_and_no_shell(self):
         overlays = []
 
