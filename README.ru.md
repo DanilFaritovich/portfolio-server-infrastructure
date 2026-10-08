@@ -303,7 +303,7 @@ firewall_allowed_tcp_ports: [80, 443]
 ```
 
 `ssh_verify_ports` — непустой список уникальных integer ports из
-`ssh_listen_ports`. Если сеть компьютера блокирует порт 22, сохраните
+`ssh_listen_ports` и обязательно включает текущий `ansible_port`. Если сеть компьютера блокирует порт 22, сохраните
 `ssh_listen_ports: [22, 2222]`, используйте доступный `ansible_port: 2222` и задайте
 `ssh_verify_ports: [2222]`. Оба server listeners и IPv4/IPv6 UFW rules остаются
 обязательными; выбранные ports ограничивают только внешние SSH/sudo probes.
@@ -328,7 +328,12 @@ hierarchies, занятые SSH-порты, неактивные Docker/containe
 state останавливают роль. Поддерживается обычный `/etc/ssh/sshd_config` со
 стандартным include `/etc/ssh/sshd_config.d/*.conf` и управляемыми ролью listening
 directives. Поддерживаются штатный Ubuntu active/enabled `ssh.socket` и обычный
-listener mode `ssh.service`; переключения activation mode нет. Штатный socket
+listener mode `ssh.service`; переключения activation mode нет. Для Ubuntu 24.04
+socket support рассчитан на штатный layout systemd SSH generator; service mode тоже
+обязан пройти preflight. Это поддержка проверяемых конфигураций, а не любых Ubuntu
+images, старых migration overrides или custom systemd layouts. Проверки выполняются
+offline с synthetic fixtures и local Ansible; успешный acceptance run на Ubuntu 24.04
+VM/VPS не заявляется. Штатный socket
 dependency drop-in принимается только с точными директивами `After=ssh.socket`
 и `Requires=ssh.socket`; socket address drop-ins должны быть созданы runtime
 generator Ubuntu. Custom overrides отклоняются. Все текущие live SSH listening
@@ -355,7 +360,14 @@ Effective candidate ports должны точно совпадать с desired 
 Source fingerprints повторно проверяются непосредственно перед записью; изменения
 source после preflight останавливают adoption. Snippet и main заменяются атомарно по отдельности,
 с откатом при обнаруженной ошибке записи; единой filesystem transaction нет, поэтому
-прерванная запись требует проверки через recovery access. Существующие service/socket
+прерванная запись требует проверки через recovery access.
+До замены adoption сохраняет `/etc/ssh/portfolio-adoption.pending` с mode 0600.
+Uncatchable termination, failed rollback или ошибка удаления marker оставляют этот
+сигнал; preflight и прямой adoption блокируют retry. Live listeners могут использовать
+старую конфигурацию, пока main/includes на диске заменены частично. Через recovery
+access восстановите или завершите согласованный tree, сохраните текущий route и
+human authentication policy, проверьте `sshd -t` и effective desired ports, и только
+после этого удаляйте marker. Нельзя вслепую выполнять reload SSH или удалять marker. Существующие service/socket
 handlers валидируют и активируют установленную конфигурацию, затем wrapper проверяет
 независимые подключения на каждом порту из `ssh_verify_ports`. После convergence legacy-директивы
 нет, следующий запуск даёт `changed=0`.
@@ -388,8 +400,24 @@ Managed `ENABLED`, input/output policies и fingerprints изменённых р
 сходятся без ложного external drift. Effective ports из `sshd -T` сравниваются
 как множество, включая одинаковые повторяющиеся entries; desired inventory port
 lists по-прежнему должны содержать unique ports.
-После прерванного firewall mutation ownership snapshot может устареть: изучите
-реальное состояние и осознанно согласуйте его через recovery access до retry.
+Перед UFW mutation роль сохраняет exact raw fingerprints, разрешённые порты,
+normalized recovery fingerprints и правила, уже присутствующие в каждой address
+family. После прерывания процесса `harden` продолжает только точные разрешённые
+TCP allow additions с комментарием роли и её input/output/boot policy changes.
+Распознаётся штатный UFW 0.36 empty-template rewrite при `LOGLEVEL=low/off` и стандартном
+forward policy, включая IPv6 rate-limit capability variants. Остальные bytes,
+неизвестные tuples/raw rules, дубликаты, удаление правил и protected base drift
+блокируют продолжение. Отсутствующие raw files и неподдерживаемые initial template/logging
+layouts дают fail-closed; предполагаемых rewrites и reset нет. Старый ownership marker
+обновляется лишь при совпадении исходных fingerprints и не разрешает уже устаревший
+ruleset. Standalone verification отклоняет stale raw fingerprints, пока `harden` не
+сохранит завершённое состояние. После ошибки сначала изучите read-only report и
+recovery access; не удаляйте ownership markers для обхода проверки.
+SSH/UFW configuration, systemd units/drop-ins и их parent directories должны принадлежать
+root с root group без group/other write permission. Symlink/type guards сохранены;
+штатный Ubuntu alias `/lib` → `/usr/lib` принимается строго для package units.
+UFW ownership marker дополнительно запрещает group/other access (0600 или строже).
+Небезопасные ownership/modes останавливают inspection до configuration mutation.
 Read-only модуль `library/portfolio_hardening_info.py` выполняет inspection.
 UFW CLI используется без новой collection; операции с rules идемпотентны и
 отмечают фактические additions/updates.
@@ -445,7 +473,10 @@ configured port и направляет к `make verify-access` и recovery acce
 
 Docker forwarding rules сохраняются. UFW host-input policy сама по себе не
 ограничивает будущие Docker-published container ports; application network
-security относится к отдельному deployment stage. См.
+security относится к отдельному deployment stage. Stage 3 не меняет управление
+Docker iptables, не создаёт application networks и не публикует контейнеры.
+До application deployment отдельно проверяются provider-side rules и политика
+Docker-published ports; открытия host-input ports здесь недостаточно. См.
 [Docker and UFW](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw).
 
 Offline-регрессии используют synthetic inventories, opaque keys, mocked commands

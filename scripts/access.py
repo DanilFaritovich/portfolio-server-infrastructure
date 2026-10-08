@@ -101,6 +101,7 @@ def hardening_inputs(path, alias, port, validate=True):
             'ssh_verify_ports must be a non-empty subset of ssh_listen_ports.')
     require(port in result['ssh_listen_ports'],
             'Keep current ansible_port in ssh_listen_ports. Add new ports alongside the current route first.')
+    require(port in result['ssh_verify_ports'], 'Keep current ansible_port in ssh_verify_ports.')
     return result
 
 

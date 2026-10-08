@@ -302,7 +302,8 @@ firewall_allowed_tcp_ports: [80, 443]
 ```
 
 `ssh_verify_ports` must be a non-empty list of unique integer ports from
-`ssh_listen_ports`. If your controller's network blocks port 22, keep
+`ssh_listen_ports`, and must include the current `ansible_port`. If your
+controller's network blocks port 22, keep
 `ssh_listen_ports: [22, 2222]`, use the reachable `ansible_port: 2222`, and set
 `ssh_verify_ports: [2222]`. Both server listeners and IPv4/IPv6 UFW rules remain
 mandatory; only external SSH/sudo probes use the selected ports. Port 22's external
@@ -328,7 +329,12 @@ ambiguous UFW state stop the role. Supported SSH input is the regular
 `/etc/ssh/sshd_config` with the standard `/etc/ssh/sshd_config.d/*.conf` include
 and role-owned listening directives. Both Ubuntu's active/enabled `ssh.socket`
 and conventional `ssh.service` listener mode are supported without switching
-activation modes. The standard socket dependency drop-in is accepted only with
+activation modes. For Ubuntu 24.04, socket support targets the stock systemd
+SSH generator layout; conventional service mode must also pass the same preflight.
+This is support for these inspected configurations, not a claim that every Ubuntu
+image, older socket migration override, or custom systemd layout works. Coverage is
+offline with synthetic fixtures and local Ansible; no Ubuntu 24.04 VM/VPS acceptance
+run is claimed. The standard socket dependency drop-in is accepted only with
 its exact `After=ssh.socket` and `Requires=ssh.socket` directives; socket address
 drop-ins must come from Ubuntu's runtime generator. Custom overrides are rejected.
 All existing live SSH listening ports must remain in `ssh_listen_ports`.
@@ -355,6 +361,13 @@ Source fingerprints are rechecked immediately before writes; source changes sinc
 abort adoption. Snippet and main replacements are
 atomic per file, with rollback on a reported write failure; they are not one
 filesystem transaction, so interrupted writes require recovery inspection.
+Before replacement, adoption persists `/etc/ssh/portfolio-adoption.pending` with
+mode 0600. An uncatchable termination, failed rollback, or failed marker cleanup
+leaves this signal; both preflight and direct adoption reject a retry. Live listeners
+may still use the old configuration while main/includes on disk are partly replaced.
+Through recovery access, restore or complete the approved tree, retain the current
+route and human authentication policy, validate `sshd -t` and effective desired ports,
+and only then clear the marker. Do not reload SSH or delete the marker blindly.
 Existing service/socket handlers validate and activate the installed configuration,
 and the wrapper then verifies independent connections on every selected `ssh_verify_ports` entry.
 After convergence there is no legacy directive and the next run reports `changed=0`.
@@ -386,8 +399,24 @@ Managed `ENABLED`, input/output policies and role-updated rule fingerprints cont
 to converge without treating the role's own changes as external drift. Effective
 `sshd -T` ports are compared as a set, including duplicate identical entries;
 the desired inventory port lists must still be unique.
-Interrupted firewall mutation can leave the ownership snapshot stale; inspect
-actual state and reconcile it deliberately through recovery access before retrying.
+Before UFW mutation, the role records exact raw fingerprints, authorized ports,
+normalized recovery fingerprints, and the rules already present in each address
+family. After a process interruption, `harden` can resume only exact authorized TCP
+allow additions with the role comment, plus its input/output/boot policy changes.
+The stock UFW 0.36 empty-template rewrite is recognized for `LOGLEVEL=low/off` and
+standard forward policy, including IPv6 rate-limit capability variants. Other bytes,
+unknown tuples/raw rules, duplicate rules, rule removal, and protected base drift
+remain blockers. Missing raw files or unsupported initial template/logging layouts
+fail closed; no inferred rewrite or reset is performed. An old ownership marker can
+upgrade only while its original fingerprints match; it cannot authorize an already
+stale ruleset. Standalone verification rejects stale raw fingerprints until `harden`
+records the completed state. After any failure, inspect the read-only report and
+recovery access before a deliberate retry; do not delete ownership markers.
+SSH/UFW configuration, systemd units/drop-ins, and their parent directories must be
+root-owned with root group and no group/other write permission. Symlink/type guards
+remain in force; Ubuntu's package `/lib` to `/usr/lib` alias is accepted narrowly.
+The UFW ownership marker must additionally have no group/other access (0600 or
+stricter). Unsafe ownership or modes stop inspection before configuration mutation.
 The focused read-only `library/portfolio_hardening_info.py` module performs these
 checks. UFW CLI commands are used without an additional collection; their rule
 operations are idempotent and report actual additions/updates.
@@ -442,7 +471,11 @@ Transient Ansible module files are cleaned up as in access verification.
 
 Docker's own forwarding rules remain unchanged. UFW host-input policy does not
 by itself constrain future Docker-published container ports; application network
-security remains part of the separate deployment stage. See
+security remains part of the separate deployment stage. Stage 3 does not change
+Docker's iptables management, create application networks, or publish containers.
+Provider-side rules and an explicit policy for Docker-published ports need separate
+review before application deployment; opening host-input ports here is insufficient.
+See
 [Docker and UFW](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw).
 
 Offline regression tests use synthetic inventories and opaque keys, mocked

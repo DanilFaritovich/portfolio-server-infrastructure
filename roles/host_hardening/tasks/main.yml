@@ -8,6 +8,12 @@
       - ssh_listen_ports | unique | length == ssh_listen_ports | length
       - firewall_allowed_tcp_ports | unique | length == firewall_allowed_tcp_ports | length
       - ansible_port | int in ssh_listen_ports
+      - ssh_verify_ports | default(ssh_listen_ports) is sequence
+      - ssh_verify_ports | default(ssh_listen_ports) is not string
+      - ssh_verify_ports | default(ssh_listen_ports) | select('integer') | list == ssh_verify_ports | default(ssh_listen_ports)
+      - ansible_port | int in (ssh_verify_ports | default(ssh_listen_ports))
+      - ssh_verify_ports | default(ssh_listen_ports) | difference(ssh_listen_ports) | length == 0
+      - ssh_verify_ports | default(ssh_listen_ports) | unique | length == ssh_verify_ports | default(ssh_listen_ports) | length
       - (ssh_listen_ports + firewall_allowed_tcp_ports) | select('integer') | list == (ssh_listen_ports + firewall_allowed_tcp_ports)
       - (ssh_listen_ports + firewall_allowed_tcp_ports) | min >= 1
       - (ssh_listen_ports + firewall_allowed_tcp_ports) | max <= 65535
@@ -46,7 +52,6 @@
     group: root
     mode: '0600'
   become: true
-  when: not hardening_firewall.marker_exists
 
 # UFW's CLI is itself idempotent. No new collection is needed; report actual
 # rule additions/updates only, and never reset/delete an existing ruleset.

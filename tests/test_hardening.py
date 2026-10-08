@@ -1,12 +1,14 @@
 """Stage 3 tests use synthetic inventories/files and prohibit real SSH/UFW calls."""
 
 import copy
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -32,6 +34,8 @@ adoption = load('ssh_adoption', 'library/portfolio_ssh_adopt.py')
 class HardeningTests(unittest.TestCase):
     def setUp(self):
         import tempfile
+        previous_umask = os.umask(0o022)
+        self.addCleanup(os.umask, previous_umask)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
@@ -44,6 +48,26 @@ class HardeningTests(unittest.TestCase):
         self.key.touch(mode=0o600)
         Path(str(self.key) + '.pub').touch(mode=0o600)
         self.tasks = yaml.safe_load((ROOT / 'roles/host_hardening/tasks/main.yml').read_text())
+        metadata_patch = self.trusted_fixture_metadata()
+        metadata_patch.__enter__()
+        self.addCleanup(metadata_patch.__exit__, None, None, None)
+
+    @contextmanager
+    def trusted_fixture_metadata(self):
+        """Supply only synthetic host ownership; keep real modes and controller identity."""
+        original_info, original_adoption = info.trusted_metadata, adoption.trusted_metadata
+        def proxy(path):
+            if not isinstance(path, Path):
+                return path
+            metadata = path.stat()
+            if path in (Path('/tmp'), Path('/')) or path == self.directory or self.directory in path.parents:
+                mode = 0o40755 if path in (Path('/tmp'), Path('/')) else metadata.st_mode
+                return SimpleNamespace(stat=lambda: SimpleNamespace(st_uid=0, st_gid=0, st_mode=mode))
+            return path
+        with patch.object(info, 'trusted_metadata', side_effect=lambda path, *args, **kwargs:
+                          original_info(proxy(path), *args, **kwargs)), \
+                patch.object(adoption, 'trusted_metadata', side_effect=lambda path: original_adoption(proxy(path))):
+            yield
 
     def write_inventory(self):
         self.inventory.write_text(yaml.safe_dump({'all': {'children': {'bootstrap': {
@@ -132,6 +156,9 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(result['report'].count('WARN  UFW package baseline'), 1)
         self.assertIn('existing safe baseline can be adopted', result['report'])
         fake.params['report_only'] = False
+        initial_raw_rules = ('*filter\n:ufw-user-input - [0:0]\n### RULES ###\n'
+                             '\n### END RULES ###\nCOMMIT\n')
+        self.fixture_path('/etc/ufw/user.rules').write_text(initial_raw_rules)
         first = self.inspect(fake)
         task = copy.deepcopy(next(task for task in self.tasks if
             task.get('ansible.builtin.copy', {}).get('dest') == '/etc/ufw/portfolio-hardening.json'))
@@ -155,9 +182,17 @@ class HardeningTests(unittest.TestCase):
         self.status = 'Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n' + '\n'.join(
             f'{p}/tcp{family} ALLOW IN Anywhere{family} # portfolio-host-hardening'
             for p in (2222, 2200, 80, 443) for family in ('', ' (v6)'))
-        self.fixture_path('/etc/ufw/user.rules').write_text('-A ufw-user-input -p tcp --dport 2222 -j ACCEPT\n')
-        fake.params['refresh_rules'] = True
+        comment = '706f7274666f6c696f2d686f73742d68617264656e696e67'
+        owned_raw_rules = ('*filter\n:ufw-user-input - [0:0]\n### RULES ###\n' +
+                           ''.join(f'\n### tuple ### allow tcp {port} 0.0.0.0/0 any 0.0.0.0/0 in comment={comment}\n'
+                                   f'-A ufw-user-input -p tcp --dport {port} -j ACCEPT\n'
+                                   for port in (2222, 2200, 80, 443)) +
+                           '\n### END RULES ###\nCOMMIT\n')
+        self.fixture_path('/etc/ufw/user.rules').write_text(owned_raw_rules)
         refreshed = self.inspect(fake)
+        self.assertIn('baseline', refreshed)
+        self.assertEqual(refreshed['baseline']['recovery'][info.RULE_FILES[0]]['present'],
+                         [80, 443, 2200, 2222])
         final_task = copy.deepcopy(next(task for task in self.tasks if task['name'] ==
                                        'Record the resulting managed firewall rule fingerprints'))
         final_task['ansible.builtin.copy']['dest'] = str(self.marker)
@@ -166,6 +201,7 @@ class HardeningTests(unittest.TestCase):
         final_task.pop('become')
         recorded = self.local_ansible([final_task], {'hardening_after_firewall': refreshed})
         self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+        self.assertEqual(json.loads(self.marker.read_text()), refreshed['baseline'])
         fake.params.update(refresh_rules=False, verify=True)
         for verify in (False, True):
             fake.params['verify'] = verify
@@ -344,6 +380,15 @@ class HardeningTests(unittest.TestCase):
             # Execute exactly the streamed entry point, only remapping paths to fixtures.
             namespace = {'fixture_path': self.fixture_path}
             payload = payload.replace('from pathlib import Path', 'Path = fixture_path')
+            payload = payload.replace('def inspect(module):', '''def trusted_metadata(path, message, private=False):
+    metadata = path.stat()
+    mode = 0o40755 if path in (Path('/tmp'), Path('/')) else metadata.st_mode
+    metadata = SimpleNamespace(st_uid=0, st_gid=0, st_mode=mode)
+    require(metadata.st_uid == metadata.st_gid == 0 and
+            not stat.S_IMODE(metadata.st_mode) & (0o077 if private else 0o022), message)
+
+def inspect(module):''')
+            namespace['SimpleNamespace'] = SimpleNamespace
             output = io.StringIO()
             with patch.object(info.glob, 'glob', return_value=[]), \
                     patch('shutil.which', return_value='/usr/sbin/ufw'), patch('os.geteuid', return_value=0), \
@@ -701,7 +746,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         self.assertNotIn('state: absent', (ROOT / 'roles/host_hardening/tasks/main.yml').read_text())
 
     def fixture_path(self, name):
-        return self.directory / str(name).lstrip('/') if str(name).startswith(('/etc/', '/run/', '/proc/', '/usr/lib/systemd/')) else Path(name)
+        return self.directory / str(name).lstrip('/') if str(name).startswith(('/etc/', '/run/', '/proc/', '/usr/lib/systemd/', '/lib/systemd/')) else Path(name)
 
     def inspection_fixture(self, managed=True, active=True):
         import shutil
@@ -782,14 +827,21 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         fake.run_command.side_effect = command
         self.marker = self.fixture_path('/etc/ufw/portfolio-hardening.json')
         if managed:
-            with patch.object(info, 'Path', side_effect=self.fixture_path):
+            self.marker.parent.mkdir(parents=True, exist_ok=True)
+            self.marker.write_text('{}')
+            self.marker.chmod(0o600)
+            with self.trusted_fixture_metadata(), patch.object(info, 'Path', side_effect=self.fixture_path):
                 baseline = {'base': {name: info.fingerprint(self.fixture_path(name)) for name in info.PROTECTED},
                             'rules': {name: info.fingerprint(self.fixture_path(name)) for name in info.RULE_FILES}}
+            with self.trusted_fixture_metadata():
+                baseline['recovery'] = {name: info.recovery_rules(self.fixture_path(name), []) for name in info.RULE_FILES}
+            baseline['ports'] = [2222, 2200, 80, 443]
             self.marker.write_text(json.dumps(baseline))
+            self.marker.chmod(0o600)
         return fake
 
     def inspect(self, fake):
-        with patch.object(info, 'Path', side_effect=self.fixture_path), patch.object(info, 'STATE', self.marker), \
+        with self.trusted_fixture_metadata(), patch.object(info, 'Path', side_effect=self.fixture_path), patch.object(info, 'STATE', self.marker), \
                 patch.object(info.glob, 'glob', return_value=[]):
             return info.inspect(fake)
 
@@ -1076,7 +1128,21 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         library.mkdir()
         code = (ROOT / 'library/portfolio_hardening_info.py').read_text()
         code = code.replace('from pathlib import Path',
-            f'from pathlib import Path as RealPath\ndef Path(value):\n    return RealPath({str(self.directory)!r}) / str(value).lstrip("/")')
+            f'''from pathlib import Path as RealPath
+from types import SimpleNamespace
+def Path(value):
+    if str(value) in ('/', '/tmp'):
+        return RealPath(value)
+    return RealPath({str(self.directory)!r}) / str(value).lstrip("/")
+''')
+        code = code.replace('def inspect(module):', '''def trusted_metadata(path, message, private=False):
+    metadata = path.stat()
+    mode = 0o40755 if path in (Path('/tmp'), Path('/')) else metadata.st_mode
+    metadata = SimpleNamespace(st_uid=0, st_gid=0, st_mode=mode)
+    require(metadata.st_uid == metadata.st_gid == 0 and
+            not stat.S_IMODE(metadata.st_mode) & (0o077 if private else 0o022), message)
+
+def inspect(module):''')
         code = code.replace('    checks = Findings()\n', f'''    def fixture_command(argv, **kwargs):
         return json.loads(RealPath({str(state)!r}).read_text())[json.dumps(argv)]
     module.run_command = fixture_command
@@ -1545,9 +1611,22 @@ if '-T' in sys.argv:
         library = self.directory / 'library'
         library.mkdir()
         code = (ROOT / 'library/portfolio_ssh_adopt.py').read_text()
+        code = code.replace('from pathlib import Path',
+            f'''from pathlib import Path as RealPath
+def Path(value):
+    if str(value) == '/etc/ssh/portfolio-adoption.pending':
+        return RealPath({str(self.directory)!r}) / 'adoption.pending'
+    return RealPath(value)
+''')
         code = code.replace(repr(adoption.MAIN), repr(str(main)))
         code = code.replace(repr(adoption.INCLUDES), repr(str(snippets / '*.conf')))
         code = code.replace("'/usr/sbin/sshd'", repr(str(validator)))
+        code = code.replace('def adopt(module):', '''def trusted_metadata(path):
+    metadata = path.stat()
+    mode = 0o40755 if path in (Path('/tmp'), Path('/')) else metadata.st_mode
+    require(not stat.S_IMODE(mode) & 0o022)
+
+def adopt(module):''')
         (library / 'fixture_adopt.py').write_text(code)
         task = copy.deepcopy(next(t for t in self.tasks if 'portfolio_ssh_adopt' in t))
         task['fixture_adopt'] = task.pop('portfolio_ssh_adopt')

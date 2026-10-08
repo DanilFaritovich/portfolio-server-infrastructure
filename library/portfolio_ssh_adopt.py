@@ -40,6 +40,8 @@ changed:
 
 import glob
 import hashlib
+import os
+import stat
 from pathlib import Path
 import re
 import tempfile
@@ -57,7 +59,15 @@ def require(condition):
         raise ValueError('SSH adoption source changed or is unsupported; repeat read-only preflight.')
 
 
+def trusted_metadata(path):
+    metadata = path.stat()
+    require(metadata.st_uid == metadata.st_gid == 0 and not stat.S_IMODE(metadata.st_mode) & 0o022)
+
+
 def adopt(module):
+    pending = Path('/etc/ssh/portfolio-adoption.pending')
+    if pending.exists() or pending.is_symlink():
+        raise ValueError('SSH adoption interrupted; inspect main/includes through recovery access before clearing the pending marker.')
     records = module.params['adoption']
     if not records:
         return False
@@ -71,6 +81,10 @@ def adopt(module):
     for source in sources:
         path = Path(source['path'])
         require(path.is_file() and not path.is_symlink())
+        trusted_metadata(path)
+        for parent in path.parents:
+            require(not parent.is_symlink())
+            trusted_metadata(parent)
         data = path.read_bytes()
         require(hashlib.sha256(data).hexdigest() == source['sha256'])
         original[source['path']] = data
@@ -140,6 +154,18 @@ def adopt(module):
             require(not Path(name).is_symlink() and Path(name).read_bytes() == data)
         if module.check_mode:
             return True
+        # Persist the interruption signal before the first replacement. Never
+        # clear it after a failed rollback or an uncatchable termination.
+        with pending.open('x') as handle:
+            os.chmod(pending, 0o600)
+            handle.write('SSH adoption in progress; inspect main and standard includes before retry.\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory_fd = os.open(str(pending.parent), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
         applied = []
         try:
             # Remove the external directive first; the daemon is not reloaded here.
@@ -162,7 +188,9 @@ def adopt(module):
                     rollback_failed = True
             if rollback_failed:
                 raise ValueError('SSH adoption rollback failed; inspect files through recovery access.')
+            pending.unlink()
             raise
+        pending.unlink()
     return True
 
 

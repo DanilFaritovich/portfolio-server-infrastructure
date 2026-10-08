@@ -65,6 +65,7 @@ import glob
 import hashlib
 import ipaddress
 import json
+import stat
 from pathlib import Path
 import re
 
@@ -172,6 +173,102 @@ def fingerprint(path):
     return hashlib.sha256(content).hexdigest()
 
 
+def stock_rule_skeleton(prefix, expanded=False, limits=False, logging='low', blocked=()):
+    """Exact UFW 0.36 stock empty template and CLI-generated scaffolding."""
+    chains = ['user-input', 'user-output', 'user-forward']
+    if expanded:
+        chains += [f'{group}-logging-{direction}' for group in ('before', 'user', 'after')
+                   for direction in ('input', 'output', 'forward')]
+        chains += ['logging-deny', 'logging-allow']
+    if limits:
+        chains += ['user-limit', 'user-limit-accept']
+    header = '*filter\n' + ''.join(f':{prefix}-{chain} - [0:0]\n' for chain in chains) + '### RULES ###\n'
+    rate = (f'-A {prefix}-user-limit -m limit --limit 3/minute -j LOG --log-prefix "[UFW LIMIT BLOCK] "\n'
+            if limits and logging != 'off' else '')
+    if limits:
+        rate += f'-A {prefix}-user-limit -j REJECT\n-A {prefix}-user-limit-accept -j ACCEPT\n'
+    if not expanded:
+        return header + rate + 'COMMIT\n'
+    footer = '\n### END RULES ###\n\n### LOGGING ###\n'
+    limit = '-m limit --limit 3/min --limit-burst 10'
+    if logging == 'off':
+        footer += ''.join(f'-I {prefix}-user-logging-{direction} -j RETURN\n'
+                          for direction in ('input', 'output', 'forward'))
+    else:
+        footer += ''.join(f'-A {prefix}-after-logging-{direction} -j LOG --log-prefix "[UFW BLOCK] " {limit}\n'
+                          for direction in ('input', 'output', 'forward') if direction in blocked)
+        footer += (f'-I {prefix}-logging-deny -m conntrack --ctstate INVALID -j RETURN {limit}\n'
+                   f'-A {prefix}-logging-deny -j LOG --log-prefix "[UFW BLOCK] " {limit}\n'
+                   f'-A {prefix}-logging-allow -j LOG --log-prefix "[UFW ALLOW] " {limit}\n')
+    footer += '### END LOGGING ###\n'
+    if limits:
+        footer += '\n### RATE LIMITING ###\n' + rate + '### END RATE LIMITING ###\n'
+    return header + footer + 'COMMIT\n'
+
+
+def stock_recovery_bytes(text, prefix):
+    # Only byte-for-byte stock layouts can cross the first CLI rewrite. Custom
+    # comments/chains/logging remain fingerprinted as-is. Forward/logging settings
+    # are protected; only authorized input/output default-policy variants vary.
+    default = Path('/etc/default/ufw')
+    config = Path('/etc/ufw/ufw.conf')
+    safe_file(default, 'Unsafe UFW default configuration.')
+    safe_file(config, 'Unsafe UFW boot configuration.')
+    level = re.findall(r'^LOGLEVEL=(low|off)$', config.read_text(), re.M)
+    forward = re.findall(r'^DEFAULT_FORWARD_POLICY="(ACCEPT|DROP|REJECT)"$', default.read_text(), re.M)
+    if len(level) != 1 or len(forward) != 1:
+        return text.encode()
+    minimum = stock_rule_skeleton(prefix, limits=prefix == 'ufw')
+    if text == minimum:
+        return ('stock UFW scaffolding ' + prefix + level[0] + forward[0]).encode()
+    for limits in ((True,) if prefix == 'ufw' else (False, True)):
+        for incoming in (False, True):
+            for outgoing in (False, True):
+                blocked = ({'input'} if incoming else set()) | ({'output'} if outgoing else set())
+                if forward[0] != 'ACCEPT':
+                    blocked.add('forward')
+                if text == stock_rule_skeleton(prefix, True, limits, level[0], blocked):
+                    return ('stock UFW scaffolding ' + prefix + level[0] + forward[0]).encode()
+    return text.encode()
+
+
+def recovery_rules(path, allowed):
+    """Fingerprint all bytes except exact authorized UFW TCP allow blocks."""
+    if not safe_file(path, 'Unsafe UFW recovery rules.', optional=True):
+        return None
+    text = path.read_text()
+    prefix, anywhere = ('ufw6', '::/0') if path.name == 'user6.rules' else ('ufw', '0.0.0.0/0')
+    if text == stock_rule_skeleton(prefix, limits=prefix == 'ufw'):
+        normalized = stock_recovery_bytes(text, prefix)
+        require(normalized != text.encode(),
+                'Initial UFW template requires standard LOGLEVEL=low/off and DEFAULT_FORWARD_POLICY for safe recovery.')
+        return {'sha256': hashlib.sha256(normalized).hexdigest(), 'present': []}
+    if '### RULES ###\n' not in text:
+        # Older/nonstandard empty files remain adoptable, but cannot recover
+        # across a format rewrite. Do not guess or discard unknown bytes.
+        return {'sha256': hashlib.sha256(text.encode()).hexdigest(), 'present': []}
+    require(text.count('### RULES ###\n') == text.count('### END RULES ###\n') == 1,
+            'Ambiguous UFW raw rule sections.')
+    head, tail = text.split('### RULES ###\n')
+    body, foot = tail.split('### END RULES ###\n')
+    prefix, anywhere = ('ufw6', '::/0') if path.name == 'user6.rules' else ('ufw', '0.0.0.0/0')
+    comment = 'portfolio-host-hardening'.encode().hex()
+    pattern = (r'\n### tuple ### allow tcp ([0-9]+) ' + re.escape(anywhere) +
+               r' any ' + re.escape(anywhere) + r' in comment=' + comment +
+               r'\n-A ' + prefix + r'-user-input -p tcp --dport \1 -j ACCEPT\n')
+    seen = set()
+    def remove(match):
+        port = int(match[1])
+        require(match[1] == str(port) and port in allowed and port not in seen, 'Unauthorized or duplicate raw UFW allow rule.')
+        seen.add(port)
+        return ''
+    body = re.sub(pattern, remove, body)
+    require(body == '\n', 'Unsupported raw UFW rule bytes; recovery is blocked.')
+    normalized = head + '### RULES ###\n\n### END RULES ###\n' + foot
+    return {'sha256': hashlib.sha256(stock_recovery_bytes(normalized, prefix)).hexdigest(),
+            'present': sorted(seen)}
+
+
 def pristine_rules(path):
     """An empty UFW user file may only contain stock chains/logging/limit helpers."""
     if not path.exists():
@@ -185,7 +282,7 @@ def pristine_rules(path):
     for line in text.splitlines():
         if not line.strip() or line.startswith('#') or line in ('*filter', 'COMMIT') or line in helpers:
             continue
-        require(re.fullmatch(r':' + prefix + r'-user-(?:input|output|forward|logging-input|logging-output|logging-forward|limit|limit-accept) - \[0:0\]', line),
+        require(re.fullmatch(r':' + prefix + r'-(?:user-(?:input|output|forward|logging-input|logging-output|logging-forward|limit|limit-accept)|(?:before|after)-logging-(?:input|output|forward)|logging-(?:deny|allow)) - \[0:0\]', line),
                 'Unmanaged raw UFW user rules detected.')
 
 
@@ -241,7 +338,12 @@ def stock_unit(unit, name, socket_mode=False, ipv6_only=False, findings=None):
         require(unit['FragmentPath'] in ('/usr/lib/systemd/system/' + name, '/lib/systemd/system/' + name),
                 'Custom systemd unit detected.')
         path = Path(unit['FragmentPath'])
-        require(path.is_file() and not path.is_symlink(), 'Unsafe systemd unit file type.')
+        # Ubuntu usrmerge exposes /lib through /usr/lib. Permit only this
+        # package path alias, never arbitrary symlinked unit files.
+        if str(path).startswith('/lib/'):
+            require(str(path.resolve()) == '/usr/lib/systemd/system/' + name, 'Unsafe systemd unit path.')
+            path = Path('/usr/lib/systemd/system/' + name)
+        safe_file(path, 'Unsafe systemd unit file type.')
     check(name + ' package unit file', fragment)
     generated = None
     dropins = set(unit['DropInPaths'].split())
@@ -252,8 +354,7 @@ def stock_unit(unit, name, socket_mode=False, ipv6_only=False, findings=None):
         check(name + ' unit override in ' + root, override)
         def directory_files(root=root):
             directory = Path(root + '/' + name + '.d')
-            require(not directory.is_symlink() and (not directory.exists() or directory.is_dir()),
-                    'Unsupported systemd drop-in directory.')
+            safe_directory(directory, 'Unsafe systemd drop-in directory ownership, permissions or type.')
             return [root + '/' + name + '.d/' + path.name for path in directory.glob('*.conf')]
         files = check(name + ' drop-in directory in ' + root, directory_files)
         if files is not None:
@@ -372,11 +473,30 @@ class Findings:
         return {'ready': blockers == 0, 'findings': self.items, 'report': '\n'.join(lines)}
 
 
+def trusted_metadata(path, message, private=False):
+    metadata = path.stat()
+    require(metadata.st_uid == metadata.st_gid == 0 and
+            not stat.S_IMODE(metadata.st_mode) & (0o077 if private else 0o022), message)
+
+
+def safe_directory(path, message):
+    require(not path.is_symlink() and all(not parent.is_symlink() for parent in path.parents) and
+            (not path.exists() or path.is_dir()), message)
+    for directory in (path, *path.parents):
+        if directory.exists():
+            trusted_metadata(directory, message)
+
+
 def safe_file(path, message, optional=False):
     # Check symlinks before exists(), including dangling links. Never read devices
     # or FIFOs, nor follow a symlinked configuration directory.
     require(not path.is_symlink() and all(not parent.is_symlink() for parent in path.parents), message)
     require((optional and not path.exists()) or path.is_file(), message)
+    if path.exists():
+        trusted_metadata(path, message)
+    for parent in path.parents:
+        if parent.exists():
+            trusted_metadata(parent, message)
     return path.exists()
 
 
@@ -399,6 +519,12 @@ def inspect(module):
     checks.probe('Ubuntu host', lambda: require(
         re.search(r'^ID=[\"\']?ubuntu[\"\']?$', Path('/etc/os-release').read_text(), re.M),
         'Hardening supports Ubuntu only.'))
+    checks.probe('SSH adoption transaction', lambda: require(
+        not Path('/etc/ssh/portfolio-adoption.pending').exists() and
+        not Path('/etc/ssh/portfolio-adoption.pending').is_symlink(),
+        'Interrupted SSH adoption: disk files may be partially replaced while live listeners remain unchanged. '
+        'Use recovery access to inspect main/includes, restore or finish the approved tree, validate sshd -t and '
+        'effective ports before clearing /etc/ssh/portfolio-adoption.pending. Do not reload or retry blindly.'))
     installed = module.get_bin_path('ufw') is not None
 
     def activation():
@@ -477,8 +603,7 @@ def inspect(module):
     for name in ('/etc/ssh', '/etc/ssh/sshd_config.d'):
         def ssh_directory(name=name):
             path = Path(name)
-            require(not path.is_symlink() and (not path.exists() or path.is_dir()),
-                    'Unsupported SSH configuration directory type.')
+            safe_directory(path, 'Unsafe SSH directory ownership, permissions or type.')
         checks.probe('SSH configuration directory ' + name, ssh_directory)
     sources, legacy = [], []
     main_managed = False
@@ -631,16 +756,39 @@ def inspect(module):
         def marker():
             if not safe_file(STATE, 'Unsafe UFW ownership marker.', optional=True):
                 return False
+            trusted_metadata(STATE, 'Unsafe UFW ownership marker permissions.', private=True)
             previous = json.loads(STATE.read_text())
-            require(isinstance(previous, dict) and set(previous) == {'base', 'rules'} and
+            require(isinstance(previous, dict) and set(previous) in ({'base', 'rules'}, {'base', 'rules', 'recovery', 'ports'}) and
                     isinstance(previous['base'], dict) and isinstance(previous['rules'], dict), 'Unsafe UFW ownership marker.')
+            if 'recovery' in previous:
+                authorized = ports(previous['ports'])
+                require(isinstance(previous['recovery'], dict) and set(previous['recovery']) == set(RULE_FILES),
+                        'Malformed UFW recovery baseline.')
+                for entry in previous['recovery'].values():
+                    require(isinstance(entry, dict) and set(entry) == {'sha256', 'present'} and
+                            isinstance(entry['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', entry['sha256']) and
+                            set(ports(entry['present'], empty=True)) <= set(authorized), 'Malformed UFW recovery baseline.')
             return previous
         previous = checks.probe('UFW ownership marker', marker)
         if isinstance(previous, dict):
             checks.probe('protected UFW base configuration', lambda: require(previous['base'] == base,
                          'Protected UFW configuration changed outside the role.'))
-            checks.probe('protected raw UFW rules', lambda: require(module.params['refresh_rules'] or previous['rules'] == hashes,
-                         'Raw UFW user rules changed outside the role.'))
+            def raw_owned():
+                if previous['rules'] == hashes:
+                    return
+                require('recovery' in previous and set(previous['ports']) <= wanted,
+                        'Raw UFW user rules changed without an authorized recovery baseline.')
+                normalized = {name: recovery_rules(Path(name), set(previous['ports'])) for name in RULE_FILES}
+                require(set(previous['recovery']) == set(RULE_FILES) and all(
+                    normalized[name] is not None and previous['recovery'][name] is not None and
+                    normalized[name]['sha256'] == previous['recovery'][name]['sha256'] and
+                    set(previous['recovery'][name]['present']) <= set(normalized[name]['present'])
+                    for name in RULE_FILES), 'Raw UFW user rules changed outside the role.')
+                require(not verify or module.params['refresh_rules'],
+                        'Interrupted UFW transaction: run harden to finish authorized rules and record final fingerprints.')
+                checks.convergence('authorized UFW transaction recovery', False, False,
+                                   'Harden can finish the exact previously authorized UFW rule additions.')
+            checks.probe('protected raw UFW rules', raw_owned)
         elif previous is False:
             checks.probe('unmanaged UFW ownership', lambda: require(not active and not rules,
                          'Existing UFW state is not owned by this role.'), active is not None and rules is not None)
@@ -649,6 +797,13 @@ def inspect(module):
                     safe_file(Path(name), 'Unexpected UFW configuration file type.', optional=True)
                     pristine_rules(Path(name))
                 checks.probe('pristine raw UFW rules ' + name, raw_rules)
+        if wanted is not None:
+            recovery = checks.probe('UFW recovery baseline', lambda: {
+                name: recovery_rules(Path(name), wanted) for name in RULE_FILES})
+            if recovery is not None:
+                checks.probe('UFW recovery files present', lambda: require(all(value is not None for value in recovery.values()),
+                             'Missing UFW raw rule files cannot be safely recovered.'))
+                snapshot.update(recovery=recovery, ports=sorted(wanted))
         def defaults():
             path = Path('/etc/default/ufw')
             safe_file(path, 'Unexpected UFW configuration file type.')
