@@ -727,13 +727,13 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
                          [handlers[i]['name'] for i in (0, 1)])
 
     def test_offline_make_and_verification_have_no_mutation_or_live_calls(self):
-        for target in ('harden', 'verify-hardening', 'check', 'ci'):
+        for target in ('harden', 'verify-hardening', 'reboot-host', 'check', 'ci'):
             result = subprocess.run(['make', '-n', target], cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             if target in ('check', 'ci'):
                 self.assertNotIn('scripts/access.py', result.stdout)
                 self.assertNotIn('inventories/production.yml', result.stdout)
-                for playbook in ('harden', 'verify-hardening'):
+                for playbook in ('harden', 'verify-hardening', 'reboot-host'):
                     self.assertIn(f'--syntax-check -i inventories/production.example.yml playbooks/{playbook}.yml', result.stdout)
             else:
                 self.assertIn(f'scripts/access.py {target} ', result.stdout)

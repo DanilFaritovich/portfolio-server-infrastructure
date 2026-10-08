@@ -285,15 +285,36 @@ def inspect_host(host, port, interpreter, key, inputs):
     require(result['ready'], 'Resolve all FAIL findings before make harden. WARN findings can converge safely.')
 
 
+def verify_hardening(inventory, alias, host, port, stage, inputs):
+    # Each selected verification port gets a new independent connection. Reuse the
+    # already trusted host identity via HostKeyAlias; never scan/accept keys.
+    identity = host if port == 22 else f'[{host}]:{port}'
+    print('LIVE / POST-CONVERGENCE VERIFY: all ssh_listen_ports are required on the server; '
+          'fresh SSH access is required on every ssh_verify_ports entry.', flush=True)
+    for target_port in inputs['ssh_verify_ports']:
+        connection = stage | {'ansible_port': target_port,
+                              'ansible_ssh_args': stage['ansible_ssh_args'] + f' -o HostKeyAlias={identity}'}
+        try:
+            run_playbook(inventory, alias, connection, 'verify.yml')
+        except subprocess.CalledProcessError:
+            print(f'Post-convergence access verification failed on configured SSH port {target_port}. '
+                  'Stop and check make verify-access on the current inventory route and recovery access. '
+                  'A future port may be unavailable until make harden succeeds.', flush=True)
+            raise
+        run_playbook(inventory, alias, connection | inputs, 'verify-hardening.yml')
+
+
 def live(mode, inventory, key):
     prerequisites(mode)
-    if mode in ('docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening'):
+    if mode in ('docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host'):
         try:
             check_key(key)
         except (ValueError, OSError):
             raise ValueError('Managed access is not ready. Run make bootstrap-user first; check the dedicated key pair.') from None
     alias, host, port, user, interpreter = load_host(inventory, validate_hardening=mode != 'inspect-hardening')
-    inputs = hardening_inputs(inventory, alias, port, validate=mode != 'inspect-hardening') if mode in ('harden', 'verify-hardening', 'inspect-hardening') else {}
+    inputs = hardening_inputs(inventory, alias, port, validate=mode != 'inspect-hardening') if mode in ('harden', 'verify-hardening', 'inspect-hardening', 'reboot-host') else {}
+    if mode == 'reboot-host':
+        require(sys.stdin.isatty(), 'Reboot requires an interactive terminal; no reboot was requested.')
     known_host(host, port, allow_trust=mode == 'bootstrap-user')
     if mode == 'inspect-hardening':
         inspect_host(host, port, interpreter, key, inputs)
@@ -325,7 +346,37 @@ def live(mode, inventory, key):
                             ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
                             ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
     }
-    run_playbook(inventory, alias, managed, 'verify.yml')
+    try:
+        run_playbook(inventory, alias, managed, 'verify.yml')
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        if mode == 'reboot-host':
+            raise ValueError('Pre-reboot key-only SSH/sudo verification failed; no reboot was requested. '
+                             'Stop and check make verify-access and recovery access.') from None
+        raise
+    if mode == 'reboot-host':
+        print(f'LIVE / MUTATING: reboot {host}:{port}. Keep provider console/recovery access. '
+              'Docker verification afterward may change the image cache.', flush=True)
+        try:
+            answer = input('Reboot this host now? [y/N] ')
+        except (EOFError, KeyboardInterrupt):
+            answer = ''
+        require(answer.strip().lower() in ('y', 'yes'), 'Reboot declined; no reboot was requested.')
+        stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
+        stage['ansible_become_flags'] = '-n'
+        phase = 'reboot and bounded SSH recovery'
+        try:
+            run_playbook(inventory, alias, stage | {'reboot_host_confirmed': True}, 'reboot-host.yml')
+            phase = 'verify-access after reboot'
+            run_playbook(inventory, alias, managed, 'verify.yml')
+            phase = 'verify-docker after reboot'
+            run_playbook(inventory, alias, stage, 'verify-docker.yml')
+            phase = 'verify-hardening after reboot'
+            verify_hardening(inventory, alias, host, port, stage, inputs)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            raise ValueError(f'{phase} failed; the host may already have rebooted. Stop and use provider '
+                             'console/recovery access; do not repeat reboot blindly. No later checks ran.') from None
+        print('Reboot and access/Docker/hardening verification completed. STOP.')
+        return
     if mode in ('docker-host', 'verify-docker'):
         print('LIVE / MUTATING: Docker host provisioning.' if mode == 'docker-host' else
               'LIVE / VERIFY: Docker checks and disposable runtime smoke test (image cache may change).', flush=True)
@@ -338,28 +389,13 @@ def live(mode, inventory, key):
         if mode == 'harden':
             print('LIVE / MUTATING: UFW and SSH listening ports. Keep provider recovery console access.', flush=True)
             run_playbook(inventory, alias, stage | inputs, 'harden.yml')
-        # Each selected verification port gets a new independent connection. Reuse the
-        # already trusted host identity via HostKeyAlias; never scan/accept keys.
-        identity = host if port == 22 else f'[{host}]:{port}'
-        print('LIVE / POST-CONVERGENCE VERIFY: all ssh_listen_ports are required on the server; '
-              'fresh SSH access is required on every ssh_verify_ports entry.', flush=True)
-        for target_port in inputs['ssh_verify_ports']:
-            connection = stage | {'ansible_port': target_port,
-                                  'ansible_ssh_args': stage['ansible_ssh_args'] + f' -o HostKeyAlias={identity}'}
-            try:
-                run_playbook(inventory, alias, connection, 'verify.yml')
-            except subprocess.CalledProcessError:
-                print(f'Post-convergence access verification failed on configured SSH port {target_port}. '
-                      'Stop and check make verify-access on the current inventory route and recovery access. '
-                      'A future port may be unavailable until make harden succeeds.', flush=True)
-                raise
-            run_playbook(inventory, alias, connection | inputs, 'verify-hardening.yml')
+        verify_hardening(inventory, alias, host, port, stage, inputs)
     print('Requested stage completed. STOP.')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening'])
+    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=str(DEFAULT_KEY))
     args = parser.parse_args()

@@ -163,6 +163,7 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make inspect-hardening` | Report all Stage 3 safety findings before harden | **LIVE / read-only**, exit 0 for PASS/WARN, non-zero for FAIL |
 | `make harden` | Configure UFW and validated SSH listening ports | **LIVE / MUTATING**, managed key-only access |
 | `make verify-hardening` | Verify server SSH listeners, selected SSH access ports, UFW and active Docker/containerd | **LIVE / verification**, no managed state changes |
+| `make reboot-host` | Verify access, confirm reboot, wait for recovery, then verify access/Docker/hardening | **LIVE / MUTATING**, interactive confirmation; image cache may change |
 | `make check` | YAML/Ansible lint, syntax, actionlint, wrapper tests | **OFFLINE** |
 | `make ci` | Same offline checks as `make check` | **OFFLINE** |
 
@@ -185,7 +186,7 @@ isolation, preflight failure before provisioning, example inventory rejection,
 Make/CI offline boundaries, unchanged probes and guaranteed smoke cleanup.
 Selected safety assertions and daemon-policy convergence run with real Ansible
 on temporary local fixtures with network connections blocked. Syntax checks
-cover all six entry-point playbooks; lint includes all three roles.
+cover all seven entry-point playbooks; lint includes all three roles.
 
 Checks always use `inventories/production.example.yml`, never production
 inventory, keys, passwords or VPS connections. Wrapper tests use temporary
@@ -524,6 +525,38 @@ make verify-hardening
 The second `make harden` must report `changed=0` if external state has not changed.
 The agent runs offline checks only; live safety, listeners and idempotency require
 this manual validation. STOP after Stage 3.
+
+## Confirmed host reboot
+
+After successful Stage 3 verification, invoke `make reboot-host` as a separate
+maintenance operation. It is not an automatic provisioning step. First verify
+provider-console/recovery access and provider-side SSH rules: reboot will end
+existing SSH sessions. Use the same overrides as the other verification commands:
+
+```bash
+make reboot-host INVENTORY=/path/to/local-inventory.yml AUTOMATION_KEY=/path/to/automation-key
+```
+
+The wrapper first verifies key-only SSH as `ansible` and `sudo -n` on the current
+inventory port. It then asks `Reboot this host now? [y/N]` in an interactive terminal.
+Only `y`/`yes` authorizes reboot; empty input, refusal, EOF, or Ctrl-C stops the command.
+Without a TTY it rejects the request before host contact; there is no unattended or
+force mode. Existing inventory, automation key, and host trust are reused; no key is
+created and password authentication/sudo prompts remain disabled.
+
+`playbooks/reboot-host.yml` uses `ansible.builtin.reboot` with `reboot_timeout: 300`,
+`connect_timeout: 10`, and `post_reboot_delay: 5`. Ansible separately bounds waiting
+for a new boot ID and the readiness test: allow approximately 600 seconds plus the
+delay and SSH/Ansible overhead. After recovery it runs `verify-access`, `verify-docker`,
+and `verify-hardening` checks in order with the same inventory/key, including fresh
+access on every `ssh_verify_ports` and all server listeners. The Docker smoke test
+may change the image cache; no firewall/SSH provisioning runs. Failure returns a
+non-zero status identifying the failed phase and stops later checks. The host may
+already have rebooted: use recovery console access and do not repeat reboot blindly.
+Human-access policy and application deployment remain separate stages.
+
+Offline tests mock all remote/reboot calls; `make check`/CI perform only playbook
+syntax checks and local validation. The agent has not performed a real reboot.
 
 ## Overrides and troubleshooting
 

@@ -162,6 +162,7 @@ password prompts и agent. Paramiko используется только для
 | `make inspect-hardening` | Собрать все Stage 3 safety findings перед harden | **LIVE / read-only**, exit 0 для PASS/WARN, non-zero для FAIL |
 | `make harden` | Настроить UFW и validated SSH listening ports | **LIVE / MUTATING**, managed key-only access |
 | `make verify-hardening` | Проверить все SSH-порты, UFW и active Docker/containerd | **LIVE / verification**, без изменения managed state |
+| `make reboot-host` | Проверить доступ, подтвердить reboot, дождаться восстановления и проверить access/Docker/hardening | **LIVE / MUTATING**, интерактивное подтверждение, возможны изменения image cache |
 | `make check` | YAML/Ansible lint, syntax, actionlint, wrapper tests | **OFFLINE** |
 | `make ci` | Те же offline checks, что у `make check` | **OFFLINE** |
 
@@ -182,7 +183,7 @@ Docker regression tests проверяют managed key-only orchestration, isola
 connection overlay, остановку при preflight failure, отклонение example inventory,
 Make/CI offline boundaries, unchanged probes и smoke cleanup. Выбранные safety
 assertions и convergence daemon policy выполняются реальным Ansible на временных
-local fixtures с заблокированной сетью. Syntax-check покрывает все шесть
+local fixtures с заблокированной сетью. Syntax-check покрывает все семь
 playbooks; lint проверяет все три роли.
 
 Checks всегда используют `inventories/production.example.yml`, никогда —
@@ -526,6 +527,39 @@ make verify-hardening
 Второй `make harden` должен дать `changed=0`, если external state не изменился.
 Агент выполняет только offline checks; live safety, listeners и идемпотентность
 подтверждаются вручную. После Stage 3 — STOP.
+
+## Подтверждённая перезагрузка хоста
+
+После успешной проверки Stage 3 можно отдельно выполнить `make reboot-host`.
+Это явная операция обслуживания, а не автоматический шаг provisioning. Перед
+запуском проверьте provider-console/recovery access и provider-side SSH rules:
+reboot прервёт текущие SSH sessions. Используйте те же overrides, что при остальных
+проверках:
+
+```bash
+make reboot-host INVENTORY=/path/to/local-inventory.yml AUTOMATION_KEY=/path/to/automation-key
+```
+
+Wrapper сначала проверяет key-only SSH как `ansible` и `sudo -n` на текущем inventory
+порту. Затем в интерактивном терминале спрашивает `Reboot this host now? [y/N]`.
+Только `y`/`yes` разрешают reboot; пустой ответ, отказ, EOF или Ctrl-C останавливают
+команду. Без TTY запуск отклоняется до обращения к хосту; unattended/force режима нет.
+Существующие inventory, ключ и host trust сохраняются; новые ключи не создаются,
+password authentication и sudo prompts запрещены.
+
+`playbooks/reboot-host.yml` использует `ansible.builtin.reboot` с `reboot_timeout: 300`,
+`connect_timeout: 10` и `post_reboot_delay: 5`. Ansible отдельно ограничивает ожидание
+нового boot ID и readiness test: возможны примерно 600 секунд ожидания плюс задержка
+и SSH/Ansible overhead. После восстановления последовательно выполняются проверки
+`verify-access`, `verify-docker`, `verify-hardening` с теми же inventory и ключом,
+включая независимый доступ на каждом `ssh_verify_ports` и все server listeners.
+Docker smoke test может изменить image cache; firewall/SSH provisioning не запускается.
+При ошибке возвращается non-zero status с указанием failed phase, последующие проверки
+не выполняются. Reboot уже мог произойти: используйте recovery console и не повторяйте
+его вслепую. Human-access policy и application deployment остаются отдельными stages.
+
+Offline-тесты подменяют все remote/reboot вызовы; `make check`/CI выполняют только
+syntax-check этого playbook и локальные проверки. Агент не выполнял реальный reboot.
 
 ## Переопределения и troubleshooting
 
