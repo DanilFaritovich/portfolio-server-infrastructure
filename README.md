@@ -8,7 +8,8 @@ Host provisioning through Ansible for an Ubuntu VPS. The pipeline is:
 local setup -> bootstrap managed ansible user -> verify access
 -> provision Docker host -> verify Docker
 -> firewall + validated SSH host ports -> verify hardening
--> human access -> verify users -> final SSH policy -> verify SSH security -> STOP
+-> human access -> verify users -> final SSH policy -> verify SSH security
+-> separately confirmed server operations -> verify operations -> STOP
 ```
 
 Docker Engine, Compose and Buildx are prepared for future workloads. Caddy,
@@ -165,6 +166,9 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make harden` | Configure UFW and validated SSH listening ports | **LIVE / MUTATING**, managed key-only access |
 | `make verify-hardening` | Verify server SSH listeners, selected SSH access ports, UFW and active Docker/containerd | **LIVE / verification**, no managed state changes |
 | `make reboot-host` | Verify access, confirm reboot, wait for recovery, then verify access/Docker/hardening | **LIVE / MUTATING**, interactive confirmation; image cache may change |
+| `make inspect-operations` | Inspect Stage 5 readiness | **LIVE / read-only** |
+| `make setup-operations` | Configure security updates and bounded journals | **LIVE / MUTATING**, explicit TTY confirmation |
+| `make verify-operations` | Verify Stage 5 state | **LIVE / read-only** |
 | `make check` | YAML/Ansible lint, syntax, actionlint, wrapper tests | **OFFLINE** |
 | `make ci` | Same offline checks as `make check` | **OFFLINE** |
 
@@ -736,3 +740,137 @@ live Stage 3 verification, `add-user`, `verify-user`, `secure-ssh`, and
 idempotency, then add/verify another ordinary user after hardening. Exercise failures
 (denied confirmation, bad key, unmanaged account, conflicting sudo, Match/include,
 interrupted activation) only on disposable fixtures or a recoverable test VPS.
+
+## Server operations and maintenance (Stage 5)
+
+Run Stage 5 separately after Stage 4. Application deployment remains separate.
+`inspect-operations` and `verify-operations` use strict key-only OpenSSH, existing
+host trust and `sudo -n`; they stream standard-library Python through stdin with
+`-I -B`, without remote payload files, cache updates, package refreshes, smoke
+containers or journal writes. Normal SSH/sudo audit records may still be generated.
+All commands first inspect Stage 3 hardening; Stage 5 also requires the Stage 4
+final root/password/keyboard-interactive policy. Only the current inventory SSH
+route is used; use Stage 3/4 verification separately to re-prove all routes and
+human administrator access.
+
+| Command | Behavior |
+| --- | --- |
+| `make inspect-operations` | LIVE/read-only preflight; PASS/WARN are ready, FAIL blocks |
+| `make setup-operations` | LIVE/mutating; preflight then TTY confirmation `[y/N]`, default deny |
+| `make verify-operations` | LIVE/read-only; require installed policy, packages, timers and limits |
+
+Setup installs `unattended-upgrades` and `logrotate` with `state: present`, without
+an immediate package-index refresh or upgrade. It manages one marked APT file,
+clears inherited origin allowlists and permits only Ubuntu's release-specific
+`-security` origin. Docker's third-party origin, normal `-updates`, ESM and other
+origins are excluded. Automatic reboot and automatic package/kernel removal are
+disabled. Enabled `apt-daily`, `apt-daily-upgrade` and `logrotate` timers perform
+scheduled work later; overdue timers may run shortly after setup. Security updates
+can restart affected services through package maintainer scripts. Keep recovery
+access and choose a maintenance window. Package installation needs usable cached
+APT indexes and network access; failures stop without automatic recovery.
+Already-running APT maintenance services block policy transitions; wait for
+completion and inspect again rather than deleting lock files.
+
+Journald defaults: persistent journal cap 256 MiB, runtime cap 64 MiB, 512 MiB
+reserved free space, retention 14 days and compression. Role defaults in
+`roles/server_operations/defaults/main.yml` parameterize these bounds; operational
+variables do not belong in the restricted inventory. Only a changed journald file
+notifies its restart handler. Repeat unchanged setup should report `changed=0`;
+this has to be confirmed on your VPS. Existing journals age out during normal
+rotation; setup never vacuums or deletes them. Limits are per journal namespace
+and do not cap arbitrary application files. Non-default journal namespaces are
+outside this stage.
+
+System logrotate must have a finite global rotation count (1–52); entries may
+override it with 0–52. Only the standard `/etc/logrotate.d` include is supported.
+Preflight reports exact escaped configuration paths and expected/actual state.
+Missing role-owned files and the journald drop-in directory are WARN before setup
+and FAIL during verification; unsafe existing files, ancestors or symlinks always
+FAIL. Native `apt-config` validates installed syntax and effective values; the
+prospective configuration is replayed through stdin in APT load order, with the
+managed file inserted at its actual position and the main `apt.conf` last. No
+hooks, shell commands or package operations are executed. Hash comments, scopes,
+lists, regex and unrelated vendor hooks are handled by APT itself. There are no
+filename-based policy exceptions: standard periodic settings such as those in
+`10periodic` can coexist if the candidate converges safely. Late/main overrides,
+unknown policy controls, unsafe reboot/removal/authentication settings,
+uninspected includes and redirected configuration sources block setup.
+The stock `Unattended-Upgrade::DevRelease` controls whether unattended upgrades
+run on a development release; it does not authorize additional origins or upgrade
+the distribution. On identified stable Ubuntu (including Noble 24.04 LTS),
+`auto`, `false` and `true` are valid. Unknown values, nested controls, missing or
+conflicting release identity fail closed. Development releases are unsupported:
+`auto` may enable updates near release day, `true` enables them, while `false`
+disables them and therefore cannot satisfy Stage 5 security-update guarantees.
+Both installed and prospective APT policy are checked with the same release
+classification from `/etc/os-release` and optional `/etc/lsb-release`.
+Independent journald settings such as `ForwardToSyslog` coexist; unmanaged
+retention controls and unknown/invalid settings remain blocking. Reports expose
+paths, key names and line numbers without configuration values or command text.
+Preflight also refuses unsafe/symlinked managed paths, masked/custom
+maintenance units or drop-ins, failed critical services, incomplete dpkg state,
+and low disk/inode headroom. Configurations that fail must be reconciled manually;
+setup never resets or adopts unrelated files. It verifies system logrotate in
+`--debug` mode without rotating or changing its state file. Stage 2 Docker
+`local` logging with `20m`/`5` is required in the daemon and every existing
+container; existing containers keep their creation-time logging settings and
+must be reviewed/recreated separately if incompatible. No Docker restart, prune,
+network, public port or external monitoring service is added.
+
+Diagnostics show load per CPU, available RAM, swap use, free disk/inodes for `/`,
+`/var`, `/var/log`, `/var/lib/docker`, SSH/socket, Docker/containerd, journald,
+timers, failed units, effective update policy and journal limits. Disk below
+10% or 512 MiB, or inodes below 5%, blocks setup. RAM below 15%, load/core above 1,
+swap above 50% or absent swap produce WARN. Reboot-required and APT/update-run
+stamps older than three days also produce WARN: stamps show scheduling activity,
+not proof that every security update installed successfully. Inspection is a
+snapshot using cached metadata; it does not refresh indexes, simulate an upgrade,
+count outstanding security packages, install updates or schedule monitoring.
+Service health means systemd state, not application availability. Probe timeout
+or malformed state fails closed; raw command stderr/configuration/logs are hidden.
+
+Manual verification sequence (not executed during implementation):
+
+```bash
+make deps               # if local pinned tools are not installed; registry access
+make check              # offline regressions, lint and example-inventory syntax
+# Only after reviewing code, local inventory, keys and provider recovery access:
+make inspect-operations
+make setup-operations   # explicitly confirm in the terminal
+make verify-operations
+make setup-operations   # confirm again; expect changed=0 with no drift
+make verify-operations
+```
+
+These commands support existing `INVENTORY` and `AUTOMATION_KEY` overrides. Do not
+use a live `--check` as an offline test. Stage 5 adds no automatic reboot: when
+reboot is pending, separately approve `make reboot-host`, then repeat
+`make verify-operations`; reboot-host's existing verification includes a Docker
+smoke container and may populate the image cache.
+
+Recovery is manual. If SSH fails, stop retries and use the provider console.
+Inspect `systemctl status ssh.service ssh.socket --no-pager`, `sshd -t`,
+`sshd -T`, `ss -lnt` and `ufw status verbose`; compare Stage 3 ports and Stage 4
+policy before any edit/reload. Preserve an open recovery session and verify
+managed and human key-only access independently before leaving it. Never restore
+root/password login or reset UFW as an automatic fallback.
+
+For Docker, use console or verified admin access to read
+`systemctl is-active docker containerd` and `docker info --format '{{.LoggingDriver}}'`.
+Review storage headroom and known-good Stage 2 daemon configuration before an
+explicitly approved repair. Do not delete `/var/lib/docker`, uninstall runtimes,
+prune resources or blindly restart Docker. For an administrator, inspect `id
+<admin>`, `getent passwd <admin>` and `visudo -c` through console/managed access;
+restore only a reviewed public key/account/sudo configuration. Do not copy private
+keys or adopt an unmanaged account automatically; re-prove `make verify-user`
+and `make verify-ssh-security` with the existing `HUMAN_*` inputs. A missing
+managed account requires the separately approved bootstrap/recovery workflow.
+
+For update/log diagnostics, `systemctl is-active apt-daily.timer
+apt-daily-upgrade.timer logrotate.timer`, `systemctl --failed --no-pager`,
+`dpkg --audit`, `journalctl --disk-usage` and `logrotate --debug
+/etc/logrotate.conf` are read-only probes. Run them only in an explicitly approved
+live session; review verbose/debug output locally because it can expose paths or
+other sensitive details. Never run logrotate without `--debug`, force APT/dpkg
+lock removal, run autoremove, vacuum journals or trigger upgrades as a diagnostic.
