@@ -1,0 +1,81 @@
+---
+- name: Require explicitly confirmed Ubuntu operations setup
+  ansible.builtin.assert:
+    that:
+      - server_operations_confirmed | default(false) | bool
+      - ansible_distribution == 'Ubuntu'
+      - ansible_distribution_release in ['jammy', 'noble', 'resolute']
+      - server_operations_journal_system_mb is integer
+      - server_operations_journal_system_mb >= 16
+      - server_operations_journal_system_mb <= 4096
+      - server_operations_journal_runtime_mb is integer
+      - server_operations_journal_runtime_mb >= 16
+      - server_operations_journal_runtime_mb <= 1024
+      - server_operations_journal_keep_free_mb is integer
+      - server_operations_journal_keep_free_mb >= 128
+      - server_operations_journal_keep_free_mb <= 16384
+      - server_operations_journal_retention_days is integer
+      - server_operations_journal_retention_days >= 1
+      - server_operations_journal_retention_days <= 90
+    fail_msg: Confirm operations setup and provide supported Ubuntu and journal limits.
+    quiet: true
+
+- name: Inspect server operations before making changes
+  portfolio_operations_info:
+    verify: false
+  become: true
+
+- name: Ensure journald drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: Configure unattended security updates
+  ansible.builtin.template:
+    src: apt-security.j2
+    dest: /etc/apt/apt.conf.d/99zz-portfolio-security
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+
+- name: Install unattended security updates and log rotation
+  ansible.builtin.apt:
+    name:
+      - unattended-upgrades
+      - logrotate
+    state: present
+  become: true
+
+- name: Configure bounded journald retention
+  ansible.builtin.template:
+    src: journald.j2
+    dest: /etc/systemd/journald.conf.d/99-portfolio.conf
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  notify: Restart managed journald
+
+- name: Enable and start scheduled maintenance timers
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+    - logrotate.timer
+  become: true
+
+- name: Apply changed journald configuration
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify server operations after configuration
+  portfolio_operations_info:
+    verify: true
+  become: true

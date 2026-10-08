@@ -8,7 +8,7 @@ export ANSIBLE_HOME := $(CURDIR)/.ansible
 # Subprocesses must find the same pinned Ansible tools as the invoking interpreter.
 export PATH := $(abspath $(VENV))/bin:$(PATH)
 
-.PHONY: deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
+.PHONY: deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
 
 # Human account inputs are supplied by the caller; USER is intentionally untouched.
 export HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
@@ -81,6 +81,21 @@ verify-ssh-security:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py verify-ssh-security --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
 
+# LIVE / read-only: inspect Stage 5 operations readiness.
+inspect-operations:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py inspect-operations --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
+# LIVE / MUTATING: configure bounded system operations policy.
+setup-operations:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py setup-operations --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
+# LIVE / read-only: verify Stage 5 operations policy and services.
+verify-operations:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py verify-operations --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
 # Strictly offline, including wrapper tests with temporary fixtures and mocked processes.
 check: lint-yaml lint-ansible syntax-check lint-workflows test-access
 
@@ -104,6 +119,7 @@ syntax-check:
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/verify-user.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/secure-ssh.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/verify-ssh-security.yml
+	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/setup-operations.yml
 
 lint-workflows:
 	@$(ACTIONLINT) -shellcheck="" .github/workflows/ci.yml

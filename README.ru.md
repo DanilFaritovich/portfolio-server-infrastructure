@@ -8,7 +8,8 @@ Provisioning VPS на Ubuntu через Ansible. Pipeline:
 local setup -> bootstrap managed ansible user -> verify access
 -> provision Docker host -> verify Docker
 -> firewall + validated SSH host ports -> verify hardening
--> human access -> verify users -> final SSH policy -> verify SSH security -> STOP
+-> human access -> verify users -> final SSH policy -> verify SSH security
+-> separately confirmed server operations -> verify operations -> STOP
 ```
 
 Docker Engine, Compose и Buildx готовят хост к будущим workloads. Caddy,
@@ -743,3 +744,139 @@ live Stage 3 verification, `add-user`, `verify-user`, `secure-ssh`,
 hardening. Отказы (denied confirmation, bad key, unmanaged account, sudo conflict,
 Match/include, interrupted activation) проверяйте только в disposable fixtures
 или на тестовом VPS с рабочим recovery.
+
+## Эксплуатация и обслуживание сервера (Stage 5)
+
+Stage 5 запускается отдельно после Stage 4. Развёртывание приложений остаётся
+отдельным этапом. `inspect-operations` и `verify-operations` используют строгий
+key-only OpenSSH, существующее доверие к host key и `sudo -n`. Python-код
+передаётся через stdin с `-I -B`: без удалённых payload-файлов, обновления кеша,
+smoke-контейнеров и изменений журналов. Обычные записи аудита SSH/sudo возможны.
+Все команды сначала проверяют hardening Stage 3; Stage 5 также требует финальную
+политику Stage 4 для root/password/keyboard-interactive. Используется текущий
+SSH-маршрут inventory; все маршруты и доступ человеческого администратора
+перепроверяйте отдельно командами Stage 3/4.
+
+| Команда | Поведение |
+| --- | --- |
+| `make inspect-operations` | LIVE/read-only preflight: PASS/WARN допускаются, FAIL блокирует |
+| `make setup-operations` | LIVE/изменения: preflight, затем TTY-подтверждение `[y/N]`, по умолчанию отказ |
+| `make verify-operations` | LIVE/read-only: требует применённые настройки, пакеты, таймеры и лимиты |
+
+Роль устанавливает `unattended-upgrades` и `logrotate` с `state: present`, без
+немедленного обновления индексов или пакетов. Один маркированный APT-файл очищает
+унаследованные списки origins и разрешает только Ubuntu `-security` для текущего
+релиза. Сторонний origin Docker, обычный `-updates`, ESM и прочие origins исключены.
+Автоматические перезагрузки и удаление пакетов/ядер отключены. Таймеры `apt-daily`,
+`apt-daily-upgrade` и `logrotate` выполняют обслуживание по расписанию;
+пропущенный запуск может состояться вскоре после setup. Обновления безопасности
+могут перезапускать затронутые сервисы через package maintainer scripts.
+Сохраните recovery-доступ и выберите окно обслуживания. Установка требует рабочих
+кешированных индексов APT и сети; ошибка останавливает этап без автоматического
+восстановления. Уже выполняющиеся APT maintenance services блокируют переход
+политики: дождитесь завершения и повторите инспекцию, не удаляйте lock-файлы.
+
+Лимиты journald по умолчанию: 256 MiB постоянных журналов, 64 MiB runtime,
+512 MiB резерв свободного места, 14 дней хранения, сжатие. Параметры задаются
+в `roles/server_operations/defaults/main.yml`, а не в ограниченном inventory.
+Только изменение конфигурации вызывает handler перезапуска journald. Повторный
+setup без drift должен дать `changed=0`; это нужно подтвердить на вашем VPS.
+Существующие журналы освобождаются при обычной ротации; setup не выполняет vacuum
+или удаление. Лимиты относятся к отдельному journal namespace и не ограничивают
+произвольные файлы приложений; нестандартные namespaces вне этого этапа.
+
+Системный logrotate должен иметь конечный глобальный rotate (1–52); отдельные
+файлы допускают 0–52. Поддерживается только стандартный include `/etc/logrotate.d`.
+Preflight показывает конкретные экранированные пути и ожидаемое/фактическое состояние.
+Отсутствие управляемых файлов и каталога drop-in journald — WARN перед setup и FAIL
+при verify. Небезопасные существующие файлы, предки или symlink всегда дают FAIL.
+Штатный `apt-config` проверяет синтаксис установленной конфигурации и эффективные
+значения. Будущая конфигурация передаётся через stdin в порядке загрузки APT:
+управляемый файл вставляется на своё место, основной `apt.conf` — последним.
+Hooks, shell-команды и операции с пакетами при этом не запускаются. Комментарии
+с `#`, вложенные блоки, списки, regex и независимые vendor hooks разбирает сам APT.
+Исключений по именам файлов нет: штатные periodic-настройки, включая `10periodic`,
+совместимы, если кандидат безопасно приводит политику к целевому состоянию.
+Поздние/main overrides, неизвестные управляющие ключи, небезопасные настройки
+reboot/removal/authentication, непроверенные includes и перенаправление источников
+конфигурации блокируют setup. Штатный `Unattended-Upgrade::DevRelease` определяет
+запуск unattended updates на development-выпуске; он не разрешает дополнительные
+origins и не обновляет дистрибутив до другого выпуска. На подтверждённой стабильной
+Ubuntu, включая Noble 24.04 LTS, допустимы `auto`, `false` и `true`. Неизвестные
+значения, вложенные управляющие ключи и отсутствующие или противоречивые данные
+выпуска блокируют операцию. Development-выпуски не поддерживаются: `auto` может
+разрешать обновления ближе к дате выпуска, `true` разрешает их, а `false` отключает
+и потому не обеспечивает гарантии Stage 5. Текущая и будущая APT-политики используют
+одинаковую классификацию из `/etc/os-release` и, при наличии, `/etc/lsb-release`.
+Независимые настройки journald, например
+`ForwardToSyslog`, допускаются; сторонние настройки хранения и неизвестные или
+некорректные настройки остаются блокером. Диагностика выводит пути, ключи и строки
+без значений конфигурации или текста команд. Также блокируются небезопасные пути
+или symlink, masked/custom maintenance units и drop-ins, сбои критичных сервисов,
+незавершённое состояние dpkg, нехватка места или inode. Конфликты устраняются
+вручную: автоматического reset или adoption нет. Системный logrotate проверяется
+только с `--debug`, без ротации и изменения state-файла. В daemon Docker и каждом
+существующем контейнере требуются лимиты Stage 2: `local`, `20m`, `5`. Контейнеры
+сохраняют настройки момента создания; несовместимые нужно отдельно рассмотреть
+и пересоздать. Stage 5 не перезапускает Docker, не делает prune и не добавляет
+сети, публичные порты или внешние monitoring-сервисы.
+
+Диагностика показывает нагрузку на CPU, доступную RAM, swap, место/inode для `/`,
+`/var`, `/var/log`, `/var/lib/docker`, SSH/socket, Docker/containerd, journald,
+таймеры, failed units, эффективную политику обновлений и лимиты журналов.
+Свободное место ниже 10% или 512 MiB, inode ниже 5% блокируют setup. RAM ниже 15%,
+load/core выше 1, swap выше 50% или его отсутствие дают WARN. Pending reboot и
+APT/update-run stamps старше трёх дней тоже дают WARN: stamp подтверждает активность
+расписания, но не успешную установку всех security updates. Инспекция использует
+текущие кешированные данные; она не обновляет индексы, не симулирует upgrade,
+не считает ожидающие security-пакеты, не устанавливает обновления и не запускает
+постоянный мониторинг. Состояние systemd не доказывает доступность приложения.
+Timeout или некорректный ответ блокируют операцию; сырой stderr, конфиги и журналы
+не выводятся.
+
+Последовательность самостоятельной проверки (при реализации не выполнялась):
+
+```bash
+make deps               # если pinned tools ещё не установлены; доступ к registry
+make check              # offline regression tests, lint, syntax с примером inventory
+# После review кода, локального inventory, ключей и provider recovery-доступа:
+make inspect-operations
+make setup-operations   # явное подтверждение в терминале
+make verify-operations
+make setup-operations   # повторное подтверждение; ожидается changed=0 без drift
+make verify-operations
+```
+
+Поддерживаются прежние overrides `INVENTORY` и `AUTOMATION_KEY`. Live `--check`
+не является offline-проверкой. Автоматического reboot нет: при необходимости
+отдельно подтвердите `make reboot-host`, затем повторите `make verify-operations`.
+Существующая проверка reboot-host включает Docker smoke-контейнер и может
+пополнить image cache.
+
+Восстановление выполняется вручную. Если SSH недоступен, остановите повторные
+попытки и используйте provider console. Посмотрите `systemctl status ssh.service
+ssh.socket --no-pager`, `sshd -t`, `sshd -T`, `ss -lnt`, `ufw status verbose`;
+сопоставьте порты Stage 3 и политику Stage 4 до редактирования или reload.
+Сохраните открытую recovery-сессию и независимо подтвердите managed и human
+key-only доступ перед выходом. Автоматически включать root/password login
+или сбрасывать UFW нельзя.
+
+Для Docker через console или проверенный admin-доступ прочитайте
+`systemctl is-active docker containerd`, `docker info --format '{{.LoggingDriver}}'`.
+Перед отдельно разрешённым ремонтом проверьте место и известную корректную
+конфигурацию daemon Stage 2. Не удаляйте `/var/lib/docker`, runtime-пакеты,
+ресурсы через prune и не перезапускайте Docker вслепую. Для администратора через
+console/managed-доступ проверьте `id <admin>`, `getent passwd <admin>`, `visudo -c`;
+восстанавливайте только рассмотренные public key/account/sudo настройки. Не
+копируйте private keys и не принимайте unmanaged account автоматически. Повторно
+подтвердите `make verify-user` и `make verify-ssh-security` с прежними `HUMAN_*`.
+Отсутствующий managed account требует отдельно разрешённого bootstrap/recovery.
+
+Для диагностики обновлений/журналов read-only команды: `systemctl is-active
+apt-daily.timer apt-daily-upgrade.timer logrotate.timer`, `systemctl --failed
+--no-pager`, `dpkg --audit`, `journalctl --disk-usage`, `logrotate --debug
+/etc/logrotate.conf`. Выполняйте их только в явно разрешённой live-сессии;
+подробный/debug-вывод просматривайте локально, он может раскрывать пути или другую
+чувствительную информацию. Logrotate без `--debug`, принудительное удаление
+APT/dpkg locks, autoremove, vacuum журналов и запуск upgrade не являются безопасной
+диагностикой.

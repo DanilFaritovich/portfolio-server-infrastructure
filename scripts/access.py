@@ -567,9 +567,69 @@ def human_access(mode, inventory, automation_key):
     print('Requested human access stage completed. STOP.')
 
 
+def operations_probe(host, port, interpreter, key, module, params):
+    """Strict key-only stream transport; no Ansible remote files or cache writes."""
+    ssh = ['ssh'] + shlex.split(SSH_BASE) + [
+        '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
+        '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
+        '-o', 'KbdInteractiveAuthentication=no', '-o', 'IdentityAgent=none',
+        '-i', str(key), '-p', str(port), 'ansible@' + host,
+    ]
+    login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False, timeout=30)
+    require(login.returncode == 0 and login.stdout.strip() == 'ansible', 'Managed key-only SSH access failed.')
+    payload = '__name__ = "portfolio_inspection"\n' + (ROOT / 'library' / module).read_text()
+    payload += '\ninspect_stream(json.loads(' + repr(json.dumps(params)) + '))\n'
+    process = subprocess.run(ssh + ['sudo -n ' + shlex.quote(interpreter) + ' -I -B -'],
+                             input=payload, capture_output=True, text=True, check=False, timeout=300)
+    try:
+        result = json.loads(process.stdout)
+        require(process.returncode == 0 and type(result['ready']) is bool and
+                isinstance(result['report'], str), 'Invalid read-only inspection result.')
+    except (ValueError, KeyError, TypeError):
+        raise ValueError('Managed sudo or read-only inspection failed; review manually.') from None
+    print(result['report'])
+    require(result['ready'], 'Resolve FAIL findings manually before proceeding.')
+
+
+def operations(mode, inventory, key):
+    prerequisites(mode)
+    check_key(key)
+    alias, host, port, _, interpreter = load_host(inventory)
+    inputs = hardening_inputs(inventory, alias, port)
+    known_host(host, port)
+    # Stage 3 verification is also streamed: no Ansible ping/temp payloads.
+    operations_probe(host, port, interpreter, key, 'portfolio_hardening_info.py', {
+        'current_port': port, 'ssh_ports': inputs['ssh_listen_ports'],
+        'tcp_ports': inputs['firewall_allowed_tcp_ports'], 'verify': True,
+        'refresh_rules': False, 'socket_candidate': False, 'report_only': True,
+    })
+    operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py',
+                     {'verify': mode == 'verify-operations'})
+    if mode != 'setup-operations':
+        return
+    require(sys.stdin.isatty(), 'Operations setup requires an interactive terminal; no changes requested.')
+    print('LIVE / MUTATING: security update policy, bounded journald retention and timers. '
+          'Keep provider recovery access. No automatic reboot.', flush=True)
+    try:
+        answer = input('Apply server operations configuration? [y/N] ')
+    except (EOFError, KeyboardInterrupt):
+        answer = ''
+    require(answer.strip().lower() in ('y', 'yes'), 'Operations setup declined; no changes requested.')
+    run_playbook(inventory, alias, {
+        'ansible_user': 'ansible', 'ansible_connection': 'ssh',
+        'ansible_private_key_file': str(key), 'ansible_host_key_checking': True,
+        'ansible_become_flags': '-n', 'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
+        'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
+                            ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
+                            ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
+        'server_operations_confirmed': True,
+    }, 'setup-operations.yml')
+    operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py', {'verify': True})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
+    parser.add_argument('mode', choices=['inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=str(DEFAULT_KEY))
     args = parser.parse_args()
@@ -578,6 +638,8 @@ def main():
     try:
         if args.mode == 'setup':
             setup_inventory(inventory)
+        elif args.mode in ('inspect-operations', 'setup-operations', 'verify-operations'):
+            operations(args.mode, inventory, key_path(args.key))
         elif args.mode in ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'):
             human_access(args.mode, inventory, key_path(args.key))
         else:
