@@ -654,7 +654,7 @@ def human_access(mode, inventory, automation_key=None):
                             ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
                             ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
     }
-    if imported and (mode != 'add-user' or key.exists() or Path(str(key) + '.pub').exists()):
+    if imported and mode != 'add-user':
         check_key(key)
         pair_public = public_key_file(str(key) + '.pub')
         require(public.read_text().split()[:2] == pair_public.read_text().split()[:2],
@@ -665,8 +665,19 @@ def human_access(mode, inventory, automation_key=None):
         if not imported:
             prepare_human_key(key, name)
             public = public_key_file(str(key) + '.pub')
-        run_playbook(inventory, alias, managed | human | {'human_access_user_public_key_path': str(public)}, 'add-user.yml')
-        if imported and not key.exists():
+        _, _, _, _, interpreter = load_host(inventory)
+        before = user_probe(host, port, interpreter, automation_key, managed_user, {
+            'action': 'preflight-add-user', 'name': name, 'sudo': human['human_access_user_sudo'],
+            'groups': human['human_access_user_groups'], 'commands': human['human_access_user_sudo_commands'],
+        })
+        if not before.get('existing'):
+            run_playbook(inventory, alias, managed | human | {'human_access_user_public_key_path': str(public)}, 'add-user.yml')
+            before = user_probe(host, port, interpreter, automation_key, managed_user, {'action': 'show-user', 'name': name})
+        user_probe(host, port, interpreter, automation_key, managed_user, {
+            'action': 'add-user-key', 'name': name, 'key': public.read_text().strip(),
+            'token': before['token'], 'confirmed': True,
+        })
+        if imported:
             print('Public key installed. Access is UNVERIFIED: its owner must run make verify-user with the matching key.')
             return
     if mode == 'secure-ssh':
@@ -698,6 +709,108 @@ def human_access(mode, inventory, automation_key=None):
             for login in (managed_user, name):
                 verify_auth_methods(host, target, login, identity)
     print('Requested human access stage completed. STOP.')
+
+
+USER_MANAGEMENT_MODES = ('list-users', 'show-user', 'list-user-keys', 'add-user-key', 'revoke-user-key', 'remove-user')
+
+
+def user_probe(host, port, interpreter, key, controller, params):
+    """Stream a bounded engine with no remote payload files or private-key reads."""
+    ssh = ['ssh'] + shlex.split(SSH_BASE) + [
+        '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey',
+        '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no', '-o', 'IdentityAgent=none',
+        '-i', str(key), '-p', str(port), controller + '@' + host,
+    ]
+    source = (ROOT / 'library/portfolio_human_info.py').read_text()
+    source = source.split('def main():')[0].replace('from ansible.module_utils.basic import AnsibleModule', '')
+    payload = source + '\n' + (ROOT / 'scripts/user_management.py').read_text()
+    payload += '\nmanage_stream(json.loads(' + repr(json.dumps(params | {'controller': controller})) + '))\n'
+    result = subprocess.run(ssh + ['sudo -n ' + shlex.quote(interpreter) + ' -I -B -'],
+                            input=payload, capture_output=True, text=True, check=False, timeout=180)
+    try:
+        response = json.loads(result.stdout)
+        require(result.returncode == 0 and response.get('ready') is True and isinstance(response['result'], dict),
+                response.get('error', 'User management SSH/sudo failed; stop and inspect through recovery.'))
+        return response['result']
+    except (KeyError, TypeError, json.JSONDecodeError):
+        raise ValueError('Invalid user management response; stop and inspect through recovery.') from None
+
+
+def user_management(mode, inventory, override=None):
+    controller, key = managed_access(inventory, override)
+    name = os.environ.get('HUMAN_USER', '')
+    if mode != 'list-users':
+        require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', name or '') and name not in ('root', controller),
+                'Set HUMAN_USER to a managed human account separate from root/current controller.')
+    params = {'action': mode, 'name': name}
+    if mode == 'add-user-key':
+        public = public_key_file(os.environ.get('HUMAN_PUBLIC_KEY', ''))
+        params['key'] = public.read_text().strip()
+    if mode == 'revoke-user-key':
+        digest = os.environ.get('KEY_FINGERPRINT', '')
+        require(re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', digest), 'Set KEY_FINGERPRINT to an exact SHA256 fingerprint.')
+        params['fingerprint'] = digest
+    prerequisites(mode)
+    check_key(key)
+    alias, host, port, _, interpreter = load_host(inventory)
+    inputs = hardening_inputs(inventory, alias, port)
+    known_host(host, port)
+    probe = lambda values: user_probe(host, port, interpreter, key, controller, values)
+    if mode in ('list-users', 'show-user', 'list-user-keys'):
+        print(json.dumps(probe(params), indent=2))
+        return
+    # Validate Stage 3 and fresh managed key-only sudo before every mutation.
+    operations_probe(host, port, interpreter, key, 'portfolio_hardening_info.py', {
+        'current_port': port, 'ssh_ports': inputs['ssh_listen_ports'],
+        'tcp_ports': inputs['firewall_allowed_tcp_ports'], 'verify': True,
+        'refresh_rules': False, 'socket_candidate': False, 'report_only': True,
+    }, controller)
+    before = probe({'action': 'show-user', 'name': name})
+    if mode == 'remove-user' and before.get('removed'):
+        print(json.dumps(before, indent=2))
+        return
+    params['token'] = before['token']
+    if mode in ('revoke-user-key', 'remove-user'):
+        recovery = os.environ.get('RECOVERY_USER', '')
+        require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', recovery or '') and recovery not in ('root', controller, name),
+                'Set RECOVERY_USER to another managed human admin whose access will be retained.')
+        recovery_key = human_key_path(os.environ.get('RECOVERY_KEY'), recovery)
+        require(recovery_key != key, 'Use a separate recovery administrator key.')
+        retained = probe({'action': 'show-user', 'name': recovery})
+        require(retained.get('sudo') == 'admin', 'Recovery account must be a managed administrator.')
+        managed = {'ansible_user': controller, 'ansible_connection': 'ssh',
+                   'ansible_private_key_file': str(key), 'ansible_host_key_checking': True,
+                   'ansible_become_flags': '-n', 'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
+                   'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
+                   ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
+                   ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none'}
+        human = {'human_access_user_name': recovery, 'human_access_user_sudo': 'admin',
+                 'human_access_user_groups': retained['groups'], 'human_access_user_sudo_commands': ['ALL']}
+        verify_human(inventory, alias, host, port, managed, inputs, human, recovery_key)
+        params.update(recovery_user=recovery, recovery_token=retained['token'])
+    require(sys.stdin.isatty(), 'User/key mutation requires interactive recovery confirmation.')
+    print(json.dumps(before, indent=2))
+    if mode == 'add-user-key':
+        print('Public key to add: ' + params['key'])
+    elif mode == 'revoke-user-key':
+        print('Fingerprint to revoke: ' + params['fingerprint'])
+    print('LIVE / MUTATING: ' + mode + ' for ' + name + '. Keep provider console recovery available.', flush=True)
+    try:
+        answer = input('Apply this user/key change? [y/N] ')
+    except (EOFError, KeyboardInterrupt):
+        answer = ''
+    require(answer.strip().lower() in ('y', 'yes'), 'User/key change declined; no mutation requested.')
+    result = probe(params | {'confirmed': True})
+    # The remote engine verifies exact key/account results. Fresh controller proof
+    # after mutation detects a lost automation route; failures never trigger retries.
+    operations_probe(host, port, interpreter, key, 'portfolio_hardening_info.py', {
+        'current_port': port, 'ssh_ports': inputs['ssh_listen_ports'],
+        'tcp_ports': inputs['firewall_allowed_tcp_ports'], 'verify': True,
+        'refresh_rules': False, 'socket_candidate': False, 'report_only': True,
+    }, controller)
+    print(json.dumps(result, indent=2))
+    if mode == 'add-user-key':
+        print('Key installed; its owner must independently verify key-only SSH access from their PC.')
 
 
 def operations_probe(host, port, interpreter, key, module, params, user):
@@ -763,7 +876,7 @@ def operations(mode, inventory, key=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['generate-user-key', 'show-public-key', 'show-controller', 'connect-controller', 'connect-user', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
+    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'generate-user-key', 'show-public-key', 'show-controller', 'connect-controller', 'connect-user', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=None, help='Legacy key override; explicit inventories own the key path.')
     args = parser.parse_args()
@@ -778,6 +891,8 @@ def main():
             cli_connection(args.mode, inventory, args.key or None)
         elif args.mode in ('inspect-operations', 'setup-operations', 'verify-operations'):
             operations(args.mode, inventory, args.key or None)
+        elif args.mode in USER_MANAGEMENT_MODES:
+            user_management(args.mode, inventory, args.key or None)
         elif args.mode in ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'):
             human_access(args.mode, inventory, args.key or None)
         else:

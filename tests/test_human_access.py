@@ -39,6 +39,7 @@ class HumanWrapperTests(unittest.TestCase):
                        'firewall_allowed_tcp_ports': [80, 443]}
         self.env = {'HUMAN_USER': 'operator', 'HUMAN_SUDO': 'admin', 'HUMAN_KEY': str(self.key)}
         self.events = []
+        self.public_key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFfixture synthetic\n'
         for name, options in (
             ('prerequisites', {}), ('check_key', {}), ('known_host', {}),
             ('managed_access', {'return_value': ('ansible', self.automation)}),
@@ -46,6 +47,8 @@ class HumanWrapperTests(unittest.TestCase):
             ('hardening_inputs', {'return_value': self.inputs}),
             ('public_key_file', {'side_effect': lambda value: Path(value)}),
             ('prepare_key', {'side_effect': lambda *a, **kw: self.events.append('generate')}),
+            ('prepare_human_key', {'side_effect': self.prepare_human_key}),
+            ('user_probe', {'side_effect': self.user_probe}),
             ('verify_hardening', {'side_effect': lambda *a: self.events.append('automation')}),
             ('verify_human', {'side_effect': lambda *a: self.events.append('human')}),
             ('verify_auth_methods', {}),
@@ -58,6 +61,14 @@ class HumanWrapperTests(unittest.TestCase):
                        patch.object(access.sys.stdin, 'isatty', return_value=True)):
             mocked.start()
             self.addCleanup(mocked.stop)
+
+    def prepare_human_key(self, key, name):
+        self.events.append('generate')
+        Path(str(key) + '.pub').write_text(self.public_key)
+
+    def user_probe(self, host, port, interpreter, key, controller, params):
+        self.events.append('user_probe:' + params['action'])
+        return {'token': 'synthetic-token'}
 
     def test_privilege_inputs_reject_sudo_injection_and_system_groups(self):
         for bad in ({'HUMAN_USER': 'root'}, {'HUMAN_USER': 'ansible'}, {'HUMAN_GROUPS': 'docker'},
@@ -84,16 +95,20 @@ class HumanWrapperTests(unittest.TestCase):
 
     def test_add_user_preflight_creation_and_fresh_verification(self):
         access.human_access('add-user', self.inventory, self.automation)
-        self.assertEqual(self.events, ['automation', 'generate', 'add-user.yml', 'human'])
+        self.assertEqual(self.events, ['automation', 'generate', 'user_probe:preflight-add-user', 'add-user.yml',
+                                       'user_probe:show-user', 'user_probe:add-user-key', 'human'])
         variables = self.run_playbook.call_args.args[2]
         self.assertEqual(variables['human_access_user_public_key_path'], str(self.key) + '.pub')
         self.assertNotIn('ansible_become', variables)
         self.assertEqual(variables['ansible_user'], 'ansible')
 
     def test_public_only_import_never_generates_or_claims_verified_access(self):
-        with patch.dict(os.environ, {'HUMAN_PUBLIC_KEY': str(self.directory / 'import.pub')}):
+        imported_key = self.directory / 'import.pub'
+        imported_key.write_text(self.public_key)
+        with patch.dict(os.environ, {'HUMAN_PUBLIC_KEY': str(imported_key)}):
             access.human_access('add-user', self.inventory, self.automation)
-        self.assertEqual(self.events, ['automation', 'add-user.yml'])
+        self.assertEqual(self.events, ['automation', 'user_probe:preflight-add-user', 'add-user.yml',
+                                       'user_probe:show-user', 'user_probe:add-user-key'])
         self.prepare_key.assert_not_called()
         self.verify_human.assert_not_called()
 

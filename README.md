@@ -1009,3 +1009,72 @@ apt-daily-upgrade.timer logrotate.timer`, `systemctl --failed --no-pager`,
 live session; review verbose/debug output locally because it can expose paths or
 other sensitive details. Never run logrotate without `--debug`, force APT/dpkg
 lock removal, run autoremove, vacuum journals or trigger upgrades as a diagnostic.
+
+## User and SSH key management (Stage 6, task 3)
+
+These commands contact the VPS through the inventory managed user and private-key path.
+They never use the initial password login or require a hardcoded automation username.
+Listing reads actual server accounts, groups, effective sudo/SSH policy and authorized keys;
+there is no local user/key cache. Root and the current controller cannot be targeted.
+
+| Command | Purpose | Boundary |
+| --- | --- | --- |
+| `make list-users` | List recorded human users/rights/keys and the protected inventory controller | LIVE / read-only |
+| `make show-user HUMAN_USER=operator` | Inspect identity, groups, sudo and SSH keys | LIVE / read-only |
+| `make list-user-keys HUMAN_USER=operator` | List authorized public keys, SHA256 fingerprints and ownership | LIVE / read-only |
+| `make add-user-key HUMAN_USER=operator HUMAN_PUBLIC_KEY=/path/other-pc.pub` | Add one public key, preserving every other entry | LIVE / MUTATING, interactive confirmation |
+| `make revoke-user-key HUMAN_USER=operator KEY_FINGERPRINT=SHA256:...` | Revoke exactly one managed key | LIVE / MUTATING, retained admin proof and confirmation |
+| `make remove-user HUMAN_USER=operator` | Revoke credentials/sudo and delete the account, retaining files | LIVE / MUTATING, retained admin proof and confirmation |
+
+Public imports use the existing `.pub` validation; private keys are never uploaded or read.
+Importing from another PC does not require its private key on this controller. After an
+addition, the key owner must independently verify login with that identity, for example
+`make verify-user HUMAN_USER=operator HUMAN_SUDO=admin HUMAN_KEY=/path/operator-key`
+from a configured checkout on that PC. Import success alone does not prove access.
+Existing-user `add-user` uses the same additive key engine; existing privilege/group
+changes are refused and require a separately reviewed migration.
+
+Account ownership comes from protected `/var/lib/portfolio-human-access/<user>.json`
+records, checked against the current identity and privilege policy. Exact authorized-key
+entries explicitly installed through these wrappers are tracked in adjacent
+`<user>.keys.json` records. Existing keys from earlier stages are shown as unmanaged.
+To take responsibility for one, explicitly add its identical public line (including its
+comment) using `add-user-key`; a matching fingerprint with different options/comments or
+multiple entries blocks the operation. Unmanaged accounts cannot be adopted; unmanaged
+keys cannot be revoked, and any unmanaged key blocks account removal. These server
+records establish ownership, while actual VPS state remains the source of access facts.
+
+For revocation/removal, supply another managed human administrator and its local key:
+
+```sh
+make revoke-user-key HUMAN_USER=operator KEY_FINGERPRINT=SHA256:... \
+  RECOVERY_USER=backupadmin RECOVERY_KEY=~/.ssh/portfolio-infra/backupadmin_ed25519
+make remove-user HUMAN_USER=operator \
+  RECOVERY_USER=backupadmin RECOVERY_KEY=~/.ssh/portfolio-infra/backupadmin_ed25519
+```
+
+The retained administrator must differ from the target and current controller. Its
+fresh key-only SSH and `sudo -n` access are proven on every `ssh_verify_ports` route.
+Without that proof the last confirmed human administrative access cannot be removed.
+Keep provider-console recovery available. Mutations verify Stage 3 and managed access,
+show the current state/request, require default-deny TTY confirmation, and reject state
+changes after preflight. Server-side operations serialize and check key contents before
+atomic replacement. No SSH daemon, ports, authentication policy or services are changed.
+A successful mutation checks its exact server result and re-proves managed access.
+
+Removal blocks active user processes, custom userdel hooks, unknown privilege/group state,
+conditional SSH Match policies, unsupported key sources/includes and pending SSH activation.
+It empties authorized keys and removes the managed sudo fragment before invoking
+`userdel` without `--remove` or `--force`. Home, mail and other user files remain with their
+numeric ownership; a protected removal receipt prevents automatic account recreation.
+Do not reassign that UID to another account without reviewing the retained files.
+Repeated add/revoke/removal is unchanged when the verified result already exists.
+Revoking a key affects future authentication, not an existing SSH session.
+If a mutation fails, credentials may already have been revoked: stop and inspect through
+retained administrator/provider recovery access; never retry blindly or reopen SSH policy.
+
+Offline checks cover ownership boundaries, preservation, exact revocation, stale proofs,
+confirmation, retained files, strict transport and Make wrappers. Live operator checks
+remain necessary: import keys from two PCs, verify each identity independently, revoke
+one and prove new login fails while the other succeeds, remove a disposable managed
+account and confirm its files remain, then check repeated operations and Stage 1–5 access.

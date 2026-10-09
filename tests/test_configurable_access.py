@@ -93,6 +93,31 @@ class ConfigurableAccessTests(unittest.TestCase):
                 self.assertEqual(variables['portfolio_automation_user'], 'automation')
         self.assertEqual([call.args[2] for call in auth.call_args_list], ['automation', 'person'])
 
+    def test_add_user_imported_key_is_installed_but_remains_unverified(self):
+        public_key = self.directory / 'import.pub'
+        content = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFfixture synthetic\n'
+        public_key.write_text(content)
+        probes = []
+
+        def user_probe(host, port, interpreter, key, controller, params):
+            probes.append(params)
+            return {'token': 'synthetic-token'}
+
+        env = {'HUMAN_USER': 'person', 'HUMAN_SUDO': 'admin', 'HUMAN_KEY': str(self.directory / 'person'),
+               'HUMAN_PUBLIC_KEY': str(public_key)}
+        with patch.dict(access.os.environ, env, clear=True), patch.object(access, 'check_key'), \
+                patch.object(access, 'public_key_file', side_effect=lambda value: Path(value)), \
+                patch.object(access, 'verify_hardening'), patch.object(access, 'user_probe', side_effect=user_probe), \
+                patch.object(access, 'verify_human') as verify, patch.object(access, 'run_playbook') as run, \
+                patch('builtins.print'):
+            access.human_access('add-user', self.inventory)
+
+        self.assertEqual([probe['action'] for probe in probes], ['preflight-add-user', 'show-user', 'add-user-key'])
+        self.assertEqual(probes[2]['key'], content.strip())
+        self.assertEqual(probes[2]['token'], 'synthetic-token')
+        self.assertEqual(run.call_args.args[3], 'add-user.yml')
+        verify.assert_not_called()
+
     def test_human_identity_and_groups_cannot_collide_with_selected_automation(self):
         for env in ({'HUMAN_USER': 'automation'}, {'HUMAN_USER': 'person', 'HUMAN_GROUPS': 'automation'}):
             with self.subTest(env=env), self.assertRaises(ValueError):

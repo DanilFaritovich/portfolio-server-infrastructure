@@ -9,10 +9,10 @@ export ANSIBLE_HOME := $(CURDIR)/.ansible
 # Subprocesses must find the same pinned Ansible tools as the invoking interpreter.
 export PATH := $(abspath $(VENV))/bin:$(PATH)
 
-.PHONY: generate-user-key show-public-key show-controller connect-controller connect-user deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
+.PHONY: list-users show-user list-user-keys add-user-key revoke-user-key remove-user generate-user-key show-public-key show-controller connect-controller connect-user deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
 
 # Human account inputs are supplied by the caller; USER is intentionally untouched.
-export KEY_NAME HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
+export KEY_FINGERPRINT RECOVERY_USER RECOVERY_KEY KEY_NAME HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
 
 # Dependency setup uses registries; checks below use installed dependencies offline.
 deps:
@@ -76,6 +76,11 @@ verify-hardening:
 reboot-host:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py reboot-host --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
+# LIVE user/key management: mutations require explicit interactive confirmation.
+list-users show-user list-user-keys add-user-key revoke-user-key remove-user:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
 
 # LIVE / MUTATING: add a human account using explicitly supplied HUMAN_* inputs.
 add-user:

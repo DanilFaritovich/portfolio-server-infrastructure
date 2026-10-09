@@ -1018,3 +1018,73 @@ apt-daily.timer apt-daily-upgrade.timer logrotate.timer`, `systemctl --failed
 чувствительную информацию. Logrotate без `--debug`, принудительное удаление
 APT/dpkg locks, autoremove, vacuum журналов и запуск upgrade не являются безопасной
 диагностикой.
+
+## Управление пользователями и SSH-ключами (Stage 6, задача 3)
+
+Команды обращаются к VPS через managed user и путь ключа из inventory. Начальный
+password login не используется, имя automation-пользователя не фиксировано.
+Списки читают фактические аккаунты, группы, effective sudo/SSH policy и authorized keys;
+локального кэша пользователей/ключей нет. Root и текущий контроллер защищены.
+
+| Команда | Назначение | Граница |
+| --- | --- | --- |
+| `make list-users` | Управляемые human-пользователи, права, ключи и защищённый inventory controller | LIVE / read-only |
+| `make show-user HUMAN_USER=operator` | Identity, группы, sudo и SSH-ключи | LIVE / read-only |
+| `make list-user-keys HUMAN_USER=operator` | Разрешённые public keys, SHA256 fingerprints и принадлежность | LIVE / read-only |
+| `make add-user-key HUMAN_USER=operator HUMAN_PUBLIC_KEY=/path/other-pc.pub` | Добавить один public key, сохранив остальные записи | LIVE / MUTATING, интерактивное подтверждение |
+| `make revoke-user-key HUMAN_USER=operator KEY_FINGERPRINT=SHA256:...` | Отозвать конкретный управляемый ключ | LIVE / MUTATING, проверка другого admin и подтверждение |
+| `make remove-user HUMAN_USER=operator` | Отозвать ключи/sudo и удалить аккаунт, сохранив файлы | LIVE / MUTATING, проверка другого admin и подтверждение |
+
+Импорт использует существующую проверку `.pub`; private keys не читаются и не загружаются.
+Для public key с другого ПК не нужен его private key на контроллере. После добавления
+владелец независимо проверяет вход этой identity, например
+`make verify-user HUMAN_USER=operator HUMAN_SUDO=admin HUMAN_KEY=/path/operator-key`
+из настроенного checkout на том ПК. Успешный импорт сам по себе не доказывает доступ.
+Для существующего аккаунта `add-user` использует тот же механизм добавления ключа;
+изменения существующих прав/групп требуют отдельно рассмотренной миграции.
+
+Принадлежность аккаунта определяется защищённой записью
+`/var/lib/portfolio-human-access/<user>.json`, сверяемой с identity и privilege policy.
+Точные authorized-key строки, явно установленные этими wrappers, учитываются в соседней
+записи `<user>.keys.json`. Ключи предыдущих этапов отображаются как unmanaged.
+Чтобы явно принять ответственность за такой ключ, добавьте идентичную public строку
+(включая comment) через `add-user-key`. Совпадающий fingerprint при иных options/comments
+или нескольких записях блокирует операцию. Неуправляемые аккаунты не принимаются в
+управление; неуправляемые ключи нельзя отозвать, и они блокируют удаление аккаунта.
+Записи на сервере определяют принадлежность; источником фактов о доступе остаётся VPS.
+
+Для отзыва/удаления укажите другого managed human-admin и его локальный ключ:
+
+```sh
+make revoke-user-key HUMAN_USER=operator KEY_FINGERPRINT=SHA256:... \
+  RECOVERY_USER=backupadmin RECOVERY_KEY=~/.ssh/portfolio-infra/backupadmin_ed25519
+make remove-user HUMAN_USER=operator \
+  RECOVERY_USER=backupadmin RECOVERY_KEY=~/.ssh/portfolio-infra/backupadmin_ed25519
+```
+
+Сохраняемый admin должен отличаться от цели и текущего контроллера. Свежий key-only SSH
+и `sudo -n` проверяются на каждом маршруте `ssh_verify_ports`. Без этого доказательства
+последний подтверждённый human-admin доступ нельзя удалить. Сохраняйте provider-console
+recovery. Мутации проверяют Stage 3 и managed access, показывают состояние/запрос,
+требуют default-deny TTY confirmation и отклоняют изменения состояния после preflight.
+Серверные операции сериализуются и сверяют содержимое ключей перед atomic replacement.
+SSH daemon, порты, authentication policy и сервисы не меняются. Успешная мутация
+проверяет точный результат на сервере и повторно доказывает managed access.
+
+Удаление блокируется активными процессами пользователя, custom userdel hooks, неизвестным
+состоянием прав/групп, SSH Match, неподдерживаемыми key sources/includes и pending SSH
+activation. Сначала очищаются authorized keys и удаляется managed sudo fragment,
+затем вызывается `userdel` без `--remove` и `--force`. Home, mail и остальные файлы
+сохраняются с числовыми владельцами; защищённая запись об удалении блокирует автоматическое
+пересоздание аккаунта. Не назначайте этот UID другому аккаунту без ревизии сохранённых файлов.
+Повторное добавление/отзыв/удаление не меняет уже подтверждённый результат.
+Отзыв ключа влияет на будущую аутентификацию, но не закрывает существующую SSH-сессию.
+При ошибке мутации credentials уже могли быть отозваны: остановитесь и проверьте состояние
+через сохраняемого admin/provider recovery; не повторяйте вслепую и не ослабляйте SSH policy.
+
+Offline checks покрывают границы принадлежности, сохранение ключей, точный отзыв,
+устаревшие proofs, подтверждение, сохранение файлов, strict transport и Make wrappers.
+Ручные LIVE-проверки остаются необходимыми: импортировать ключи двух ПК, независимо
+проверить обе identity, отозвать один и подтвердить отказ нового входа при успешном входе
+вторым, удалить тестовый managed account и проверить сохранность файлов, затем проверить
+повторные операции и доступ Stage 1–5.
