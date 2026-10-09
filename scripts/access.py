@@ -266,7 +266,7 @@ def known_host(host, port, allow_trust=False):
     print('Host key saved to ~/.ssh/known_hosts. Strict host-key checking remains enabled.', flush=True)
 
 
-def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=False):
+def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=False, check=False, diff=False):
     # Connection extra-vars would override even delegated localhost. Scope runtime
     # settings to the managed host in an additional inventory source instead.
     connection = {name: value for name, value in variables.items() if name.startswith('ansible_')}
@@ -280,6 +280,10 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
         command.append('--ask-pass')
     if ask_become:
         command.append('--ask-become-pass')
+    if check:
+        command.append('--check')
+    if diff:
+        command.append('--diff')
     environment = os.environ.copy()
     for name in ('ANSIBLE_PARAMIKO_LOOK_FOR_KEYS', 'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD',
                  'ANSIBLE_PARAMIKO_RECORD_HOST_KEYS'):
@@ -860,6 +864,32 @@ def operations(mode, inventory, key=None):
     }, managed_user)
     operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py',
                      {'verify': mode == 'verify-operations'}, managed_user)
+    if mode in ('preview-apt-policy', 'apply-apt-policy'):
+        preview = mode == 'preview-apt-policy'
+        if not preview:
+            require(sys.stdin.isatty(), 'APT-only application requires an interactive terminal.')
+            try:
+                answer = input('Apply only the single missing APT policy line? [y/N] ')
+            except (EOFError, KeyboardInterrupt):
+                answer = ''
+            require(answer.strip().lower() in ('y', 'yes'), 'APT-only application declined; no change requested.')
+        variables = {
+            'ansible_user': managed_user, 'ansible_connection': 'ssh',
+            'ansible_private_key_file': str(key), 'ansible_host_key_checking': True,
+            'ansible_become_flags': '-n', 'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
+            'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
+                                ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
+                                ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
+            'portfolio_apt_confirmed': not preview,
+        }
+        try:
+            run_playbook(inventory, alias, variables, 'apt-policy.yml', check=preview, diff=True)
+            if not preview:
+                operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py', {'verify': True}, managed_user)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+            raise ValueError('APT-only stage failed; STOP. If application was requested, the file may already '
+                             'have changed; inspect read-only and do not retry blindly.') from None
+        return
     if mode != 'setup-operations':
         return
     require(sys.stdin.isatty(), 'Operations setup requires an interactive terminal; no changes requested.')
@@ -884,7 +914,7 @@ def operations(mode, inventory, key=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'generate-user-key', 'show-public-key', 'show-controller', 'connect-controller', 'connect-user', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
+    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'generate-user-key', 'show-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=None, help='Legacy key override; explicit inventories own the key path.')
     args = parser.parse_args()
@@ -897,7 +927,7 @@ def main():
             local_key(args.mode)
         elif args.mode in ('show-controller', 'connect-controller', 'connect-user'):
             cli_connection(args.mode, inventory, args.key or None)
-        elif args.mode in ('inspect-operations', 'setup-operations', 'verify-operations'):
+        elif args.mode in ('preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations'):
             operations(args.mode, inventory, args.key or None)
         elif args.mode in USER_MANAGEMENT_MODES:
             user_management(args.mode, inventory, args.key or None)

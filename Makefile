@@ -102,6 +102,12 @@ verify-ssh-security:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py verify-ssh-security --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
 
+# LIVE: preview is check/diff only; apply changes only the guarded APT file.
+.PHONY: preview-apt-policy apply-apt-policy
+preview-apt-policy apply-apt-policy:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
 # LIVE / read-only: inspect Stage 5 operations readiness.
 inspect-operations:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
@@ -129,6 +135,7 @@ lint-ansible:
 	@ANSIBLE_INVENTORY="$(CURDIR)/inventories/production.example.yml" $(VENV)/bin/ansible-lint --offline playbooks roles
 
 syntax-check:
+	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/apt-policy.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/bootstrap.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/verify.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/docker-host.yml

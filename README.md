@@ -893,6 +893,33 @@ human administrator access.
 | `make inspect-operations` | LIVE/read-only preflight; PASS/WARN are ready, FAIL blocks |
 | `make setup-operations` | LIVE/mutating; preflight then TTY confirmation `[y/N]`, default deny |
 | `make verify-operations` | LIVE/read-only; require installed policy, packages, timers and limits |
+| `make preview-apt-policy` | LIVE/check-diff; preview only the exact missing APT policy line |
+| `make apply-apt-policy` | LIVE/mutating; guarded APT-only replacement after default-deny TTY confirmation |
+
+For the diagnosed missing `Unattended-Upgrade::Remove-New-Unused-Dependencies
+"false";` directive, use the separate APT-only entry point. It reuses strict
+managed SSH/sudo, existing host trust and Stage 3/5 inspectors. Preview and apply
+each require separate LIVE authorization:
+
+```bash
+make preview-apt-policy INVENTORY=inventories/production.yml
+# Only after reviewing the preview and separately authorizing application:
+make apply-apt-policy INVENTORY=inventories/production.yml
+make verify-operations INVENTORY=inventories/production.yml
+```
+
+The destination must already be a root:root regular file with mode 0644 and
+trusted parent paths. Its bytes must match the current `apt-security.j2` template
+exactly, or differ only by that one missing line. A wider diff, unsafe metadata,
+concurrent replacement or lock contention stops the command without attempting
+repair. Preview uses Ansible `--check --diff` and does not write the managed APT
+file; Ansible may create temporary execution files. Apply replaces only
+`/etc/apt/apt.conf.d/99zz-portfolio-security` atomically and runs existing Stage 5
+verification. An already matching file is unchanged. This path does not install
+packages or configure Docker, journald, timers, SSH, sudoers or accounts.
+If application or subsequent verification fails, the APT file may already have
+changed: stop, inspect read-only and do not retry blindly. `setup-operations`
+retains its broader scope and must not be used as an APT-only repair.
 
 Setup installs `unattended-upgrades` and `logrotate` with `state: present`, without
 an immediate package-index refresh or upgrade. It manages one marked APT file,

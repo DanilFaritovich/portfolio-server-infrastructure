@@ -900,6 +900,33 @@ SSH-маршрут inventory; все маршруты и доступ челов
 | `make inspect-operations` | LIVE/read-only preflight: PASS/WARN допускаются, FAIL блокирует |
 | `make setup-operations` | LIVE/изменения: preflight, затем TTY-подтверждение `[y/N]`, по умолчанию отказ |
 | `make verify-operations` | LIVE/read-only: требует применённые настройки, пакеты, таймеры и лимиты |
+| `make preview-apt-policy` | LIVE/check-diff: preview только одной отсутствующей строки APT policy |
+| `make apply-apt-policy` | LIVE/изменения: guarded APT-only replacement после TTY-подтверждения `[y/N]` |
+
+Для выявленной отсутствующей директивы
+`Unattended-Upgrade::Remove-New-Unused-Dependencies "false";` предусмотрен отдельный
+APT-only entry point. Он использует существующие strict SSH/sudo, host trust и
+инспекторы Stage 3/5. Preview и применение требуют отдельных LIVE-разрешений:
+
+```bash
+make preview-apt-policy INVENTORY=inventories/production.yml
+# Только после проверки preview и отдельного разрешения на применение:
+make apply-apt-policy INVENTORY=inventories/production.yml
+make verify-operations INVENTORY=inventories/production.yml
+```
+
+Назначение должно уже быть regular file root:root с mode 0644 и доверенными
+родительскими каталогами. Байты должны точно совпадать с текущим `apt-security.j2`
+либо отличаться только отсутствием одной указанной строки. Более широкий diff,
+небезопасные metadata, конкурентная замена и занятый lock останавливают команду
+без попытки исправления. Preview использует Ansible `--check --diff` и не записывает
+managed APT-файл; Ansible может создавать временные файлы выполнения. Применение
+атомарно заменяет только `/etc/apt/apt.conf.d/99zz-portfolio-security`, затем запускает
+существующую verification Stage 5. Совпадающий файл остаётся unchanged. Этот путь
+не устанавливает пакеты и не настраивает Docker, journald, timers, SSH, sudoers или
+аккаунты. При ошибке применения или последующей verification APT-файл уже мог
+измениться: STOP, read-only диагностика, без слепого повтора. `setup-operations`
+сохраняет широкий объём действий и не подходит для APT-only исправления.
 
 Роль устанавливает `unattended-upgrades` и `logrotate` с `state: present`, без
 немедленного обновления индексов или пакетов. Один маркированный APT-файл очищает
