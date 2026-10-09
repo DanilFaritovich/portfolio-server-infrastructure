@@ -99,11 +99,16 @@ def read_account(name, controller):
     rc, groups, _ = Runner({}).run_command(['id', '-Gn', name])
     require(rc == 0 and set(groups.split()) == set(record['groups']) | {name},
             'Unmanaged supplementary group state; review manually.')
-    rc, listing, _ = Runner({}).run_command(['sudo', '-n', '-l', '-w', '10000', '-U', name])
+    try:
+        rc, listing, _ = Runner({}).run_command(['sudo', '-n', '-l', '-U', name])
+    except (OSError, subprocess.TimeoutExpired):
+        raise PreflightError('Cannot inspect effective sudo grants; sudo listing failed.') from None
+    require(rc == 0 or (record['sudo'] == 'none' and rc == 1),
+            'Cannot inspect effective sudo grants; sudo listing failed.')
     grants = [line.strip() for line in listing.splitlines() if line.strip().startswith('(')]
     expected = '(ALL : ALL) NOPASSWD: ' + ', '.join(record['commands'])
     if record['sudo'] == 'none':
-        require(not grants and rc in (0, 1), 'Unmanaged sudo grants; review manually.')
+        require(not grants, 'Unmanaged sudo grants; review manually.')
     else:
         permitted = {expected}
         if record['sudo'] == 'admin' and set(record['groups']) & {'sudo', 'admin'}:

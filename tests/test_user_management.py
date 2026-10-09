@@ -18,6 +18,7 @@ engine = types.ModuleType('user_engine')
 source = (ROOT / 'library/portfolio_human_info.py').read_text().split('def main():')[0]
 exec(compile(source.replace('from ansible.module_utils.basic import AnsibleModule', ''), 'human_info', 'exec'), engine.__dict__)
 exec(compile((ROOT / 'scripts/user_management.py').read_text(), 'user_management', 'exec'), engine.__dict__)
+runner_run_command = engine.Runner.run_command
 spec = importlib.util.spec_from_file_location('management_access', ROOT / 'scripts/access.py')
 access = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(access)
@@ -66,6 +67,7 @@ class EngineTests(unittest.TestCase):
         if argv[0] == 'id':
             return 0, argv[-1] + '\n', ''
         if argv[0] == 'sudo':
+            self.assert_sudo_argv(argv)
             return 0, '    (ALL : ALL) NOPASSWD: ALL\n', ''
         if argv[0] == '/usr/sbin/sshd':
             return 0, ('authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\n'
@@ -78,6 +80,9 @@ class EngineTests(unittest.TestCase):
         if argv[0] == 'getent':
             return 2 if self.deleted else 0, '', ''
         self.fail('Unexpected command: ' + repr(argv))
+
+    def assert_sudo_argv(self, argv):
+        self.assertEqual(['sudo', '-n', '-l', '-U', argv[-1]], argv)
 
     def params(self, action, **extra):
         before = engine.read_account('operator', 'controller')[0]
@@ -190,11 +195,87 @@ class EngineTests(unittest.TestCase):
         record.update(sudo='none', commands=[])
         (self.state / 'operator.json').write_text(json.dumps(record))
         (self.sudo / 'portfolio-human-operator').unlink()
-        with patch.object(engine.Runner, 'run_command', side_effect=lambda argv, **kw:
-                          (1, '', '') if argv[0] == 'sudo' and argv[-1] == 'operator' else self.command(argv, **kw)):
+        def denied(argv, **kwargs):
+            if argv[0] == 'sudo' and argv[-1] == 'operator':
+                self.assert_sudo_argv(argv)
+                return 1, '', ''
+            return self.command(argv, **kwargs)
+        with patch.object(engine.Runner, 'run_command', side_effect=denied):
             result = engine.execute(self.params('add-user-key', key=key(2)))
         self.assertEqual('none', result['sudo'])
         self.assertFalse((self.sudo / 'portfolio-human-operator').exists())
+
+    def test_sudo_listing_requires_success_for_admin_even_with_valid_grant_output(self):
+        for rc in (1, -9):
+            def failed_listing(argv, **kwargs):
+                if argv[0] == 'sudo':
+                    self.assert_sudo_argv(argv)
+                    return rc, '(ALL : ALL) NOPASSWD: ALL\n', ''
+                return self.command(argv, **kwargs)
+            with patch.object(engine.Runner, 'run_command', side_effect=failed_listing):
+                with self.assertRaisesRegex(engine.PreflightError, 'Cannot inspect effective sudo grants; sudo listing failed'):
+                    engine.read_account('operator', 'controller')
+
+    def test_sudo_listing_execution_errors_are_sanitized(self):
+        diagnostic = 'Cannot inspect effective sudo grants; sudo listing failed.'
+        for error in (OSError('private stderr detail'), subprocess.TimeoutExpired('sudo', 30)):
+            def broken_listing(argv, **kwargs):
+                if argv[0] == 'sudo':
+                    self.assert_sudo_argv(argv)
+                    raise error
+                return self.command(argv, **kwargs)
+            with patch.object(engine.Runner, 'run_command', side_effect=broken_listing):
+                with self.assertRaises(engine.PreflightError) as raised:
+                    engine.read_account('operator', 'controller')
+            self.assertEqual(diagnostic, str(raised.exception))
+            self.assertNotIn('private stderr detail', str(raised.exception))
+
+    def test_sudo_grant_matching_rejects_extra_missing_and_unmanaged_entries(self):
+        cases = (
+            (0, '(ALL : ALL) NOPASSWD: ALL\n(root) NOPASSWD: ALL\n'),
+            (0, ''),
+            (0, '(root) NOPASSWD: ALL\n'),
+        )
+        for rc, output in cases:
+            def altered_listing(argv, **kwargs):
+                if argv[0] == 'sudo':
+                    self.assert_sudo_argv(argv)
+                    return rc, output, ''
+                return self.command(argv, **kwargs)
+            with patch.object(engine.Runner, 'run_command', side_effect=altered_listing):
+                with self.assertRaises(engine.PreflightError):
+                    engine.read_account('operator', 'controller')
+
+    def test_regular_user_only_accepts_denied_listing_without_grants(self):
+        record = json.loads((self.state / 'operator.json').read_text())
+        record.update(sudo='none', commands=[])
+        (self.state / 'operator.json').write_text(json.dumps(record))
+        for rc, output, should_raise in ((1, '', False), (2, '', True), (1, '(root) ALL\n', True)):
+            def ordinary_listing(argv, **kwargs):
+                if argv[0] == 'sudo':
+                    self.assert_sudo_argv(argv)
+                    return rc, output, ''
+                return self.command(argv, **kwargs)
+            with patch.object(engine.Runner, 'run_command', side_effect=ordinary_listing):
+                if should_raise:
+                    with self.assertRaises(engine.PreflightError):
+                        engine.read_account('operator', 'controller')
+                else:
+                    self.assertEqual('none', engine.read_account('operator', 'controller')[0]['sudo'])
+
+    def test_admin_sudo_listing_uses_exact_argv_and_accepts_expected_grant(self):
+        with patch.object(engine.Runner, 'run_command', side_effect=self.command) as run:
+            account = engine.read_account('operator', 'controller')[0]
+        run.assert_any_call(['sudo', '-n', '-l', '-U', 'operator'])
+        self.assertEqual('admin', account['sudo'])
+        self.assertEqual(['ALL'], account['commands'])
+
+    def test_runner_subprocess_call_keeps_bounded_timeout(self):
+        completed = subprocess.CompletedProcess(['id'], 0, '', '')
+        with patch.object(engine.subprocess, 'run', return_value=completed) as run:
+            self.assertEqual((0, '', ''), runner_run_command(engine.Runner({}), ['id']))
+        self.assertEqual(30, run.call_args.kwargs['timeout'])
+        self.assertEqual(['id'], run.call_args.args[0])
 
     def test_mutations_require_confirmation_and_retained_admin(self):
         for extra in ({'confirmed': False}, {'recovery_user': 'operator'}, {'recovery_user': 'controller'}):
@@ -204,8 +285,11 @@ class EngineTests(unittest.TestCase):
     def test_unmanaged_groups_and_ssh_sources_block(self):
         for command, output in (('id', 'operator docker'), ('/usr/sbin/sshd', 'authorizedkeyscommand /custom'),
                                 ('sudo', '(root) NOPASSWD: ALL')):
-            with patch.object(engine.Runner, 'run_command', side_effect=lambda argv, **kw:
-                              (0, output, '') if argv[0] == command else self.command(argv, **kw)):
+            def altered_probe(argv, **kwargs):
+                if argv[0] == 'sudo':
+                    self.assert_sudo_argv(argv)
+                return (0, output, '') if argv[0] == command else self.command(argv, **kwargs)
+            with patch.object(engine.Runner, 'run_command', side_effect=altered_probe):
                 with self.assertRaises(engine.PreflightError):
                     engine.read_account('operator', 'controller')
 
