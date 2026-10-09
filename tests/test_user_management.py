@@ -5,7 +5,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import struct
+import subprocess
 import tempfile
 import types
 import unittest
@@ -113,6 +115,25 @@ class EngineTests(unittest.TestCase):
         result = engine.execute(self.params('add-user-key', key=key(1)))
         self.assertTrue(result['keys'][0]['managed'])
 
+    def test_failed_ledger_write_preserves_access_and_requires_explicit_registration(self):
+        with patch.object(engine, 'write_ledger', side_effect=OSError('disk failure')):
+            with self.assertRaises(OSError):
+                engine.execute(self.params('add-user-key', key=key(2)))
+        account = engine.read_account('operator', 'controller')[0]
+        self.assertEqual([True, False], [entry['managed'] for entry in account['keys']])
+        with self.assertRaises(engine.PreflightError):
+            engine.execute(self.params('revoke-user-key', fingerprint=engine.fingerprint(key(2))))
+        self.assertTrue(engine.execute(self.params('add-user-key', key=key(2)))['changed'])
+        self.assertFalse(engine.execute(self.params('add-user-key', key=key(2)))['changed'])
+
+    def test_two_controllers_share_server_ownership_and_preserve_each_other_keys(self):
+        engine.execute(self.params('add-user-key', key=key(2)))
+        result = engine.execute(self.params('add-user-key', key=key(3), controller='second_controller'))
+        self.assertTrue(all(entry['managed'] for entry in result['keys']))
+        result = engine.execute(self.params('revoke-user-key', fingerprint=engine.fingerprint(key(2)),
+                                            controller='second_controller'))
+        self.assertEqual([key(1), key(3)], [entry['key'] for entry in result['keys']])
+
     def test_options_and_duplicate_identity_are_not_replaced(self):
         path = self.home / 'operator/.ssh/authorized_keys'
         for content in ('restrict ' + key(1) + '\n', key(1) + '\n' + key(1) + '\n'):
@@ -206,11 +227,20 @@ class EngineTests(unittest.TestCase):
 class WrapperTests(unittest.TestCase):
     def setUp(self):
         self.events = []
-        self.key = Path('/synthetic/controller')
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.controller_key = Path(self.temp.name) / 'controller'
+        self.recovery_key = Path(self.temp.name) / 'recovery'
+        for path, identity in ((Path(str(self.controller_key) + '.pub'), key(1)),
+                               (Path(str(self.recovery_key) + '.pub'), key(2))):
+            path.write_text(identity + '\n')
+            path.chmod(0o600)
+        self.key = self.controller_key
         self.inputs = {'ssh_listen_ports': [2222], 'ssh_verify_ports': [2222], 'firewall_allowed_tcp_ports': []}
         for name, kwargs in (
             ('managed_access', {'return_value': ('controller', self.key)}), ('prerequisites', {}),
             ('check_key', {}), ('known_host', {}),
+            ('human_key_path', {'return_value': self.recovery_key}),
             ('load_host', {'return_value': ('portfolio', 'host.test', 2222, 'root', '/usr/bin/python3')}),
             ('hardening_inputs', {'return_value': self.inputs}),
             ('operations_probe', {'side_effect': lambda *args: self.events.append('managed-proof')}),
@@ -260,6 +290,36 @@ class WrapperTests(unittest.TestCase):
                 access.user_management('remove-user', Path('/synthetic/inventory'))
         self.assertNotIn('mutate', self.events)
 
+    def test_copied_controller_identity_cannot_be_used_as_recovery(self):
+        Path(str(self.recovery_key) + '.pub').write_text(key(1) + ' different-comment')
+        with patch('builtins.input') as confirmation, self.assertRaisesRegex(ValueError, 'different SSH key identities'):
+            access.user_management('remove-user', Path('/synthetic/inventory'))
+        confirmation.assert_not_called()
+        self.assertNotIn('recovery-proof', self.events)
+        self.assertNotIn('mutate', self.events)
+
+    def test_recovery_ssh_or_sudo_failure_never_confirms_or_mutates(self):
+        for error in (ValueError('SSH failed'), subprocess.CalledProcessError(1, 'sudo')):
+            with patch.object(access, 'verify_human', side_effect=error), patch('builtins.input') as confirmation:
+                with self.assertRaises(type(error)):
+                    access.user_management('remove-user', Path('/synthetic/inventory'))
+            confirmation.assert_not_called()
+        self.assertNotIn('mutate', self.events)
+
+    def test_public_key_confirmation_escapes_terminal_controls(self):
+        public = Path(self.temp.name) / 'import.pub'
+        public.write_text(key(3) + ' \x1b[2J')
+        public.chmod(0o600)
+        with patch.dict(os.environ, HUMAN_PUBLIC_KEY=str(public)), \
+                patch('builtins.input', return_value='no'), patch('builtins.print') as output:
+            with self.assertRaises(ValueError):
+                access.user_management('add-user-key', Path('/synthetic/inventory'))
+        display = [call.args[0] for call in output.call_args_list if call.args and
+                   str(call.args[0]).startswith('Public key to add:')][0]
+        self.assertNotIn('\x1b', display)
+        self.assertIn('\\u001b', display)
+        self.assertNotIn('mutate', self.events)
+
     def test_read_only_command_never_mutates(self):
         access.user_management('list-users', Path('/synthetic/inventory'))
         self.assertEqual(['inspect'], self.events)
@@ -287,6 +347,36 @@ class WrapperTests(unittest.TestCase):
 
 
 class SafetySurfaceTests(unittest.TestCase):
+    def test_recovery_verification_selects_only_the_requested_agent_identity(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        selected = Path(temporary.name) / 'recovery'
+        selected.touch(mode=0o600)
+        managed = {'ansible_user': 'controller', 'ansible_ssh_args': access.SSH_BASE +
+                   ' -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none'
+                   ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
+                   ' -o KbdInteractiveAuthentication=no'}
+        with patch.object(access, 'check_key'), patch.object(access, 'public_key_file'), \
+                patch.object(access, 'run_playbook') as playbook:
+            access.verify_human(Path('/synthetic/inventory'), 'portfolio', 'host.test', 2222,
+                                managed, {'ssh_verify_ports': [2222, 2223]},
+                                {'human_access_user_name': 'recovery', 'human_access_user_sudo': 'admin'},
+                                selected)
+        for call in playbook.call_args_list:
+            connection = call.args[2]
+            # OpenSSH -G parses local options only; no network or private-key reads.
+            result = subprocess.run(['ssh', '-G', *shlex.split(connection['ansible_ssh_args']),
+                                     '-i', connection['ansible_private_key_file'], '-p', str(connection['ansible_port']),
+                                     'recovery@host.test'], capture_output=True, text=True, check=True)
+            settings = result.stdout.splitlines()
+            self.assertEqual(['identityfile ' + str(selected)],
+                             [line for line in settings if line.startswith('identityfile ')])
+            for setting in ('identitiesonly yes', 'forwardagent no', 'clearallforwardings yes',
+                            'passwordauthentication no', 'kbdinteractiveauthentication no',
+                            'stricthostkeychecking true', 'hostkeyalias [host.test]:2222'):
+                self.assertIn(setting, settings)
+            self.assertNotIn('identityagent none', settings)
+
     def test_make_commands_forward_selected_inputs_without_host_contact(self):
         import subprocess
         with tempfile.TemporaryDirectory() as directory:

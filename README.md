@@ -166,7 +166,7 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make connect-controller` | Interactive SSH as the inventory managed user | **LIVE / interactive session** |
 | `make connect-user` | Interactive SSH as the selected human user | **LIVE / interactive session** |
 | `make bootstrap-user` | Create/reuse dedicated key, bootstrap account, then verify | **LIVE / MUTATING** |
-| `make verify-access` | Verify existing key-only ansible access | **LIVE / verification**, no managed configuration changes |
+| `make verify-access` | Verify inventory managed key-only access | **LIVE / verification**, no managed configuration changes |
 | `make docker-host` | Provision Docker packages, logging policy and services | **LIVE / MUTATING**, managed key-only access |
 | `make verify-docker` | Check Docker/services and run a disposable container | **LIVE / verification**, transient container/image-cache changes |
 | `make inspect-hardening` | Report all Stage 3 safety findings before harden | **LIVE / read-only**, exit 0 for PASS/WARN, non-zero for FAIL |
@@ -1054,7 +1054,14 @@ make remove-user HUMAN_USER=operator \
 ```
 
 The retained administrator must differ from the target and current controller. Its
-fresh key-only SSH and `sudo -n` access are proven on every `ssh_verify_ports` route.
+key identity must also differ from the controller key; copying that key to another
+path does not qualify. OpenSSH verification ignores client configuration, additional
+identities, proxies and forwarding; only the selected identity may use the human's
+existing agent. Key paths cannot contain OpenSSH expansion tokens. Automation remains
+agent-independent, so its dedicated key must be usable without a passphrase prompt.
+The recovery keypair must be local, complete and protected with the same permissions
+as other human keys; unlock an encrypted recovery key in your agent before verification.
+Fresh key-only SSH and `sudo -n` access are proven on every `ssh_verify_ports` route.
 Without that proof the last confirmed human administrative access cannot be removed.
 Keep provider-console recovery available. Mutations verify Stage 3 and managed access,
 show the current state/request, require default-deny TTY confirmation, and reject state
@@ -1078,3 +1085,56 @@ confirmation, retained files, strict transport and Make wrappers. Live operator 
 remain necessary: import keys from two PCs, verify each identity independently, revoke
 one and prove new login fails while the other succeeds, remove a disposable managed
 account and confirm its files remain, then check repeated operations and Stage 1–5 access.
+
+## Stage 6 integration: manual LIVE checklist
+
+Offline validation does not establish VPS access or live idempotency. Run these steps
+only as separately approved operator operations, with a tested provider console and
+retained admin session. Use disposable usernames/keys for revocation and removal.
+
+1. **Baseline and migration.** Keep the old ignored inventory and verify its access.
+   On a secured VPS, follow [the candidate-inventory migration](#managed-user-configuration-and-migration):
+   create the new admin through `add-user`, verify it, then run `verify-access` against
+   the candidate inventory. Keep the current ports and SSH policy. Password bootstrap
+   belongs only to a fresh VPS with its initial login still available.
+2. **Local identities and trust.** On each PC run `make setup`, create a separate key
+   with `generate-user-key`, and display its public member with `show-public-key`.
+   Verify host fingerprints independently before recording local trust. Use passphrases
+   and `ssh-add` for human/recovery keys; use a dedicated unencrypted key for automation.
+   Transfer only `.pub` files. `show-controller` must display that PC's intended inventory
+   user/key. Missing trust or a conflicting key override must stop access.
+3. **Second controller and sudo.** Through the first controller, add the second PC's
+   public key to a separate managed admin with `add-user`/`add-user-key`. On PC 2, verify
+   its candidate inventory with `verify-access`; independently verify the human admin
+   with `verify-user HUMAN_USER=… HUMAN_SUDO=admin HUMAN_KEY=…`. In `connect-controller`
+   and `connect-user`, check `id -un` and `sudo -n id -u` (admin result: `0`). Both PCs
+   must continue working without copying private keys or relying on the other's agent.
+4. **Exact keys and recovery refusal.** Add two PC keys to a disposable human account,
+   inspect them with `list-user-keys`, and verify each from its owner PC. Repeat the add:
+   expect `changed: false`. With a separate proven `RECOVERY_USER`/`RECOVERY_KEY`, revoke
+   one fingerprint. A fresh session with it must fail, while the other key, controller
+   and recovery admin still work. Repeat revocation: expect unchanged. A wrong/unloaded
+   recovery key, missing sudo, copied controller key, target/controller recovery username
+   or declined confirmation must leave target state untouched. Existing sessions survive
+   key revocation; test with fresh connections.
+5. **Removal and files.** Create a marker file under the disposable user's home and
+   close its sessions/processes. Register any legacy key by its identical public line
+   before removal. Remove it using the separate recovery proof, then verify absent
+   account/sudo, empty authorized keys, preserved marker/home with numeric ownership,
+   unchanged recovery/controller access and an unchanged repeated removal. Recreation
+   must fail. Busy accounts and unmanaged keys must block removal before revocation.
+6. **Stage 1–5 regression and STOP.** From both candidate inventories run `verify-access`,
+   `verify-docker`, `verify-hardening`, `verify-ssh-security` with the retained human admin,
+   and `verify-operations`, in that order. Docker verification may populate its image
+   cache. Only after success deliberately select the candidate inventory. Repeated
+   provisioning and `changed=0` checks require separate approval; do not reboot or rerun
+   password bootstrap as a regression check on a secured VPS.
+
+Both controllers use the same protected server ownership records; there is no local
+ledger to synchronize. Protection applies to root and the current inventory controller;
+the server cannot discover other PCs' candidate inventories. Keep every active controller
+out of deletion tests, and retain a separate verified human admin. Unmanaged legacy
+automation accounts cannot be removed through these commands. If key installation
+succeeds but ledger writing fails, the new entry remains unmanaged: inspect through
+recovery, then explicitly register its identical public line. A failure after credentials
+or sudo were revoked requires manual recovery inspection, without blind retries.

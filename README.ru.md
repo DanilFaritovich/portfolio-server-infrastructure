@@ -164,7 +164,7 @@ password prompts и agent. Paramiko используется только для
 | `make connect-controller` | Интерактивный SSH под рабочим пользователем inventory | **LIVE / интерактивная сессия** |
 | `make connect-user` | Интерактивный SSH под указанным пользователем | **LIVE / интерактивная сессия** |
 | `make bootstrap-user` | Создать/использовать dedicated key, bootstrap account, проверить доступ | **LIVE / MUTATING** |
-| `make verify-access` | Проверить существующий key-only доступ ansible | **LIVE / verification**, без изменений managed configuration |
+| `make verify-access` | Проверить key-only доступ managed user из inventory | **LIVE / verification**, без изменений managed configuration |
 | `make docker-host` | Установить Docker, logging policy и настроить services | **LIVE / MUTATING**, managed key-only access |
 | `make verify-docker` | Проверить Docker/services и disposable container | **LIVE / verification**, временные container/image-cache changes |
 | `make inspect-hardening` | Собрать все Stage 3 safety findings перед harden | **LIVE / read-only**, exit 0 для PASS/WARN, non-zero для FAIL |
@@ -1063,6 +1063,14 @@ make remove-user HUMAN_USER=operator \
 ```
 
 Сохраняемый admin должен отличаться от цели и текущего контроллера. Свежий key-only SSH
+доказывается отдельной ключевой identity: копия ключа контроллера по другому пути
+не подходит. Проверки OpenSSH игнорируют client config, дополнительные identity,
+proxy и forwarding; human ssh-agent может использовать только выбранную identity.
+Пути ключей не допускают подстановок OpenSSH. Automation остаётся независимой от
+agent, поэтому выделенный ключ должен работать без запроса passphrase. Recovery-keypair
+должна быть локальной, полной и защищённой теми же правами, что остальные human keys;
+заранее разблокируйте зашифрованный recovery-ключ через `ssh-add`.
+Key-only SSH
 и `sudo -n` проверяются на каждом маршруте `ssh_verify_ports`. Без этого доказательства
 последний подтверждённый human-admin доступ нельзя удалить. Сохраняйте provider-console
 recovery. Мутации проверяют Stage 3 и managed access, показывают состояние/запрос,
@@ -1088,3 +1096,56 @@ Offline checks покрывают границы принадлежности, �
 проверить обе identity, отозвать один и подтвердить отказ нового входа при успешном входе
 вторым, удалить тестовый managed account и проверить сохранность файлов, затем проверить
 повторные операции и доступ Stage 1–5.
+
+## Stage 6: checklist ручной интеграционной LIVE-проверки
+
+Offline-проверки не доказывают доступ к VPS или LIVE-идемпотентность. Каждый шаг
+выполняется оператором по отдельному разрешению, с проверенной provider console и
+сохранённой admin-сессией. Для отзыва и удаления используйте тестовые аккаунты/ключи.
+
+1. **Исходный доступ и миграция.** Сохраните старый ignored inventory и проверьте доступ.
+   На защищённом VPS следуйте [миграции через candidate inventory](#настройка-рабочего-пользователя-и-миграция):
+   создайте нового admin через `add-user`, проверьте его, затем выполните `verify-access`
+   с candidate inventory. Сохраните порты и SSH policy. Password bootstrap применим
+   только к новому VPS с ещё доступным initial login.
+2. **Локальные ключи и trust.** На каждом ПК выполните `make setup`, создайте отдельный
+   ключ через `generate-user-key`, покажите публичную часть через `show-public-key`.
+   Независимо сверьте host fingerprints перед записью локального trust. Для human/recovery
+   используйте passphrase и `ssh-add`, для automation — выделенный незашифрованный ключ.
+   Передавайте только `.pub`. `show-controller` должен показывать выбранные на этом ПК
+   inventory user/key. Отсутствующий trust и конфликтующий override должны блокировать доступ.
+3. **Второй контроллер и sudo.** С первого контроллера добавьте public key второго ПК
+   отдельному managed admin через `add-user`/`add-user-key`. На ПК 2 проверьте candidate
+   inventory через `verify-access`, а human admin независимо через
+   `verify-user HUMAN_USER=… HUMAN_SUDO=admin HUMAN_KEY=…`. В `connect-controller` и
+   `connect-user` проверьте `id -un` и `sudo -n id -u` (для admin: `0`). Оба ПК должны
+   работать без копирования private keys и зависимости от agent другого ПК.
+4. **Точечный отзыв и отказ recovery.** Добавьте два ключа разных ПК тестовому human account,
+   просмотрите `list-user-keys` и проверьте каждый с ПК владельца. Повторное добавление:
+   `changed: false`. С отдельными доказанными `RECOVERY_USER`/`RECOVERY_KEY` отзовите один
+   fingerprint. Новый вход им должен отказать, второй ключ, controller и recovery admin
+   должны работать. Повторный отзыв — unchanged. Неверный/неразблокированный recovery-ключ,
+   отсутствие sudo, копия controller key, recovery username цели/контроллера и отказ
+   подтверждения должны сохранять состояние цели. Старые сессии переживают отзыв ключа;
+   проверяйте новые подключения.
+5. **Удаление и файлы.** Создайте marker file в home тестового пользователя и закройте
+   его сессии/процессы. Legacy keys предварительно зарегистрируйте идентичной public line.
+   Удалите пользователя с отдельным recovery proof; проверьте отсутствие account/sudo,
+   пустые authorized keys, сохранность marker/home с числовыми владельцами, рабочий
+   recovery/controller доступ и unchanged при повторном удалении. Пересоздание должно
+   блокироваться. Активные процессы и unmanaged keys должны блокировать удаление до отзыва.
+6. **Регрессии Stage 1–5 и STOP.** С обоих candidate inventories последовательно выполните
+   `verify-access`, `verify-docker`, `verify-hardening`, `verify-ssh-security` с сохраняемым
+   human admin и `verify-operations`. Docker verification может пополнить image cache.
+   Только после успеха явно выберите candidate inventory. Повторный provisioning и
+   проверки `changed=0` требуют отдельного разрешения; не перезагружайте VPS и не
+   повторяйте password bootstrap на защищённом сервере ради регрессии.
+
+Оба контроллера используют общие защищённые серверные записи; локального ledger для
+синхронизации нет. Защищены root и текущий inventory controller; сервер не может узнать
+candidate inventories других ПК. Исключите все действующие контроллеры из тестов удаления
+и сохраняйте отдельного проверенного human admin. Unmanaged legacy automation accounts
+этими командами не удаляются. Если ключ установлен, но запись ledger завершилась ошибкой,
+новая запись остаётся unmanaged: проверьте состояние через recovery, затем явно
+зарегистрируйте идентичную public line. Ошибка после отзыва credentials или sudo требует
+ручной проверки через recovery без слепого повторения.

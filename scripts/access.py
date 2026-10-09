@@ -23,7 +23,9 @@ DEFAULT_KEY = Path.home() / '.ssh/portfolio-server-infrastructure/ansible_ed2551
 PASSWORD_CONNECTION = 'portfolio_password'
 HARDENING_FIELDS = {'ssh_listen_ports', 'ssh_verify_ports', 'firewall_allowed_tcp_ports'}
 HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'bootstrap_login_user', 'ansible_private_key_file', 'ansible_python_interpreter'} | HARDENING_FIELDS
-SSH_BASE = '-o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=15'
+SSH_BASE = ('-F /dev/null -o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none'
+            ' -o ConnectTimeout=15 -o ForwardAgent=no -o ClearAllForwardings=yes'
+            ' -o PermitLocalCommand=no -o UpdateHostKeys=no')
 
 
 def require(condition, message):
@@ -140,6 +142,7 @@ def hardening_inputs(path, alias, port, validate=True):
 
 def key_path(value):
     path = Path(value).expanduser().absolute()
+    validate_cli_path(path)
     require(not path.resolve().is_relative_to(ROOT), 'Keep automation keys outside the repository.')
     require(not any(part.is_symlink() for part in [path, *path.parents]), 'Key paths must not use symlinks.')
     return path
@@ -466,6 +469,7 @@ def human_key_path(value, name, key_name=None):
         require(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}', key_name) and not key_name.endswith('.pub'),
                 'KEY_NAME must be a simple private-key filename, without directories or a .pub suffix.')
     path = Path(value or Path.home() / '.ssh/portfolio-infra' / (key_name or name + '_ed25519')).expanduser().absolute()
+    validate_cli_path(path)
     require(not any(p.is_symlink() for p in [path, *path.parents]), 'Human key paths must not use symlinks.')
     require(not path.resolve().is_relative_to(ROOT) or
             path.resolve().is_relative_to(ROOT / 'secrets/portfolio-infra'),
@@ -776,6 +780,10 @@ def user_management(mode, inventory, override=None):
                 'Set RECOVERY_USER to another managed human admin whose access will be retained.')
         recovery_key = human_key_path(os.environ.get('RECOVERY_KEY'), recovery)
         require(recovery_key != key, 'Use a separate recovery administrator key.')
+        check_key(recovery_key)
+        recovery_public = public_key_file(str(recovery_key) + '.pub').read_text().split()[:2]
+        controller_public = public_key_file(str(key) + '.pub').read_text().split()[:2]
+        require(recovery_public != controller_public, 'Recovery and controller must use different SSH key identities.')
         retained = probe({'action': 'show-user', 'name': recovery})
         require(retained.get('sudo') == 'admin', 'Recovery account must be a managed administrator.')
         managed = {'ansible_user': controller, 'ansible_connection': 'ssh',
@@ -791,7 +799,7 @@ def user_management(mode, inventory, override=None):
     require(sys.stdin.isatty(), 'User/key mutation requires interactive recovery confirmation.')
     print(json.dumps(before, indent=2))
     if mode == 'add-user-key':
-        print('Public key to add: ' + params['key'])
+        print('Public key to add: ' + json.dumps(params['key']))
     elif mode == 'revoke-user-key':
         print('Fingerprint to revoke: ' + params['fingerprint'])
     print('LIVE / MUTATING: ' + mode + ' for ' + name + '. Keep provider console recovery available.', flush=True)

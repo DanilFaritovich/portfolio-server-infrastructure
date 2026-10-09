@@ -154,6 +154,8 @@ class ConfigurableAccessTests(unittest.TestCase):
         original = dict(self.host)
         cases = [{'ansible_user': 'root'}, {'ansible_user': '-option'},
                  {'ansible_private_key_file': 'relative/key'}, {'ansible_private_key_file': '{{ secret }}'},
+                 {'ansible_private_key_file': '/synthetic/key%r'},
+                 {'ansible_private_key_file': '/synthetic/${USER}/key'},
                  {'ansible_private_key_file': True}, {'bootstrap_login_user': '-option'}]
         for missing in ('ansible_user', 'bootstrap_login_user', 'ansible_private_key_file'):
             invalid = dict(original)
