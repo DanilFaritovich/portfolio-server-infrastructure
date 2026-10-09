@@ -2,13 +2,14 @@
 - name: Validate human account and explicit privilege policy
   ansible.builtin.assert:
     that:
-      - ansible_user == 'ansible'
+      - ansible_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+      - ansible_user != 'root'
       - ansible_connection == 'ssh'
       - human_access_user_name is match('^[a-z_][a-z0-9_-]{0,30}$')
-      - human_access_user_name not in ['root', 'ansible']
+      - human_access_user_name not in ['root', ansible_user]
       - human_access_user_groups is sequence and human_access_user_groups is not string
       - human_access_user_groups | unique | length == human_access_user_groups | length
-      - human_access_user_groups | intersect(['root', 'ansible', 'docker', 'lxd', 'disk', 'shadow']) | length == 0
+      - human_access_user_groups | intersect(['root', ansible_user, 'docker', 'lxd', 'disk', 'shadow']) | length == 0
       - human_access_user_sudo in ['none', 'admin', 'restricted']
       - human_access_user_sudo == 'admin' or human_access_user_groups | intersect(['sudo', 'admin']) | length == 0
       - human_access_user_sudo != 'admin' or human_access_user_sudo_commands == ['ALL']

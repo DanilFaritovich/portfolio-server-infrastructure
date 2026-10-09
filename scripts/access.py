@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_KEY = Path.home() / '.ssh/portfolio-server-infrastructure/ansible_ed25519'
 PASSWORD_CONNECTION = 'portfolio_password'
 HARDENING_FIELDS = {'ssh_listen_ports', 'ssh_verify_ports', 'firewall_allowed_tcp_ports'}
-HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'ansible_python_interpreter'} | HARDENING_FIELDS
+HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'bootstrap_login_user', 'ansible_private_key_file', 'ansible_python_interpreter'} | HARDENING_FIELDS
 SSH_BASE = '-o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=15'
 
 
@@ -61,25 +61,57 @@ def load_host(path, validate_hardening=True):
                 'Use a simple host alias such as portfolio.')
         require(alias != 'localhost', 'Reserve localhost for the controller; use a separate VPS alias.')
         require(isinstance(values, dict) and set(values) <= HOST_FIELDS,
-                'Only host, port, initial user, Python interpreter and hardening port lists belong in inventory.')
+                'Only host, port, access users/key path, Python interpreter and hardening port lists belong in inventory.')
         for name in HARDENING_FIELDS & values.keys() if validate_hardening else ():
             validate_ports(values[name], allow_empty=name == 'firewall_allowed_tcp_ports')
         host = values.get('ansible_host')
         port = values.get('ansible_port')
-        user = values.get('ansible_user', 'root')
+        user = values.get('bootstrap_login_user', values.get('ansible_user', 'root'))
+        validate_access_values(values)
         interpreter = values.get('ansible_python_interpreter', '/usr/bin/python3')
         require(isinstance(host, str) and re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.:-]*', host)
                 and not host.endswith('.invalid') and '{{' not in host,
                 'Set ansible_host to your verified VPS hostname or address.')
         require(type(port) is int and 1 <= port <= 65535, 'Set ansible_port to an integer from 1 to 65535.')
-        require(isinstance(user, str) and re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', user)
-                and user != 'ansible', 'Initial login must be root or another existing administrator.')
+        require(isinstance(user, str) and re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', user), 'Initial login must be root or another existing administrator.')
         require(isinstance(interpreter, str) and re.fullmatch(r'/[a-zA-Z0-9_./-]+', interpreter),
                 'Use an absolute Python interpreter path.')
     except (yaml.YAMLError, TypeError, KeyError, AttributeError):
         # Parser exceptions can include inventory contents: do not expose them.
         raise ValueError('Invalid inventory. Use the static example structure without credentials.') from None
     return alias, host, port, user, interpreter
+
+
+def validate_access_values(values):
+    """Explicit access contract; legacy initial-login inventories remain supported."""
+    explicit = 'bootstrap_login_user' in values or 'ansible_private_key_file' in values
+    if explicit:
+        require({'bootstrap_login_user', 'ansible_user', 'ansible_private_key_file'} <= values.keys(),
+                'Set bootstrap_login_user, ansible_user and ansible_private_key_file together.')
+        name = values['ansible_user']
+        require(isinstance(name, str) and re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', name)
+                and name != 'root', 'ansible_user must be a non-root managed Ubuntu username.')
+        value = values['ansible_private_key_file']
+        require(isinstance(value, str) and value and (value.startswith('/') or value.startswith('~/'))
+                and '{{' not in value and '\n' not in value,
+                'ansible_private_key_file must be an absolute or ~/ local key path.')
+        key_path(value)
+    else:
+        require(values.get('ansible_user', 'root') != 'ansible',
+                'Legacy inventory describes the initial login; use the explicit access fields for managed login.')
+
+
+def managed_access(inventory, override=None):
+    # Validate the entire static inventory before selecting any connection identity.
+    alias, _, _, _, _ = load_host(inventory, validate_hardening=False)
+    values = yaml.safe_load(inventory.read_text())['all']['children']['bootstrap']['hosts'][alias]
+    if 'ansible_private_key_file' in values:
+        key = key_path(values['ansible_private_key_file'])
+        require(not override or key_path(override) == key,
+                'Key override conflicts with ansible_private_key_file; update a candidate inventory explicitly.')
+        return values['ansible_user'], key
+    # Compatibility only: old inventory holds the initial login, with the established key.
+    return 'ansible', key_path(override or DEFAULT_KEY)
 
 
 def validate_ports(values, allow_empty=False):
@@ -252,16 +284,16 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
         subprocess.run(command, cwd=ROOT, check=True, env=environment)
 
 
-def inspect_host(host, port, interpreter, key, inputs):
+def inspect_host(host, port, interpreter, key, inputs, user):
     """Read-only SSH transport avoids Ansible's remote payload/tempfile writes."""
     ssh = ['ssh'] + shlex.split(SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
         '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
         '-o', 'KbdInteractiveAuthentication=no', '-o', 'IdentityAgent=none',
-        '-i', str(key), '-p', str(port), 'ansible@' + host,
+        '-i', str(key), '-p', str(port), user + '@' + host,
     ]
     login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False)
-    if login.returncode or login.stdout.strip() != 'ansible':
+    if login.returncode or login.stdout.strip() != user:
         print('Hardening preflight\nFAIL  managed SSH access\n'
               'FAIL  host inspection unavailable without managed key-only access\n\nResult: NOT READY')
         raise ValueError('Managed SSH access failed; remaining host checks cannot run safely.')
@@ -306,7 +338,8 @@ def verify_hardening(inventory, alias, host, port, stage, inputs):
         run_playbook(inventory, alias, connection | inputs, 'verify-hardening.yml')
 
 
-def live(mode, inventory, key):
+def live(mode, inventory, key=None):
+    managed_user, key = managed_access(inventory, key)
     prerequisites(mode)
     if mode in ('docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host'):
         try:
@@ -317,13 +350,15 @@ def live(mode, inventory, key):
     inputs = hardening_inputs(inventory, alias, port, validate=mode != 'inspect-hardening') if mode in ('harden', 'verify-hardening', 'inspect-hardening', 'reboot-host') else {}
     if mode == 'reboot-host':
         require(sys.stdin.isatty(), 'Reboot requires an interactive terminal; no reboot was requested.')
+    if mode == 'bootstrap-user':
+        require(user != managed_user, 'Bootstrap login and managed user must be separate accounts.')
     known_host(host, port, allow_trust=mode == 'bootstrap-user')
     if mode == 'inspect-hardening':
-        inspect_host(host, port, interpreter, key, inputs)
+        inspect_host(host, port, interpreter, key, inputs, managed_user)
         return
     if mode == 'bootstrap-user':
         require(sys.stdin.isatty(), 'Bootstrap requires an interactive terminal for the Ansible password prompt.')
-        print('LIVE / MUTATING: creates ansible and approves unrestricted NOPASSWD sudo.', flush=True)
+        print(f'LIVE / MUTATING: configures {managed_user} and approves unrestricted NOPASSWD sudo.', flush=True)
         prepare_key(key)
     else:
         check_key(key)
@@ -338,12 +373,12 @@ def live(mode, inventory, key):
             'ansible_paramiko_host_key_checking': True,
             'ansible_paramiko_private_key_file': '', 'ansible_paramiko_proxy_command': '',
             'ansible_paramiko_timeout': 15,
-            'bootstrap_user_name': 'ansible', 'bootstrap_user_public_key_path': str(key) + '.pub',
+            'bootstrap_user_name': managed_user, 'bootstrap_user_public_key_path': str(key) + '.pub',
             'bootstrap_user_allow_passwordless_sudo': True,
         }, 'bootstrap.yml', ask_pass=True, ask_become=user != 'root')
-    print('LIVE / VERIFY: checking key-only ansible access, ping and sudo -n. Run make bootstrap-user first if access fails.', flush=True)
+    print(f'LIVE / VERIFY: checking key-only {managed_user} access, ping and sudo -n.', flush=True)
     managed = variables | {
-        'ansible_user': 'ansible', 'ansible_private_key_file': str(key), 'ansible_become': False,
+        'ansible_user': managed_user, 'ansible_private_key_file': str(key), 'ansible_become': False,
         'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
                             ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
                             ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
@@ -396,17 +431,17 @@ def live(mode, inventory, key):
 
 
 
-def human_inputs(environment=None):
+def human_inputs(environment=None, managed_user='ansible'):
     env = os.environ if environment is None else environment
     name = env.get('HUMAN_USER', '')
-    require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', name or '') and name not in ('root', 'ansible'),
+    require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', name or '') and name not in ('root', managed_user),
             'Set HUMAN_USER to a separate non-root Ubuntu username.')
     policy = env.get('HUMAN_SUDO') or 'none'
     require(policy in ('none', 'admin', 'restricted'), 'HUMAN_SUDO must be none, admin or restricted.')
     groups = [value.strip() for value in env.get('HUMAN_GROUPS', '').split(',') if value.strip()]
     require(len(groups) == len(set(groups)) and all(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', g) for g in groups),
             'HUMAN_GROUPS must be unique comma-separated Ubuntu group names.')
-    require(not set(groups) & {'root', 'ansible', 'docker', 'lxd', 'disk', 'shadow'},
+    require(not set(groups) & {'root', managed_user, 'docker', 'lxd', 'disk', 'shadow'},
             'Root-equivalent/system groups are not supported for human accounts.')
     require(policy == 'admin' or not set(groups) & {'sudo', 'admin'},
             'sudo/admin group membership requires HUMAN_SUDO=admin.')
@@ -456,7 +491,7 @@ def verify_human(inventory, alias, host, port, managed, inputs, human, key):
                                 # Human encrypted keys may use their existing agent; only this identity is eligible.
                                 'ansible_ssh_args': managed['ansible_ssh_args'].replace(' -o IdentityAgent=none', '')
                                 + f' -o HostKeyAlias={identity}'}
-        run_playbook(inventory, alias, connection | human, 'verify-user.yml')
+        run_playbook(inventory, alias, connection | human | {'portfolio_automation_user': managed['ansible_user']}, 'verify-user.yml')
 
 
 
@@ -496,8 +531,9 @@ def verify_auth_methods(host, port, user, trust_name):
             transport.close()
 
 
-def human_access(mode, inventory, automation_key):
-    human = human_inputs()
+def human_access(mode, inventory, automation_key=None):
+    managed_user, automation_key = managed_access(inventory, automation_key)
+    human = human_inputs(managed_user=managed_user)
     name = human['human_access_user_name']
     key = human_key_path(os.environ.get('HUMAN_KEY'), name)
     require(key.resolve() != automation_key.resolve(), 'Use separate human and automation SSH keys.')
@@ -509,7 +545,7 @@ def human_access(mode, inventory, automation_key):
     inputs = hardening_inputs(inventory, alias, port)
     known_host(host, port)
     managed = {
-        'ansible_connection': 'ssh', 'ansible_user': 'ansible', 'ansible_host_key_checking': True,
+        'ansible_connection': 'ssh', 'ansible_user': managed_user, 'ansible_host_key_checking': True,
         'ansible_private_key_file': str(automation_key), 'ansible_become_flags': '-n',
         'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
         'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
@@ -562,21 +598,21 @@ def human_access(mode, inventory, automation_key):
         run_playbook(inventory, alias, managed | inputs, 'verify-ssh-security.yml')
         identity = host if port == 22 else f'[{host}]:{port}'
         for target in inputs['ssh_verify_ports']:
-            for login in ('ansible', name):
+            for login in (managed_user, name):
                 verify_auth_methods(host, target, login, identity)
     print('Requested human access stage completed. STOP.')
 
 
-def operations_probe(host, port, interpreter, key, module, params):
+def operations_probe(host, port, interpreter, key, module, params, user):
     """Strict key-only stream transport; no Ansible remote files or cache writes."""
     ssh = ['ssh'] + shlex.split(SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
         '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
         '-o', 'KbdInteractiveAuthentication=no', '-o', 'IdentityAgent=none',
-        '-i', str(key), '-p', str(port), 'ansible@' + host,
+        '-i', str(key), '-p', str(port), user + '@' + host,
     ]
     login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False, timeout=30)
-    require(login.returncode == 0 and login.stdout.strip() == 'ansible', 'Managed key-only SSH access failed.')
+    require(login.returncode == 0 and login.stdout.strip() == user, 'Managed key-only SSH access failed.')
     payload = '__name__ = "portfolio_inspection"\n' + (ROOT / 'library' / module).read_text()
     payload += '\ninspect_stream(json.loads(' + repr(json.dumps(params)) + '))\n'
     process = subprocess.run(ssh + ['sudo -n ' + shlex.quote(interpreter) + ' -I -B -'],
@@ -591,7 +627,8 @@ def operations_probe(host, port, interpreter, key, module, params):
     require(result['ready'], 'Resolve FAIL findings manually before proceeding.')
 
 
-def operations(mode, inventory, key):
+def operations(mode, inventory, key=None):
+    managed_user, key = managed_access(inventory, key)
     prerequisites(mode)
     check_key(key)
     alias, host, port, _, interpreter = load_host(inventory)
@@ -602,9 +639,9 @@ def operations(mode, inventory, key):
         'current_port': port, 'ssh_ports': inputs['ssh_listen_ports'],
         'tcp_ports': inputs['firewall_allowed_tcp_ports'], 'verify': True,
         'refresh_rules': False, 'socket_candidate': False, 'report_only': True,
-    })
+    }, managed_user)
     operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py',
-                     {'verify': mode == 'verify-operations'})
+                     {'verify': mode == 'verify-operations'}, managed_user)
     if mode != 'setup-operations':
         return
     require(sys.stdin.isatty(), 'Operations setup requires an interactive terminal; no changes requested.')
@@ -616,7 +653,7 @@ def operations(mode, inventory, key):
         answer = ''
     require(answer.strip().lower() in ('y', 'yes'), 'Operations setup declined; no changes requested.')
     run_playbook(inventory, alias, {
-        'ansible_user': 'ansible', 'ansible_connection': 'ssh',
+        'ansible_user': managed_user, 'ansible_connection': 'ssh',
         'ansible_private_key_file': str(key), 'ansible_host_key_checking': True,
         'ansible_become_flags': '-n', 'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
         'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
@@ -624,14 +661,14 @@ def operations(mode, inventory, key):
                             ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
         'server_operations_confirmed': True,
     }, 'setup-operations.yml')
-    operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py', {'verify': True})
+    operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py', {'verify': True}, managed_user)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=['inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
-    parser.add_argument('--key', default=str(DEFAULT_KEY))
+    parser.add_argument('--key', default=None, help='Legacy key override; explicit inventories own the key path.')
     args = parser.parse_args()
     os.umask(0o077)
     inventory = Path(args.inventory).expanduser().absolute()
@@ -639,11 +676,11 @@ def main():
         if args.mode == 'setup':
             setup_inventory(inventory)
         elif args.mode in ('inspect-operations', 'setup-operations', 'verify-operations'):
-            operations(args.mode, inventory, key_path(args.key))
+            operations(args.mode, inventory, args.key or None)
         elif args.mode in ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'):
-            human_access(args.mode, inventory, key_path(args.key))
+            human_access(args.mode, inventory, args.key or None)
         else:
-            live(args.mode, inventory, key_path(args.key))
+            live(args.mode, inventory, args.key or None)
     except ValueError as error:
         print(f'Error: {error}', file=sys.stderr)
         return 1

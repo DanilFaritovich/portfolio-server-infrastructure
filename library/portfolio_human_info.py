@@ -84,7 +84,7 @@ def safe(path, directory=False, label='account-management path'):
 def inspect(module):
     args = module.params
     name = args['name']
-    require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', name) and name not in ('root', 'ansible'),
+    require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', name) and name != 'root',
             'Unsupported human account name.')
     home = HOME_ROOT / name
     record = STATE_ROOT / (name + '.json')

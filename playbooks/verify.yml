@@ -4,6 +4,15 @@
   gather_facts: false
   any_errors_fatal: true
   tasks:
+    - name: Require a non-root managed key-only connection
+      ansible.builtin.assert:
+        that:
+          - ansible_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+          - ansible_user != 'root'
+          - ansible_connection == 'ssh'
+          - ansible_private_key_file is defined
+        quiet: true
+
     - name: Verify Ansible connectivity
       ansible.builtin.ping:
 
@@ -11,7 +20,7 @@
       ansible.builtin.command: id -un
       changed_when: false
       register: verify_login
-      failed_when: verify_login.rc != 0 or verify_login.stdout != 'ansible'
+      failed_when: verify_login.rc != 0 or verify_login.stdout != ansible_user
 
     - name: Verify non-interactive sudo reaches root
       ansible.builtin.command: sudo -n id -u

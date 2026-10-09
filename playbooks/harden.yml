@@ -7,7 +7,8 @@
     - name: Require managed non-interactive OpenSSH access
       ansible.builtin.assert:
         that:
-          - ansible_user == 'ansible'
+          - ansible_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+          - ansible_user != 'root'
           - ansible_connection == 'ssh'
           - ansible_private_key_file is defined
           - ansible_host_key_checking | bool

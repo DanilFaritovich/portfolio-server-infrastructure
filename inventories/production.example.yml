@@ -7,7 +7,11 @@ all:
           ansible_host: vps.example.invalid
           # Set the existing SSH port; bootstrap does not change it.
           ansible_port: 22
-          ansible_user: root
+          # Initial password login is used only by bootstrap.
+          bootstrap_login_user: root
+          # All subsequent stages use this non-root account and local key.
+          ansible_user: ansible
+          ansible_private_key_file: ~/.ssh/portfolio-server-infrastructure/ansible_ed25519
           ansible_python_interpreter: /usr/bin/python3
           # Keep the current port during the first transition.
           ssh_listen_ports: [22]

@@ -5,7 +5,7 @@
 Provisioning VPS на Ubuntu через Ansible. Pipeline:
 
 ```text
-local setup -> bootstrap managed ansible user -> verify access
+local setup -> bootstrap managed automation user -> verify access
 -> provision Docker host -> verify Docker
 -> firewall + validated SSH host ports -> verify hardening
 -> human access -> verify users -> final SSH policy -> verify SSH security
@@ -56,7 +56,8 @@ Python и `.venv`; он не уничтожает их и не переуста�
 Установка пакетов согласует pinned requirements, существующие collections и
 совместимый actionlint переиспользуются. Setup требует сеть для dependency
 sources, но никогда не подключается к VPS. В стандартном сценарии измените только hostname/address
-и текущий SSH-порт; `ansible_user` по умолчанию — `root`. Сохраните структуру
+и текущий SSH-порт. `bootstrap_login_user` по умолчанию — `root`;
+`ansible_user` выбирает рабочего пользователя, а `ansible_private_key_file` — путь к его ключу. Сохраните структуру
 `bootstrap` с одним хостом; не записывайте пароли или содержимое ключей в inventory.
 
 Версии collections закреплены в `collections.yml`; setup/deps устанавливают их явно.
@@ -87,14 +88,14 @@ recovery console и рабочую административную сессию
 См. [OpenSSH ssh-keyscan](https://man.openbsd.org/ssh-keyscan)
 и [ssh-keygen](https://man.openbsd.org/ssh-keygen).
 Заранее подтвердите VPS prerequisites и включение sudoers.d. Не выбирайте чужую
-существующую учётную запись как управляемого пользователя `ansible`.
+существующую учётную запись как управляемого пользователя `ansible_user`.
 
 ## Доступ и безопасность
 
-Стандартный путь: **root + интерактивный SSH password → ansible + dedicated
-SSH key + NOPASSWD sudo**. Root используется только для initial bootstrap.
-Дальнейшее provisioning должно использовать `ansible`; `make verify-access` явно
-переопределяет начальный login из inventory на `ansible` и не использует root password.
+Стандартный путь: **bootstrap_login_user + интерактивный SSH password →
+ansible_user + dedicated SSH key + NOPASSWD sudo**. Начальный login используется
+только для bootstrap. Все операции и проверки Stage 1–5 используют рабочего
+пользователя и ключ из inventory через независимый key-only SSH и `sudo -n`.
 
 `make bootstrap-user` локально создаёт Ed25519 key, если оба файла пары отсутствуют,
 непосредственно перед bootstrap. `make setup` не генерирует SSH keys:
@@ -110,7 +111,7 @@ SSH key + NOPASSWD sudo**. Root используется только для ini
 Wrapper проверяет только metadata private key; private key остаётся на
 контроллере и используется только его SSH-клиентом. Bootstrap role получает
 только путь public key, читает публичный ключ локально и добавляет его в
-`/home/ansible/.ssh/authorized_keys`, сохраняя посторонние authorized keys.
+`/home/<ansible_user>/.ssh/authorized_keys`, сохраняя посторонние authorized keys.
 Не добавляйте SSH keys, реальные inventories, credentials и логи в Git.
 
 Проверка и чтение public key выполняются в явно локальном controller block
@@ -124,8 +125,8 @@ Generated keys создаются **без passphrase** для unattended provis
 Обладание этим private automation key вместе с неограниченным `NOPASSWD: ALL`
 фактически даёт **root-equivalent access к VPS**. Защитите контроллер и резервные
 копии ключа. Запуск `make bootstrap-user` явно разрешает эту policy; default consent
-роли остаётся `false`. Отдельный `/etc/sudoers.d/ansible` принадлежит root,
-имеет `0440` и проверяется через `visudo -cf`. Login password для `ansible` не задаётся.
+роли остаётся `false`. Отдельный `/etc/sudoers.d/<ansible_user>` принадлежит root,
+имеет `0440` и проверяется через `visudo -cf`. Login password для `ansible_user` не задаётся.
 
 Initial root connection использует локальный адаптер `portfolio_password` поверх
 `ansible.builtin.paramiko_ssh` из pinned
@@ -171,7 +172,7 @@ password prompts и agent. Paramiko используется только для
 Bootstrap проверяет prerequisites, local inventory, host/port и запись known_hosts
 с явным подтверждением first-use trust до генерации ключа и запроса начального пароля. Затем запускает существующую роль
 с explicit sudo consent и открывает независимые key-only SSH connections как
-`ansible`. Verification проверяет Ansible ping, `id -un == ansible` и
+`ansible_user`. Verification проверяет Ansible ping, `id -un == ansible_user` и
 `sudo -n id -u == 0`; ошибка любой стадии завершает workflow с ошибкой.
 Повторное использование начального SSH-соединения отключено. Docker provisioning запускается отдельным явным target; access verification его не выполняет.
 
@@ -215,11 +216,11 @@ Controller-key regression test запускает реальный локаль�
 `make docker-host` использует существующий access wrapper, dedicated key и
 строгий trust из `known_hosts`. Он не генерирует ключи и не принимает новый host
 trust. До любых Docker mutation выполняется `playbooks/verify.yml`: login должен
-быть `ansible`, а `sudo -n` — возвращать UID 0. Если ключа нет, сообщение предлагает
+быть `ansible_user`, а `sudo -n` — возвращать UID 0. Если ключа нет, сообщение предлагает
 `make bootstrap-user`; ошибка login/sudo останавливает stage. Docker tasks
 используют privilege escalation только там, где требуется, с non-interactive
-sudo. Пользователь `ansible` не добавляется в группу `docker`. Initial administrator
-из inventory переопределяется только для managed host; controller-local context
+sudo. Рабочий пользователь не добавляется в группу `docker`. Bootstrap login
+используется только для bootstrap; managed access действует для VPS, а controller-local context
 сохраняется.
 
 `playbooks/docker-host.yml` вызывает `roles/docker_host`. Для non-mutating package
@@ -453,7 +454,7 @@ pre-transition drift generated/loaded/live даёт WARN в `make inspect-harden
 [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
 и [OpenSSH configuration](https://man.openbsd.org/sshd_config).
 
-Оба public targets сначала проверяют независимый `ansible` key-only access и
+Оба public targets сначала проверяют независимый `ansible_user` key-only access и
 `sudo -n`. После provisioning wrapper открывает новое соединение на **каждом**
 порту из `ssh_verify_ports` и повторяет access/sudo и hardening checks. Уже доверенная
 host identity закрепляется через
@@ -542,7 +543,7 @@ reboot прервёт текущие SSH sessions. Используйте те �
 make reboot-host INVENTORY=/path/to/local-inventory.yml AUTOMATION_KEY=/path/to/automation-key
 ```
 
-Wrapper сначала проверяет key-only SSH как `ansible` и `sudo -n` на текущем inventory
+Wrapper сначала проверяет key-only SSH как `ansible_user` и `sudo -n` на текущем inventory
 порту. Затем в интерактивном терминале спрашивает `Reboot this host now? [y/N]`.
 Только `y`/`yes` разрешают reboot; пустой ответ, отказ, EOF или Ctrl-C останавливают
 команду. Без TTY запуск отклоняется до обращения к хосту; unattended/force режима нет.
@@ -563,10 +564,75 @@ Docker smoke test может изменить image cache; firewall/SSH provisio
 Offline-тесты подменяют все remote/reboot вызовы; `make check`/CI выполняют только
 syntax-check этого playbook и локальные проверки. Агент не выполнял реальный reboot.
 
+## Настройка рабочего пользователя и миграция
+
+Три поля доступа задаются вместе у хоста в существующей структуре inventory:
+
+```yaml
+bootstrap_login_user: root
+ansible_user: automation
+ansible_private_key_file: ~/.ssh/portfolio-server-infrastructure/automation_ed25519
+```
+
+Путь к ключу должен быть абсолютным или начинаться с `~/`, вне репозитория.
+Bootstrap создаёт выбранного пользователя, добавляет публичный ключ без удаления
+других ключей и устанавливает проверенный через `visudo` фрагмент `NOPASSWD: ALL`.
+Затем независимо проверяет новый key-only login, ping и `sudo -n`. Ошибка проверки
+останавливает выполнение; inventory, старые аккаунты и SSH policy автоматически
+не переключаются и не удаляются.
+
+Старый inventory без обоих новых полей сохраняет прежний смысл: `ansible_user`
+обозначает начальный login (обычно root), а следующие стадии используют старый
+аккаунт `ansible` и прежний ключ либо `AUTOMATION_KEY`. Setup сохраняет существующий
+inventory. Для явной записи прежнего доступа задайте `bootstrap_login_user` равным
+старому initial login, `ansible_user: ansible` и путь к существующему ключу;
+проверьте доступ перед дальнейшей работой. Для нового формата `AUTOMATION_KEY`
+допустим только при совпадении с ключом из inventory; конфликт блокирует команду.
+
+Если первоначальный password bootstrap login ещё работает, можно выбрать новый
+аккаунт/ключ в candidate inventory и выполнить
+`make bootstrap-user INVENTORY=inventories/migration.yml`. Независимая проверка
+должна успешно завершиться до замены старого inventory; старый аккаунт и SSH policy
+сохраняются.
+
+На VPS с завершёнными Stage 4/5 сохраните старый inventory, открытую admin-сессию
+и доступ к консоли провайдера. Не открывайте root/password SSH и не повторяйте
+password bootstrap. Через старый рабочий inventory создайте отдельный ранее
+неиспользованный аккаунт существующим путём `add-user`:
+
+```bash
+make add-user HUMAN_USER=automation HUMAN_SUDO=admin HUMAN_KEY="$HOME/.ssh/portfolio-infra/automation_ed25519"
+make verify-user HUMAN_USER=automation HUMAN_SUDO=admin HUMAN_KEY="$HOME/.ssh/portfolio-infra/automation_ed25519"
+```
+
+Нужна завершённая Stage 3; новый admin проверяется по SSH и sudo. Public-only import
+недостаточен. Используйте отдельный незашифрованный automation key вне репозитория
+и сохраните независимый human recovery access. Создайте отдельный ignored candidate
+inventory с `ansible_user: automation`, точным путём к новому ключу и прежними портами.
+До замены рабочего inventory выполните:
+
+```bash
+make verify-access INVENTORY=inventories/migration.yml
+make verify-docker INVENTORY=inventories/migration.yml
+make verify-hardening INVENTORY=inventories/migration.yml
+make verify-ssh-security INVENTORY=inventories/migration.yml HUMAN_USER=operator HUMAN_SUDO=admin HUMAN_KEY="$HOME/.ssh/portfolio-infra/operator_ed25519"
+make verify-operations INVENTORY=inventories/migration.yml
+```
+
+Для SSH security укажите существующего отдельно проверенного human admin.
+Это ручные LIVE-проверки; Docker verification может заполнить image cache.
+При любой ошибке продолжайте использовать старый inventory и recovery access.
+Только после успешных проверок осознанно замените рабочий inventory. Автоматического
+переключения, удаления старого `ansible` или изменения SSH policy при миграции нет.
+Повторное provisioning и проверка идемпотентности остаются отдельно разрешаемыми
+операторскими действиями.
+
 ## Переопределения и troubleshooting
 
-Make поддерживает local inventory path и абсолютный private-key path вне
-репозитория. Используйте одинаковые overrides для всех live targets:
+Make поддерживает local inventory path. Задайте `ansible_private_key_file` в нём.
+`AUTOMATION_KEY` сохранён для legacy inventory; для явного формата он должен
+совпадать с ключом inventory. Override ниже необязателен. Используйте одинаковый
+inventory для всех live targets:
 
 ```bash
 make bootstrap-user INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
@@ -582,11 +648,11 @@ non-interactive verification этого wrapper. Права существующ
 Отсутствующая пара генерируется, но неполная пара автоматически не исправляется
 и не заменяется.
 
-Можно заменить `ansible_user: root` в inventory на существующего администратора
+Можно заменить `bootstrap_login_user: root` в inventory на существующего администратора
 без изменений роли. Нужны SSH password login и sudo; bootstrap тогда также
 запросит sudo password через штатный `--ask-become-pass`. Managed user этих Make
-targets остаётся `ansible`. Inventory поддерживает один хост и только поля host,
-port, initial user, Python interpreter и hardening port lists из example; credentials и дополнительные
+targets выбирается через `ansible_user`. Inventory поддерживает один хост и только поля host,
+port, bootstrap/managed users, local key path, Python interpreter и hardening port lists из example; credentials и дополнительные
 runtime variables отклоняются.
 
 Все generated runtimes/tooling находятся в ignored `.tools`, `.venv`, `.ansible`
@@ -620,7 +686,7 @@ shell exports и активация environment больше не нужны.
 **LIVE**. `add-user` и `secure-ssh` изменяют сервер; verification создаёт свежие
 SSH-сессии и выполняет read-only проверки аккаунтов/policy. Root-пароли не
 используются, host trust не изменяется. Сохраняйте прежние локальные inventory и
-`AUTOMATION_KEY`: каждая команда сначала проверяет ключевой доступ `ansible`,
+`AUTOMATION_KEY`: каждая команда сначала проверяет ключевой доступ `ansible_user`,
 `sudo -n` и завершение Stage 3 на каждом маршруте `ssh_verify_ports`.
 
 ```bash
@@ -704,7 +770,7 @@ preflight; передайте диагноз на отдельную прове�
 автоматического adoption. Повторный успешный запуск сохраняет ключи и приводит
 аккаунт к прежнему состоянию без замены доступа.
 
-`secure-ssh` заново проверяет выбранного **admin** и `ansible`: свежий key-only
+`secure-ssh` заново проверяет выбранного **admin** и `ansible_user`: свежий key-only
 SSH и non-interactive root sudo, затем запрашивает подтверждение recovery с
 default deny. Роль также перепроверяет обе учётные записи непосредственно перед
 работой с policy. Устанавливаются `PermitRootLogin no`, `PasswordAuthentication no`
@@ -733,7 +799,7 @@ console изучите managed block, source files и pending receipt, выпо�
 подтвердите свежий доступ. Удаляйте receipt только после recovery/convergence.
 Возврат нужного fallback policy — отдельное решение через console, без automatic
 rollback. После hardening добавляйте людей теми же `add-user`/`verify-user` через
-`ansible`: root/password fallback не включается. Stage 3 и maintenance сохраняют
+`ansible_user`: root/password fallback не включается. Stage 3 и maintenance сохраняют
 финальный блок. Application deployment остаётся отдельным этапом.
 
 Порядок ручной проверки: offline `make check` (включая новые synthetic/mocked

@@ -3,7 +3,8 @@
   ansible.builtin.assert:
     that:
       - human_access_user_name is defined
-      - human_access_user_name not in ['root', 'ansible']
+      - human_access_user_name != 'root'
+      - human_access_user_name != portfolio_automation_user
       - ansible_user == human_access_user_name
       - human_access_user_sudo in ['none', 'admin', 'restricted']
     quiet: true

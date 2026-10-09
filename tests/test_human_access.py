@@ -41,6 +41,7 @@ class HumanWrapperTests(unittest.TestCase):
         self.events = []
         for name, options in (
             ('prerequisites', {}), ('check_key', {}), ('known_host', {}),
+            ('managed_access', {'return_value': ('ansible', self.automation)}),
             ('load_host', {'return_value': ('portfolio', 'fixture.example.test', 2222, 'root', '/usr/bin/python3')}),
             ('hardening_inputs', {'return_value': self.inputs}),
             ('public_key_file', {'side_effect': lambda value: Path(value)}),
@@ -130,7 +131,7 @@ class HumanWrapperTests(unittest.TestCase):
         with patch.object(original, 'check_key'), patch.object(original, 'public_key_file'), \
                 patch.object(original, 'run_playbook') as run:
             original.verify_human(self.inventory, 'portfolio', 'fixture.example.test', 2222,
-                                  {'ansible_ssh_args': access.SSH_BASE + ' -o IdentityAgent=none'},
+                                  {'ansible_user': 'ansible', 'ansible_ssh_args': access.SSH_BASE + ' -o IdentityAgent=none'},
                                   self.inputs, human, self.key)
         self.assertEqual([call.args[2]['ansible_port'] for call in run.call_args_list], [2222, 2200])
         for call in run.call_args_list:

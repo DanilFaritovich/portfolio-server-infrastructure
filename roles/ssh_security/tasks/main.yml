@@ -2,10 +2,11 @@
 - name: Require verified administrator and explicit recovery confirmation
   ansible.builtin.assert:
     that:
-      - ansible_user == 'ansible'
+      - ansible_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+      - ansible_user != 'root'
       - ansible_connection == 'ssh'
       - human_access_user_name is defined
-      - human_access_user_name not in ['ansible', 'root']
+      - human_access_user_name not in ['root', ansible_user]
       - human_access_user_sudo == 'admin'
       - ssh_security_confirmed | default(false) | bool
     fail_msg: Use make secure-ssh after independent administrator SSH/sudo verification and recovery confirmation.
@@ -26,6 +27,7 @@
   # These are Ansible SSH plugin options scoped to this human-admin verification include;
   # renaming them would leave the automation connection settings in effect.
   vars:
+    portfolio_automation_user: "{{ hostvars[inventory_hostname].ansible_user }}"  # noqa: var-naming[no-role-prefix]
     ansible_user: "{{ human_access_user_name }}"
     ansible_private_key_file: "{{ human_access_user_private_key_path }}"  # noqa: var-naming[no-role-prefix]
     ansible_ssh_args: "{{ human_access_user_ssh_args }}"  # noqa: var-naming[no-role-prefix]

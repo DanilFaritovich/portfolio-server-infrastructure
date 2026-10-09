@@ -2,7 +2,8 @@ VENV := .venv
 ACTIONLINT := .tools/bin/actionlint
 YAML_FILES := .yamllint.yml .ansible-lint collections.yml inventories/production.example.yml playbooks roles .github/workflows
 INVENTORY ?= inventories/production.yml
-AUTOMATION_KEY ?= $(HOME)/.ssh/portfolio-server-infrastructure/ansible_ed25519
+# Optional legacy override; explicit inventory supplies the managed key path.
+AUTOMATION_KEY ?=
 export INVENTORY AUTOMATION_KEY
 export ANSIBLE_HOME := $(CURDIR)/.ansible
 # Subprocesses must find the same pinned Ansible tools as the invoking interpreter.

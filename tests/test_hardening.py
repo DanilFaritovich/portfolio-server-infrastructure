@@ -435,7 +435,7 @@ def inspect(module):''')
             with patch.object(access.subprocess, 'run', side_effect=responses), \
                     contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(ValueError):
                 access.inspect_host('fixture.example.test', 2222, '/usr/bin/python3', self.key,
-                                    {'ssh_listen_ports': [2222], 'firewall_allowed_tcp_ports': [80, 443]})
+                                    {'ssh_listen_ports': [2222], 'firewall_allowed_tcp_ports': [80, 443]}, 'ansible')
             self.assertIn('NOT READY', output.getvalue())
             self.assertNotIn('sensitive-stdout', output.getvalue())
             self.assertNotIn('secret-stderr', output.getvalue())
