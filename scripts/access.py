@@ -157,7 +157,7 @@ def check_key(path):
     require(path.stat().st_mode & 0o077 == 0, 'Private key permissions must be 0600 or stricter.')
 
 
-def prepare_key(path, label='automation'):
+def prepare_key(path, label='automation', interactive_passphrase=False):
     """Only inspect private-key metadata; ssh-keygen creates new material locally."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.parent.stat()
@@ -170,9 +170,15 @@ def prepare_key(path, label='automation'):
         public = Path(str(path) + '.pub')
         require(not path.is_symlink() and not public.is_symlink(), 'Key files must not be symlinks.')
         if not path.exists() and not public.exists():
-            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C',
-                            'portfolio-server-infrastructure ' + label, '-f', str(path)], check=True)
-            print(f'Dedicated {label} key created locally (without passphrase).')
+            if interactive_passphrase:
+                require(sys.stdin.isatty(), 'New user key generation requires a terminal for the passphrase prompt.')
+            command = ['ssh-keygen', '-q', '-t', 'ed25519', '-C',
+                       'portfolio-server-infrastructure ' + label, '-f', str(path)]
+            if not interactive_passphrase:
+                command.extend(['-N', ''])
+            subprocess.run(command, check=True)
+            print(f'Dedicated {label} key created locally' +
+                  ('.' if interactive_passphrase else ' (without passphrase).'))
         else:
             print(f'Existing {label} key preserved.')
         check_key(path)
@@ -455,8 +461,11 @@ def human_inputs(environment=None, managed_user='ansible'):
             'human_access_user_sudo_commands': ['ALL'] if policy == 'admin' else commands}
 
 
-def human_key_path(value, name):
-    path = Path(value or Path.home() / '.ssh/portfolio-infra' / (name + '_ed25519')).expanduser().absolute()
+def human_key_path(value, name, key_name=None):
+    if key_name:
+        require(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}', key_name) and not key_name.endswith('.pub'),
+                'KEY_NAME must be a simple private-key filename, without directories or a .pub suffix.')
+    path = Path(value or Path.home() / '.ssh/portfolio-infra' / (key_name or name + '_ed25519')).expanduser().absolute()
     require(not any(p.is_symlink() for p in [path, *path.parents]), 'Human key paths must not use symlinks.')
     require(not path.resolve().is_relative_to(ROOT) or
             path.resolve().is_relative_to(ROOT / 'secrets/portfolio-infra'),
@@ -479,6 +488,99 @@ def public_key_file(value):
     result = subprocess.run(['ssh-keygen', '-l', '-f', str(path)], capture_output=True, check=False)
     require(result.returncode == 0, 'Public key is invalid.')
     return path
+
+
+def prepare_human_key(key, name, interactive_passphrase=False):
+    if key.is_relative_to(ROOT):
+        for directory in (ROOT / 'secrets', ROOT / 'secrets/portfolio-infra'):
+            directory.mkdir(mode=0o700, exist_ok=True)
+            require(directory.stat().st_uid == os.getuid() and directory.stat().st_mode & 0o077 == 0,
+                    'Local secrets directories must be owned by you with permissions 0700.')
+    if interactive_passphrase:
+        prepare_key(key, label='human ' + name, interactive_passphrase=True)
+    else:
+        prepare_key(key, label='human ' + name)
+
+
+def validate_cli_path(path):
+    # OpenSSH expands tokens in identity/trust paths even when argv bypasses a shell.
+    value = str(path)
+    require(all(ord(char) >= 32 and ord(char) != 127 for char in value) and
+            '%' not in value and '${' not in value,
+            'SSH paths must not contain control characters or OpenSSH expansion tokens.')
+
+
+def cli_human_key():
+    """Local key selection does not imply account creation or a sudo policy."""
+    name = os.environ.get('HUMAN_USER', '')
+    require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', name) and name != 'root',
+            'Set HUMAN_USER to a non-root Ubuntu username.')
+    key = human_key_path(os.environ.get('HUMAN_KEY'), name, os.environ.get('KEY_NAME'))
+    validate_cli_path(key)
+    return name, key
+
+
+def local_key(mode):
+    require(shutil.which('ssh-keygen'), 'Missing ssh-keygen. Install OpenSSH client tools.')
+    name, key = cli_human_key()
+    if mode == 'generate-user-key':
+        prepare_human_key(key, name, interactive_passphrase=True)
+    # Inspect only private metadata; validate and read public material separately.
+    check_key(key)
+    public = public_key_file(str(key) + '.pub')
+    if mode == 'show-public-key':
+        fingerprint = subprocess.run(['ssh-keygen', '-l', '-E', 'sha256', '-f', str(public)],
+                                     capture_output=True, text=True, check=True)
+        fields = fingerprint.stdout.split()
+        require(len(fields) >= 2 and re.fullmatch(r'SHA256:[A-Za-z0-9+/]+', fields[1]),
+                'Cannot determine the public-key SHA256 fingerprint.')
+        # Comments are not needed for transfer and may contain terminal control codes.
+        print(' '.join(public.read_text().split()[:2]))
+        print('SHA256 fingerprint: ' + fields[1])
+
+
+def interactive_ssh_command(host, port, user, key):
+    """The selected identity may use an unlocked agent; only existing trust is eligible."""
+    require(shutil.which('ssh') and shutil.which('ssh-keygen'), 'Missing OpenSSH client tools.')
+    validate_cli_path(key)
+    check_key(key)
+    public_key_file(str(key) + '.pub')
+    trusted = Path.home() / '.ssh/known_hosts'
+    validate_cli_path(trusted)
+    require(not any(path.is_symlink() for path in [trusted, *trusted.parents]),
+            'Known-host trust paths must not use symlinks.')
+    require(trusted.is_file(), 'Existing known_hosts trust is required; verify the server identity before connecting.')
+    for path in (trusted.parent, trusted):
+        info = path.stat()
+        require(info.st_uid == os.getuid() and info.st_mode & 0o022 == 0 and
+                (stat.S_ISDIR(info.st_mode) if path == trusted.parent else stat.S_ISREG(info.st_mode)),
+                'Known-host trust must be owned by you and not writable by group or others.')
+    known_host(host, port)
+    # Ignore SSH config commands, proxies and alternate identities. Pin the same
+    # local trust file inspected above, including when HOME differs from passwd.
+    trust_option = 'UserKnownHostsFile="' + str(trusted).replace('\\', '\\\\').replace('"', '\\"') + '"'
+    return ['ssh', '-F', '/dev/null', '-t'] + shlex.split(SSH_BASE) + [
+        '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
+        '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
+        '-o', 'KbdInteractiveAuthentication=no', '-o', 'ForwardAgent=no',
+        '-o', 'ClearAllForwardings=yes', '-o', 'PermitLocalCommand=no',
+        '-o', 'UpdateHostKeys=no', '-o', 'GlobalKnownHostsFile=/dev/null', '-o', trust_option,
+        '-i', str(key), '-p', str(port), user + '@' + host,
+    ]
+
+
+def cli_connection(mode, inventory, override=None):
+    managed_user, managed_key = managed_access(inventory, override)
+    _, host, port, _, _ = load_host(inventory)
+    user, key = cli_human_key() if mode == 'connect-user' else (managed_user, managed_key)
+    if mode != 'show-controller':
+        require(sys.stdin.isatty(), 'SSH connection requires an interactive terminal.')
+    command = interactive_ssh_command(host, port, user, key)
+    if mode == 'show-controller':
+        print(f'ansible_user: {user}\nserver: {host}\nport: {port}\nkey: {key}')
+        print('SSH command: ' + shlex.join(command))
+    else:
+        subprocess.run(command, check=True)
 
 
 def verify_human(inventory, alias, host, port, managed, inputs, human, key):
@@ -561,12 +663,7 @@ def human_access(mode, inventory, automation_key=None):
     verify_hardening(inventory, alias, host, port, managed, inputs)
     if mode == 'add-user':
         if not imported:
-            if key.is_relative_to(ROOT):
-                for directory in (ROOT / 'secrets', ROOT / 'secrets/portfolio-infra'):
-                    directory.mkdir(mode=0o700, exist_ok=True)
-                    require(directory.stat().st_uid == os.getuid() and directory.stat().st_mode & 0o077 == 0,
-                            'Local secrets directories must be owned by you with permissions 0700.')
-            prepare_key(key, label='human ' + name)
+            prepare_human_key(key, name)
             public = public_key_file(str(key) + '.pub')
         run_playbook(inventory, alias, managed | human | {'human_access_user_public_key_path': str(public)}, 'add-user.yml')
         if imported and not key.exists():
@@ -666,7 +763,7 @@ def operations(mode, inventory, key=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
+    parser.add_argument('mode', choices=['generate-user-key', 'show-public-key', 'show-controller', 'connect-controller', 'connect-user', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=None, help='Legacy key override; explicit inventories own the key path.')
     args = parser.parse_args()
@@ -675,6 +772,10 @@ def main():
     try:
         if args.mode == 'setup':
             setup_inventory(inventory)
+        elif args.mode in ('generate-user-key', 'show-public-key'):
+            local_key(args.mode)
+        elif args.mode in ('show-controller', 'connect-controller', 'connect-user'):
+            cli_connection(args.mode, inventory, args.key or None)
         elif args.mode in ('inspect-operations', 'setup-operations', 'verify-operations'):
             operations(args.mode, inventory, args.key or None)
         elif args.mode in ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'):

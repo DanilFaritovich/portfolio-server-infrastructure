@@ -158,6 +158,11 @@ password prompts и agent. Paramiko используется только для
 | --- | --- | --- |
 | `make setup` | Установить local dependencies; создать отсутствующий inventory | Только dependency registries |
 | `make deps` | Установить pinned local tooling/collections | Только dependency registries |
+| `make generate-user-key` | Создать локальную пару Ed25519 для пользователя | **LOCAL / только файлы ключа** |
+| `make show-public-key` | Показать public key и SHA256 fingerprint | **LOCAL / read-only** |
+| `make show-controller` | Показать доступ из inventory и SSH-команду | **LOCAL / read-only** |
+| `make connect-controller` | Интерактивный SSH под рабочим пользователем inventory | **LIVE / интерактивная сессия** |
+| `make connect-user` | Интерактивный SSH под указанным пользователем | **LIVE / интерактивная сессия** |
 | `make bootstrap-user` | Создать/использовать dedicated key, bootstrap account, проверить доступ | **LIVE / MUTATING** |
 | `make verify-access` | Проверить существующий key-only доступ ansible | **LIVE / verification**, без изменений managed configuration |
 | `make docker-host` | Установить Docker, logging policy и настроить services | **LIVE / MUTATING**, managed key-only access |
@@ -627,6 +632,70 @@ make verify-operations INVENTORY=inventories/migration.yml
 Повторное provisioning и проверка идемпотентности остаются отдельно разрешаемыми
 операторскими действиями.
 
+## Локальные ключи и интерактивный SSH
+
+После `make setup` или `make deps` локальным командам ключей нужны OpenSSH client tools,
+но не нужны inventory, Ansible playbook, аккаунт на VPS или подключение к серверу:
+
+```bash
+make generate-user-key HUMAN_USER=operator
+make show-public-key HUMAN_USER=operator
+```
+
+Путь по умолчанию: `~/.ssh/portfolio-infra/operator_ed25519` и соседний `.pub`.
+`KEY_NAME` выбирает другое имя private-key файла в том же каталоге, например
+`KEY_NAME=operator_laptop_ed25519`; каталоги и суффикс `.pub` запрещены.
+`HUMAN_KEY=/absolute/path/to/key` имеет приоритет над `KEY_NAME`. Используйте одинаковые
+параметры для генерации, показа public key и `connect-user`. Существующие пары сохраняются;
+неполные пары, symlinks, небезопасные права/владелец и некорректные public keys блокируют
+операцию. Новые каталоги имеют `0700`, private files — `0600` или строже. Существующие
+права проверяются без автоматического исправления. В репозитории допустим только
+ignored каталог `secrets/portfolio-infra/`; предпочтительны ключи вне репозитория.
+
+Для новой пары нужен терминал: `ssh-keygen` напрямую запрашивает passphrase, не передавая
+её в аргументах и не сохраняя в проекте. Нажатие Enter осознанно создаёт незашифрованный
+ключ. Повторная проверка существующей пары не требует терминала. `show-public-key`
+выводит только публичные algorithm/key без комментария и SHA256 fingerprint;
+нужна полная локальная пара, private file проверяется только по metadata.
+Передавайте администратору только public key. Генерация и показ не создают аккаунт
+и не устанавливают ключ на VPS; это отдельная операция `add-user`. Для нестандартного
+имени передавайте точный путь через `HUMAN_KEY` существующим Stage 4 командам,
+которые сохраняют прежние defaults.
+
+Перед подключением загрузите зашифрованный ключ в существующий локальный `ssh-agent`:
+
+```bash
+ssh-add "$HOME/.ssh/portfolio-infra/operator_ed25519"
+make show-controller
+make connect-controller
+make connect-user HUMAN_USER=operator
+```
+
+Если agent не запущен, сначала запустите локальный `ssh-agent`. `show-controller`
+работает только локально: показывает рабочего пользователя, сервер, текущий порт
+inventory, полный путь к ключу и готовую SSH-команду с shell quoting. Проверяются
+локальная пара и существующее доверие к серверу; отсутствие ключа или trust блокирует
+команду. `connect-controller` использует ту же команду; `connect-user` — сервер/порт
+того же inventory и выбранные human key/login. Обе команды подключения требуют
+терминал и уже установленный соответствующий public key. Они открывают обычный
+интерактивный shell без provisioning или verification playbooks. Действия внутри
+этой сессии могут изменять VPS.
+
+Все три команды требуют существующую доверенную запись в `~/.ssh/known_hosts` для
+`host` либо `[host]:port`. Отсутствие trust блокирует локальную проверку; изменившийся
+host key вызывает отказ при подключении. Автоматического scan, принятия или замены trust нет. До осознанной настройки отсутствующей
+записи проверьте identity через provider console или уже доверенный административный
+маршрут. Trust file и каталог должны принадлежать вам, не быть writable для group/others
+и не быть symlinks. SSH использует strict host checking, выбранный identity и key-only
+authentication; password/keyboard-interactive fallback, agent forwarding, другие
+forwarding и connection sharing отключены. SSH client config не используется, чтобы
+user, host, port и trust source определялись входными параметрами. Пути с control
+characters и OpenSSH expansion tokens запрещены. Разблокированный agent может
+аутентифицировать выбранный зашифрованный ключ; без него будет отказ, а не запрос
+пароля. Поддержка agent действует и для `connect-controller`; unattended Stage 1–5
+сохраняют прежнюю agent-independent policy. `INVENTORY` и legacy `AUTOMATION_KEY`
+следуют правилам задачи 1; конфликт managed-key override блокирует команду.
+
 ## Переопределения и troubleshooting
 
 Make поддерживает local inventory path. Задайте `ansible_private_key_file` в нём.
@@ -727,7 +796,8 @@ Root/system и распространённые runtime privilege groups зап�
 требуют admin policy. Права custom groups проверяйте отдельно. `none` не добавляет
 sudo fragment; verification требует отсутствия non-interactive sudo grant.
 
-Новые ключи создаются без passphrase, каталоги имеют `0700`, private keys — `0600`
+Ключи, автоматически создаваемые `add-user`, остаются без passphrase; отдельная
+команда `generate-user-key` запрашивает её. Каталоги имеют `0700`, private keys — `0600`
 или строже. Существующие пары сохраняются; неполные пары, symlinks, небезопасные
 permissions и совпадение пути с automation key блокируют операцию. Wrapper не
 читает private-key bytes и не отправляет их на сервер. Существующие зашифрованные
@@ -737,7 +807,9 @@ Public-only импорт без доступного локального privat
 и не разрешает финальную защиту. Используйте отдельный ключ для каждого человека;
 защищайте резервные копии как пароли. `secrets/` и распространённые имена ключей
 исключены из Git/Docker context; ignore rules не заменяют review staged files.
-Секреты и public keys не должны попадать в inventory, вывод или committed config.
+Секреты и public keys не должны попадать в inventory или committed config.
+Только явная команда `show-public-key` выводит публичный ключ для передачи;
+содержимое private key никогда не выводится.
 
 ### Типичная ошибка preflight
 

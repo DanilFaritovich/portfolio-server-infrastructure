@@ -160,6 +160,11 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | --- | --- | --- |
 | `make setup` | Install local dependencies; create missing local inventory | Dependency registries only |
 | `make deps` | Install pinned local tooling/collections | Dependency registries only |
+| `make generate-user-key` | Generate a local human Ed25519 keypair | **LOCAL / key files only** |
+| `make show-public-key` | Display public key and SHA256 fingerprint | **LOCAL / read-only** |
+| `make show-controller` | Display inventory access and SSH command | **LOCAL / read-only** |
+| `make connect-controller` | Interactive SSH as the inventory managed user | **LIVE / interactive session** |
+| `make connect-user` | Interactive SSH as the selected human user | **LIVE / interactive session** |
 | `make bootstrap-user` | Create/reuse dedicated key, bootstrap account, then verify | **LIVE / MUTATING** |
 | `make verify-access` | Verify existing key-only ansible access | **LIVE / verification**, no managed configuration changes |
 | `make docker-host` | Provision Docker packages, logging policy and services | **LIVE / MUTATING**, managed key-only access |
@@ -626,6 +631,69 @@ switches it automatically, deletes the old `ansible` account, or alters SSH poli
 as part of this migration. Repeated provisioning/idempotency remains a separately
 authorized operator check.
 
+## Local keys and interactive SSH
+
+After `make setup` (or `make deps`), local key commands need OpenSSH client tools,
+but no inventory, Ansible playbook, VPS account or server connection:
+
+```bash
+make generate-user-key HUMAN_USER=operator
+make show-public-key HUMAN_USER=operator
+```
+
+The default key is `~/.ssh/portfolio-infra/operator_ed25519` with a `.pub` companion.
+`KEY_NAME` selects a different private-key filename in the same directory, for example
+`KEY_NAME=operator_laptop_ed25519`; it cannot contain directories or end in `.pub`.
+`HUMAN_KEY=/absolute/path/to/key` takes precedence over `KEY_NAME`. Use the same inputs
+for generation, public-key display and `connect-user`. Existing pairs are preserved;
+partial pairs, symlinks, unsafe ownership/permissions and invalid public keys fail.
+New directories are `0700` and private files `0600` or stricter. Existing permissions
+are validated without silent repair. The only permitted repository key directory is
+ignored `secrets/portfolio-infra/`; prefer keys outside the repository.
+
+A new key requires a terminal: `ssh-keygen` asks for a passphrase directly, without
+passing it in arguments or storing it in this project. Pressing Enter deliberately
+creates an unencrypted key. Existing pairs can be checked again without a terminal.
+`show-public-key` prints only the public algorithm/key (without its comment) and
+SHA256 fingerprint; it requires a complete local pair and inspects only private-file
+metadata. Give only the public key to the administrator. Generation and display do
+not create an account or install its key on the VPS; installation is a separate
+`add-user` operation. For a custom filename, pass its exact path via `HUMAN_KEY` to
+existing Stage 4 commands, which retain their previous defaults.
+
+Load a passphrase-protected key into your existing local `ssh-agent` before connecting:
+
+```bash
+ssh-add "$HOME/.ssh/portfolio-infra/operator_ed25519"
+make show-controller
+make connect-controller
+make connect-user HUMAN_USER=operator
+```
+
+Start a local `ssh-agent` first if none is running. `show-controller` is local only:
+it displays the managed user, server, current inventory port, resolved key path and
+shell-quoted ready SSH command. It validates the local pair and existing host trust;
+missing keys or trust block the command. `connect-controller` uses that same command;
+`connect-user` uses the same inventory host/port with the selected human key and login.
+Both connect commands require a terminal and an already installed matching public key.
+They open a normal interactive shell and do not run provisioning or verification
+playbooks. What you run inside that shell can change the VPS.
+
+All three commands require an existing trusted entry in `~/.ssh/known_hosts` for
+`host` or `[host]:port`. Missing trust blocks local preflight; a changed host key
+fails during connection. These commands never scan, accept or replace trust. Verify server identity through the provider console or an
+already trusted administrative route before deliberately configuring missing trust.
+The trust file/directory must be owned by you, not writable by group/others and not
+symlinks. SSH uses strict host checking, the selected identity and key-only authentication;
+password/keyboard-interactive fallback, agent forwarding, other forwarding and connection
+sharing are disabled. Client SSH config is bypassed to keep identity, host, port and
+trust source tied to these inputs. Paths with control characters or OpenSSH expansion
+tokens are rejected. An unlocked agent can authenticate the selected encrypted key;
+without it, authentication fails instead of prompting for a password. Agent support
+here also applies to `connect-controller`; unattended Stage 1–5 automation retains
+its existing agent-independent policy. `INVENTORY` and legacy `AUTOMATION_KEY` follow
+the task 1 rules; conflicting managed-key overrides fail.
+
 ## Overrides and troubleshooting
 
 Make accepts a local inventory path. Set `ansible_private_key_file` there.
@@ -723,7 +791,8 @@ Root/system and common runtime privilege groups are refused; `sudo`/`admin` grou
 require the admin policy. Review custom group privileges separately. `none` adds
 no sudo fragment and verification requires no non-interactive sudo grant.
 
-Generated keys have no passphrase, directories are private (`0700`), and private
+Keys generated automatically by `add-user` have no passphrase; the separate
+`generate-user-key` command prompts for one. Directories are private (`0700`), and private
 keys are `0600` or stricter. Existing pairs are preserved; partial pairs, symlinks,
 unsafe permissions and reuse of the automation-key path fail. The wrapper never
 reads private-key bytes or uploads them. Existing encrypted human keys can use
@@ -732,8 +801,9 @@ automation remains agent-independent. Public-only imports report **UNVERIFIED**
 when the matching private key is unavailable locally. They cannot authorize final
 hardening. Use a separate key for each person and protect backups like passwords.
 `secrets/` and common key filenames are excluded from Git and Docker contexts;
-ignore rules are a guard, not a substitute for reviewing staged files. No secret
-or public key belongs in inventory, command output or committed configuration.
+ignore rules are a guard, not a substitute for reviewing staged files. Never put secrets
+or public keys in inventory or committed configuration. Only `show-public-key`
+explicitly displays the public key for transfer; private key contents are never printed.
 
 ### Common preflight failure
 

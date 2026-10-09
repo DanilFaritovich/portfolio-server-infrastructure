@@ -9,10 +9,10 @@ export ANSIBLE_HOME := $(CURDIR)/.ansible
 # Subprocesses must find the same pinned Ansible tools as the invoking interpreter.
 export PATH := $(abspath $(VENV))/bin:$(PATH)
 
-.PHONY: deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
+.PHONY: generate-user-key show-public-key show-controller connect-controller connect-user deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
 
 # Human account inputs are supplied by the caller; USER is intentionally untouched.
-export HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
+export KEY_NAME HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
 
 # Dependency setup uses registries; checks below use installed dependencies offline.
 deps:
@@ -21,6 +21,21 @@ deps:
 # Local setup prepares toolchain/dependencies and creates only missing inventory.
 setup:
 	@sh scripts/setup.sh setup
+
+# LOCAL only: generate a keypair or explicitly display its public member/fingerprint.
+generate-user-key show-public-key:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@
+
+# LOCAL only: resolve inventory and validate local key/trust, without host contact.
+show-controller:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
+# LIVE / interactive SSH session: no provisioning or automatic host-key trust.
+connect-controller connect-user:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
 
 # LIVE / MUTATING: invoking this target consents to root-equivalent NOPASSWD sudo.
 bootstrap-user:
