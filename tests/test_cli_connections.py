@@ -25,6 +25,7 @@ class CLIConnectionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='cli home ')
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
+        (self.home / '.ssh').mkdir(mode=0o700)
         self.key = self.home / '.ssh/portfolio-infra/person_ed25519'
         self.inventory = self.home / 'synthetic.yml'
         self.host = {'ansible_host': 'fixture.example.test', 'ansible_port': 2222,
@@ -51,7 +52,9 @@ class CLIConnectionTests(unittest.TestCase):
     def trust(self):
         folder = self.home / '.ssh'
         folder.mkdir(mode=0o700, exist_ok=True)
-        (folder / 'known_hosts').write_text('[fixture.example.test]:2222 ' + PUBLIC + '\n')
+        trusted = folder / 'known_hosts'
+        trusted.write_text('[fixture.example.test]:2222 ' + PUBLIC + '\n')
+        trusted.chmod(0o600)
 
     def local_run(self, command, **kwargs):
         self.assertEqual(command[0], 'ssh-keygen', 'Only local public-key operations may execute here')
