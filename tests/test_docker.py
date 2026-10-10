@@ -64,8 +64,9 @@ class DockerTests(unittest.TestCase):
                     self.assertEqual(host['ansible_private_key_file'], str(self.key))
                     self.assertTrue(host['ansible_host_key_checking'])
                     for option in ('StrictHostKeyChecking=yes', 'BatchMode=yes', 'IdentitiesOnly=yes',
-                                   'PasswordAuthentication=no', 'KbdInteractiveAuthentication=no', 'IdentityAgent=none'):
+                                   'PasswordAuthentication=no', 'KbdInteractiveAuthentication=no'):
                         self.assertIn(option, host['ansible_ssh_args'])
+                    self.assertNotIn('IdentityAgent=none', host['ansible_ssh_args'])
                     self.assertFalse(any('paramiko' in k or 'password' in k for k in host))
                     local = overlay['all']['hosts']['localhost']
                     self.assertEqual(local['ansible_connection'], 'local')

@@ -172,7 +172,8 @@ def prepare_key(path, label='automation', interactive_passphrase=False):
         fcntl.flock(lock, fcntl.LOCK_EX)
         public = Path(str(path) + '.pub')
         require(not path.is_symlink() and not public.is_symlink(), 'Key files must not be symlinks.')
-        if not path.exists() and not public.exists():
+        created = not path.exists() and not public.exists()
+        if created:
             if interactive_passphrase:
                 require(sys.stdin.isatty(), 'New user key generation requires a terminal for the passphrase prompt.')
             command = ['ssh-keygen', '-q', '-t', 'ed25519', '-C',
@@ -185,6 +186,7 @@ def prepare_key(path, label='automation', interactive_passphrase=False):
         else:
             print(f'Existing {label} key preserved.')
         check_key(path)
+        return created
 
 
 def prerequisites(mode):
@@ -302,7 +304,7 @@ def inspect_host(host, port, interpreter, key, inputs, user):
     ssh = ['ssh'] + shlex.split(SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
         '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
-        '-o', 'KbdInteractiveAuthentication=no', '-o', 'IdentityAgent=none',
+        '-o', 'KbdInteractiveAuthentication=no',
         '-i', str(key), '-p', str(port), user + '@' + host,
     ]
     login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False)
@@ -394,7 +396,7 @@ def live(mode, inventory, key=None):
         'ansible_user': managed_user, 'ansible_private_key_file': str(key), 'ansible_become': False,
         'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
                             ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
-                            ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
+                            ' -o KbdInteractiveAuthentication=no',
     }
     try:
         run_playbook(inventory, alias, managed, 'verify.yml')
@@ -505,9 +507,9 @@ def prepare_human_key(key, name, interactive_passphrase=False):
             require(directory.stat().st_uid == os.getuid() and directory.stat().st_mode & 0o077 == 0,
                     'Local secrets directories must be owned by you with permissions 0700.')
     if interactive_passphrase:
-        prepare_key(key, label='human ' + name, interactive_passphrase=True)
+        return prepare_key(key, label='human ' + name, interactive_passphrase=True)
     else:
-        prepare_key(key, label='human ' + name)
+        return prepare_key(key, label='human ' + name)
 
 
 def validate_cli_path(path):
@@ -528,15 +530,80 @@ def cli_human_key():
     return name, key
 
 
+def load_agent_key(key, public):
+    """OpenSSH owns passphrase input; never launch an agent in a child shell."""
+    require(shutil.which('ssh-add'), 'Missing ssh-add. Install OpenSSH client tools.')
+    fingerprint = subprocess.run(['ssh-keygen', '-l', '-E', 'sha256', '-f', str(public)],
+                                 capture_output=True, text=True, check=True)
+    fields = fingerprint.stdout.split()
+    require(len(fields) >= 2 and re.fullmatch(r'SHA256:[A-Za-z0-9+/]+', fields[1]),
+            'Cannot determine the public-key SHA256 fingerprint.')
+    selected = fields[1]
+
+    def identities():
+        try:
+            result = subprocess.run(['ssh-add', '-l', '-E', 'sha256'],
+                                    capture_output=True, text=True, check=False, timeout=10)
+        except subprocess.TimeoutExpired:
+            raise ValueError('SSH agent did not respond within 10 seconds; check SSH_AUTH_SOCK and retry make load-user-key.') from None
+        require(result.returncode in (0, 1),
+                'SSH agent unavailable. Start it in your shell with eval "$(ssh-agent -s)", '
+                'then run make load-user-key with the same HUMAN_USER/HUMAN_KEY/KEY_NAME.')
+        return {line.split()[1] for line in result.stdout.splitlines()
+                if len(line.split()) >= 2} if result.returncode == 0 else set()
+
+    if selected in identities():
+        print('SSH key already loaded in ssh-agent.\nFingerprint: ' + selected)
+        return
+    require(sys.stdin.isatty(),
+            'Key is not loaded. Run make load-user-key in a terminal for the OpenSSH passphrase prompt. '
+            'Use AGENT_LOAD=no to skip loading during generation.')
+    environment = os.environ.copy()
+    environment['SSH_ASKPASS_REQUIRE'] = 'never'
+    try:
+        result = subprocess.run(['ssh-add', '-q', str(key)], check=False, env=environment)
+    except KeyboardInterrupt:
+        raise ValueError('ssh-add cancelled; key preserved. Retry make load-user-key.') from None
+    require(result.returncode == 0, 'ssh-add failed or was cancelled; key preserved. Retry make load-user-key.')
+    require(selected in identities(), 'ssh-add did not load the selected public identity; key preserved.')
+    print('SSH key added to ssh-agent successfully.\nFingerprint: ' + selected)
+
+
 def local_key(mode):
     require(shutil.which('ssh-keygen'), 'Missing ssh-keygen. Install OpenSSH client tools.')
     name, key = cli_human_key()
+    policy = os.environ.get('AGENT_LOAD', 'ask')
+    require(policy in ('ask', 'yes', 'no'), 'AGENT_LOAD must be ask, yes or no.')
+    created = False
     if mode == 'generate-user-key':
-        prepare_human_key(key, name, interactive_passphrase=True)
+        created = prepare_human_key(key, name, interactive_passphrase=True)
     # Inspect only private metadata; validate and read public material separately.
     check_key(key)
     public = public_key_file(str(key) + '.pub')
-    if mode == 'show-public-key':
+    if mode == 'load-user-key':
+        load_agent_key(key, public)
+    elif mode == 'generate-user-key':
+        if created:
+            print('SSH key generated successfully.')
+        if policy == 'yes' or (created and policy == 'ask' and sys.stdin.isatty()):
+            accepted = policy == 'yes'
+            if not accepted:
+                try:
+                    answer = input('Add private key to ssh-agent? [Y/n]: ').strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    answer = 'n'
+                require(answer in ('', 'y', 'yes', 'n', 'no'), 'Answer Y or N; key preserved. Use make load-user-key later.')
+                accepted = answer in ('', 'y', 'yes')
+            if accepted:
+                try:
+                    load_agent_key(key, public)
+                except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+                    print('Key preserved; agent loading failed. ' + str(error), file=sys.stderr)
+            else:
+                print('Agent loading skipped; key preserved.')
+        else:
+            print('Agent loading skipped. Use make load-user-key when ready.')
+    elif mode == 'show-public-key':
         fingerprint = subprocess.run(['ssh-keygen', '-l', '-E', 'sha256', '-f', str(public)],
                                      capture_output=True, text=True, check=True)
         fields = fingerprint.stdout.split()
@@ -599,7 +666,7 @@ def verify_human(inventory, alias, host, port, managed, inputs, human, key):
         connection = managed | {'ansible_user': human['human_access_user_name'],
                                 'ansible_private_key_file': str(key), 'ansible_port': target,
                                 # Human encrypted keys may use their existing agent; only this identity is eligible.
-                                'ansible_ssh_args': managed['ansible_ssh_args'].replace(' -o IdentityAgent=none', '')
+                                'ansible_ssh_args': managed['ansible_ssh_args']
                                 + f' -o HostKeyAlias={identity}'}
         run_playbook(inventory, alias, connection | human | {'portfolio_automation_user': managed['ansible_user']}, 'verify-user.yml')
 
@@ -660,7 +727,7 @@ def human_access(mode, inventory, automation_key=None):
         'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
         'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
                             ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
-                            ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
+                            ' -o KbdInteractiveAuthentication=no',
     }
     if imported and mode != 'add-user':
         check_key(key)
@@ -702,7 +769,7 @@ def human_access(mode, inventory, automation_key=None):
         require(answer.strip().lower() in ('y', 'yes'), 'Final hardening declined; no SSH policy was changed.')
         try:
             confirmation = {'ssh_security_confirmed': True, 'human_access_user_private_key_path': str(key),
-                            'human_access_user_ssh_args': managed['ansible_ssh_args'].replace(' -o IdentityAgent=none', '')}
+                            'human_access_user_ssh_args': managed['ansible_ssh_args']}
             run_playbook(inventory, alias, managed | inputs | human | confirmation, 'secure-ssh.yml')
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             raise ValueError('SSH policy application failed; it may already be installed. Stop and use the retained '
@@ -726,7 +793,7 @@ def user_probe(host, port, interpreter, key, controller, params):
     """Stream a bounded engine with no remote payload files or private-key reads."""
     ssh = ['ssh'] + shlex.split(SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey',
-        '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no', '-o', 'IdentityAgent=none',
+        '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
         '-i', str(key), '-p', str(port), controller + '@' + host,
     ]
     source = (ROOT / 'library/portfolio_human_info.py').read_text()
@@ -795,7 +862,7 @@ def user_management(mode, inventory, override=None):
                    'ansible_become_flags': '-n', 'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
                    'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
                    ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
-                   ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none'}
+                   ' -o KbdInteractiveAuthentication=no'}
         human = {'human_access_user_name': recovery, 'human_access_user_sudo': 'admin',
                  'human_access_user_groups': retained['groups'], 'human_access_user_sudo_commands': ['ALL']}
         verify_human(inventory, alias, host, port, managed, inputs, human, recovery_key)
@@ -830,7 +897,7 @@ def operations_probe(host, port, interpreter, key, module, params, user):
     ssh = ['ssh'] + shlex.split(SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
         '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
-        '-o', 'KbdInteractiveAuthentication=no', '-o', 'IdentityAgent=none',
+        '-o', 'KbdInteractiveAuthentication=no',
         '-i', str(key), '-p', str(port), user + '@' + host,
     ]
     login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False, timeout=30)
@@ -879,7 +946,7 @@ def operations(mode, inventory, key=None):
             'ansible_become_flags': '-n', 'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
             'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
                                 ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
-                                ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
+                                ' -o KbdInteractiveAuthentication=no',
             'portfolio_apt_confirmed': not preview,
         }
         try:
@@ -906,7 +973,7 @@ def operations(mode, inventory, key=None):
         'ansible_become_flags': '-n', 'ansible_ssh_common_args': '', 'ansible_ssh_extra_args': '',
         'ansible_ssh_args': SSH_BASE + ' -o BatchMode=yes -o IdentitiesOnly=yes'
                             ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
-                            ' -o KbdInteractiveAuthentication=no -o IdentityAgent=none',
+                            ' -o KbdInteractiveAuthentication=no',
         'server_operations_confirmed': True,
     }, 'setup-operations.yml')
     operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py', {'verify': True}, managed_user)
@@ -914,7 +981,7 @@ def operations(mode, inventory, key=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'generate-user-key', 'show-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
+    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'generate-user-key', 'load-user-key', 'show-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=None, help='Legacy key override; explicit inventories own the key path.')
     args = parser.parse_args()
@@ -923,7 +990,7 @@ def main():
     try:
         if args.mode == 'setup':
             setup_inventory(inventory)
-        elif args.mode in ('generate-user-key', 'show-public-key'):
+        elif args.mode in ('generate-user-key', 'load-user-key', 'show-public-key'):
             local_key(args.mode)
         elif args.mode in ('show-controller', 'connect-controller', 'connect-user'):
             cli_connection(args.mode, inventory, args.key or None)
@@ -939,7 +1006,9 @@ def main():
         print(f'Error: {error}', file=sys.stderr)
         return 1
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        print('A local prerequisite, SSH or Ansible stage failed; stopping. Keep recovery access.', file=sys.stderr)
+        print('A local prerequisite, SSH or Ansible stage failed; stopping. '
+              'For an encrypted key, run make load-user-key in the same shell with the selected key. '
+              'Keep recovery access.', file=sys.stderr)
         return 1
     return 0
 

@@ -122,7 +122,7 @@ in a temporary inventory overlay (0600, removed after Ansible exits), rather
 than global connection extra-vars; delegated localhost keeps its local context.
 Only role inputs remain in `-e`. The overlay contains no passwords or key contents.
 
-Generated keys have **no passphrase** for unattended provisioning. Possession of
+Keys generated automatically by `bootstrap-user` have **no passphrase** for unattended provisioning. Existing encrypted keys can be reused after loading them into the local SSH agent. Possession of
 this private automation key, together with unrestricted `NOPASSWD: ALL`, grants
 **root-equivalent access to the VPS**. Protect the controller and key backups.
 Running `make bootstrap-user` deliberately approves that policy; the role's default
@@ -160,7 +160,8 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | --- | --- | --- |
 | `make setup` | Install local dependencies; create missing local inventory | Dependency registries only |
 | `make deps` | Install pinned local tooling/collections | Dependency registries only |
-| `make generate-user-key` | Generate a local human Ed25519 keypair | **LOCAL / key files only** |
+| `make generate-user-key` | Generate a local human Ed25519 keypair and offer agent loading | **LOCAL / key files and optional local agent** |
+| `make load-user-key` | Load the selected existing key into the local SSH agent | **LOCAL / agent only** |
 | `make show-public-key` | Display public key and SHA256 fingerprint | **LOCAL / read-only** |
 | `make show-controller` | Display inventory access and SSH command | **LOCAL / read-only** |
 | `make connect-controller` | Interactive SSH as the inventory managed user | **LIVE / interactive session** |
@@ -610,8 +611,8 @@ make verify-user HUMAN_USER=automation HUMAN_SUDO=admin HUMAN_KEY="$HOME/.ssh/po
 ```
 
 This requires completed Stage 3 and verifies the new admin login/sudo; public-only
-imports are insufficient. Use an unencrypted dedicated automation key outside the
-repository. Keep separate human recovery access. Create a separate ignored local
+imports alone are insufficient: the owner must independently prove access. Keep the device key outside the
+repository; encrypted keys can use the existing local agent. Keep separate human recovery access. Create a separate ignored local
 candidate inventory with `ansible_user: automation`, the exact new key path and the
 existing SSH ports. Explicitly verify it before replacing the working inventory:
 
@@ -664,7 +665,7 @@ existing Stage 4 commands, which retain their previous defaults.
 Load a passphrase-protected key into your existing local `ssh-agent` before connecting:
 
 ```bash
-ssh-add "$HOME/.ssh/portfolio-infra/operator_ed25519"
+make load-user-key HUMAN_USER=operator
 make show-controller
 make connect-controller
 make connect-user HUMAN_USER=operator
@@ -690,9 +691,88 @@ sharing are disabled. Client SSH config is bypassed to keep identity, host, port
 trust source tied to these inputs. Paths with control characters or OpenSSH expansion
 tokens are rejected. An unlocked agent can authenticate the selected encrypted key;
 without it, authentication fails instead of prompting for a password. Agent support
-here also applies to `connect-controller`; unattended Stage 1–5 automation retains
-its existing agent-independent policy. `INVENTORY` and legacy `AUTOMATION_KEY` follow
+also applies to `connect-controller`, `verify-access`, Stage 1–5 Ansible and the streaming
+inspectors. All select the explicit key with `IdentitiesOnly=yes`; an encrypted key
+requires the same invoking shell to have access to its unlocked agent. Unencrypted
+keys continue working without an agent. `INVENTORY` and legacy `AUTOMATION_KEY` follow
 the task 1 rules; conflicting managed-key overrides fail.
+
+### Agent loading and a new computer with one encrypted key
+
+After creating a new pair, `generate-user-key` asks `Add private key to ssh-agent? [Y/n]:`.
+Enter/Y loads the selected key through native OpenSSH `ssh-add`; N skips loading.
+OpenSSH owns passphrase input: Python never reads it. Successful loading prints only
+the selected public fingerprint. Generation stays successful if agent loading fails;
+the key is preserved. `load-user-key` reports failure with a nonzero exit status.
+Existing pairs are preserved and do not trigger another prompt by default. Use
+`load-user-key` for them, with the same `HUMAN_USER`, `HUMAN_KEY` or `KEY_NAME` selection.
+Neither command needs inventory or runs an Ansible playbook.
+
+The CLI reuses the current agent, including an empty agent; it never launches one.
+An already loaded selected fingerprint succeeds without adding other identities.
+Missing/unreachable agents produce instructions; a stalled agent query times out
+after 10 seconds. Start an agent in the parent shell only when needed:
+
+```bash
+eval "$(ssh-agent -s)"
+make load-user-key HUMAN_USER=portfolio_laptop2
+```
+
+`AGENT_LOAD=ask` (default), `yes` or `no` controls loading during generation. `yes`
+omits confirmation; `no` skips agent access. New key generation still requires a TTY
+for native passphrase input. Without a TTY there is no confirmation or passphrase
+prompt: `load-user-key` can confirm an already loaded identity, but refuses to add
+an unloaded key. Even `AGENT_LOAD=yes` cannot bypass that rule. Generation preserves
+its success and reports any loading failure; use `load-user-key` when automation
+must check loading with a nonzero failure status. Askpass is disabled during loading.
+
+On the new computer, use a reviewed checkout of this feature and OpenSSH client
+prerequisites. Keep a separate recovery administrator and the first controller:
+
+```bash
+make setup INVENTORY=inventories/laptop2.yml
+make generate-user-key HUMAN_USER=portfolio_laptop2
+make show-public-key HUMAN_USER=portfolio_laptop2
+```
+
+Choose a passphrase and accept agent loading. If no agent was available, start it in
+the parent shell and run `load-user-key`. Transfer only the `.pub` file to PC 1 and
+compare its SHA256 fingerprint. After separate LIVE authorization, PC 1 registers
+the new administrator through its existing `ansible` controller:
+
+```bash
+make add-user INVENTORY=inventories/production.yml HUMAN_USER=portfolio_laptop2 \
+  HUMAN_SUDO=admin HUMAN_PUBLIC_KEY=/path/portfolio_laptop2_ed25519.pub
+```
+
+On PC 2, edit only its ignored candidate inventory: preserve the verified host,
+current port, Python interpreter and hardening port lists; set `bootstrap_login_user`
+alongside `ansible_user: portfolio_laptop2` and
+`ansible_private_key_file: ~/.ssh/portfolio-infra/portfolio_laptop2_ed25519`.
+Record independently verified host keys in local `known_hosts`; do not rerun bootstrap
+or auto-accept trust on a secured server. The same key is used below, after LIVE approval:
+
+```bash
+make show-controller INVENTORY=inventories/laptop2.yml  # local only
+make connect-controller INVENTORY=inventories/laptop2.yml
+# In the fresh shell: id -un -> portfolio_laptop2; sudo -n id -u -> 0; exit
+make connect-user INVENTORY=inventories/laptop2.yml HUMAN_USER=portfolio_laptop2
+make verify-access INVENTORY=inventories/laptop2.yml
+```
+
+`verify-access` checks Ansible connectivity, login and noninteractive sudo. Stage 1–5
+OpenSSH and streaming paths inherit `SSH_AUTH_SOCK` and use only their explicit key;
+no second unencrypted key is required. An unloaded encrypted identity fails in batch
+mode without password fallback. Final SSH security still requires a distinct proven
+human administrator; `verify-user` cannot target the current inventory controller.
+
+For an isolated Ubuntu 24.04 VM, first run `make check` offline. Then test local key
+creation, Y/Enter/N, `AGENT_LOAD=no`, repeated generation, agent absence and repeated
+`load-user-key`. Stop the disposable agent or unset `SSH_AUTH_SOCK` to test refusal;
+never stop a shared desktop agent. Fresh SSH and Ansible checks against the disposable
+VM require separate approval and a registered key/trusted host. Test that unrelated
+loaded identities cannot substitute for the selected key. Offline mocks do not prove
+real VM authentication. This scenario retains the first controller and recovery access.
 
 ## Overrides and troubleshooting
 
@@ -708,9 +788,9 @@ make docker-host INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolut
 make verify-docker INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
 ```
 
-The sibling `.pub` must exist for an existing key. Use a dedicated unencrypted
-key for this wrapper; encrypted existing keys cannot authenticate in its
-non-interactive verification. Existing key-directory permissions must already
+The sibling `.pub` must exist for an existing key. Encrypted existing keys work
+through the invoking shell's unlocked agent; load the selected key first with
+`make load-user-key HUMAN_USER=… HUMAN_KEY=/absolute/path/to/key`. Existing key-directory permissions must already
 be `0700` or stricter; repair unsafe local permissions deliberately. A missing
 pair is generated, but a partial pair is never repaired or replaced automatically.
 
@@ -797,7 +877,7 @@ keys are `0600` or stricter. Existing pairs are preserved; partial pairs, symlin
 unsafe permissions and reuse of the automation-key path fail. The wrapper never
 reads private-key bytes or uploads them. Existing encrypted human keys can use
 an already unlocked SSH agent, with `IdentitiesOnly=yes` and the selected identity;
-automation remains agent-independent. Public-only imports report **UNVERIFIED**
+managed automation can also use its selected key through that agent. Public-only imports report **UNVERIFIED**
 when the matching private key is unavailable locally. They cannot authorize final
 hardening. Use a separate key for each person and protect backups like passwords.
 `secrets/` and common key filenames are excluded from Git and Docker contexts;
@@ -1084,8 +1164,8 @@ The retained administrator must differ from the target and current controller. I
 key identity must also differ from the controller key; copying that key to another
 path does not qualify. OpenSSH verification ignores client configuration, additional
 identities, proxies and forwarding; only the selected identity may use the human's
-existing agent. Key paths cannot contain OpenSSH expansion tokens. Automation remains
-agent-independent, so its dedicated key must be usable without a passphrase prompt.
+existing agent. Key paths cannot contain OpenSSH expansion tokens. Managed automation
+uses the same selected-agent policy; load encrypted controller keys before running targets.
 The recovery keypair must be local, complete and protected with the same permissions
 as other human keys; unlock an encrypted recovery key in your agent before verification.
 Fresh key-only SSH and `sudo -n` access are proven on every `ssh_verify_ports` route.
@@ -1127,7 +1207,7 @@ retained admin session. Use disposable usernames/keys for revocation and removal
 2. **Local identities and trust.** On each PC run `make setup`, create a separate key
    with `generate-user-key`, and display its public member with `show-public-key`.
    Verify host fingerprints independently before recording local trust. Use passphrases
-   and `ssh-add` for human/recovery keys; use a dedicated unencrypted key for automation.
+   and `load-user-key` for human/recovery/controller keys; one encrypted device key can serve interactive SSH and managed automation.
    Transfer only `.pub` files. `show-controller` must display that PC's intended inventory
    user/key. Missing trust or a conflicting key override must stop access.
 3. **Second controller and sudo.** Through the first controller, add the second PC's

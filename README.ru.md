@@ -121,7 +121,7 @@ inventory overlay (0600, удаляется после завершения Ansi
 connection extra-vars; delegated localhost сохраняет локальный context.
 В `-e` остаются только role inputs. Overlay не содержит паролей или содержимого ключей.
 
-Generated keys создаются **без passphrase** для unattended provisioning.
+Ключи, автоматически создаваемые `bootstrap-user`, остаются **без passphrase** для unattended provisioning. Существующий зашифрованный ключ можно использовать после загрузки в локальный SSH agent.
 Обладание этим private automation key вместе с неограниченным `NOPASSWD: ALL`
 фактически даёт **root-equivalent access к VPS**. Защитите контроллер и резервные
 копии ключа. Запуск `make bootstrap-user` явно разрешает эту policy; default consent
@@ -158,7 +158,8 @@ password prompts и agent. Paramiko используется только для
 | --- | --- | --- |
 | `make setup` | Установить local dependencies; создать отсутствующий inventory | Только dependency registries |
 | `make deps` | Установить pinned local tooling/collections | Только dependency registries |
-| `make generate-user-key` | Создать локальную пару Ed25519 для пользователя | **LOCAL / только файлы ключа** |
+| `make generate-user-key` | Создать локальную пару Ed25519 и предложить загрузку в agent | **LOCAL / ключ и локальный agent** |
+| `make load-user-key` | Загрузить выбранный существующий ключ в локальный agent | **LOCAL / только agent** |
 | `make show-public-key` | Показать public key и SHA256 fingerprint | **LOCAL / read-only** |
 | `make show-controller` | Показать доступ из inventory и SSH-команду | **LOCAL / read-only** |
 | `make connect-controller` | Интерактивный SSH под рабочим пользователем inventory | **LIVE / интерактивная сессия** |
@@ -611,8 +612,8 @@ make verify-user HUMAN_USER=automation HUMAN_SUDO=admin HUMAN_KEY="$HOME/.ssh/po
 ```
 
 Нужна завершённая Stage 3; новый admin проверяется по SSH и sudo. Public-only import
-недостаточен. Используйте отдельный незашифрованный automation key вне репозитория
-и сохраните независимый human recovery access. Создайте отдельный ignored candidate
+сам по себе недостаточен: владелец должен независимо доказать доступ. Храните ключ устройства вне репозитория;
+зашифрованный ключ может использовать локальный agent. Сохраните независимый human recovery access. Создайте отдельный ignored candidate
 inventory с `ansible_user: automation`, точным путём к новому ключу и прежними портами.
 До замены рабочего inventory выполните:
 
@@ -665,7 +666,7 @@ ignored каталог `secrets/portfolio-infra/`; предпочтительн�
 Перед подключением загрузите зашифрованный ключ в существующий локальный `ssh-agent`:
 
 ```bash
-ssh-add "$HOME/.ssh/portfolio-infra/operator_ed25519"
+make load-user-key HUMAN_USER=operator
 make show-controller
 make connect-controller
 make connect-user HUMAN_USER=operator
@@ -692,9 +693,90 @@ forwarding и connection sharing отключены. SSH client config не ис
 user, host, port и trust source определялись входными параметрами. Пути с control
 characters и OpenSSH expansion tokens запрещены. Разблокированный agent может
 аутентифицировать выбранный зашифрованный ключ; без него будет отказ, а не запрос
-пароля. Поддержка agent действует и для `connect-controller`; unattended Stage 1–5
-сохраняют прежнюю agent-independent policy. `INVENTORY` и legacy `AUTOMATION_KEY`
+пароля. Agent поддерживается в `connect-controller`, `verify-access`, Ansible Stage 1–5
+и streaming inspectors. Все выбирают явный ключ с `IdentitiesOnly=yes`. Зашифрованный
+ключ требует разблокированного agent в окружении вызывающего shell. Незашифрованные
+ключи продолжают работать без agent. `INVENTORY` и legacy `AUTOMATION_KEY`
 следуют правилам задачи 1; конфликт managed-key override блокирует команду.
+
+### Загрузка в agent и новый компьютер с одним зашифрованным ключом
+
+После создания новой пары `generate-user-key` спрашивает `Add private key to ssh-agent? [Y/n]:`.
+Enter/Y загружает выбранный ключ через штатный OpenSSH `ssh-add`; N пропускает загрузку.
+Passphrase вводится средствами OpenSSH: Python её не читает. Успех выводит только
+fingerprint выбранного публичного ключа. Ошибка agent не отменяет успешную генерацию;
+ключ сохраняется. Отдельная команда `load-user-key` возвращает ненулевой код при ошибке.
+Существующая пара сохраняется без повторного запроса по умолчанию. Для неё используйте
+`load-user-key` с теми же `HUMAN_USER`, `HUMAN_KEY` или `KEY_NAME`.
+Обе команды не требуют inventory и не запускают Ansible playbook.
+
+CLI использует текущий agent, в том числе пустой, и никогда не запускает новый.
+Уже загруженный выбранный fingerprint подтверждается без добавления других identity.
+Отсутствующий/недоступный agent сопровождается инструкцией; зависший запрос agent
+прерывается через 10 секунд. При необходимости запускайте agent в родительском shell:
+
+```bash
+eval "$(ssh-agent -s)"
+make load-user-key HUMAN_USER=portfolio_laptop2
+```
+
+`AGENT_LOAD=ask` (по умолчанию), `yes` или `no` управляет загрузкой при генерации.
+`yes` пропускает подтверждение; `no` исключает обращения к agent. Создание новой пары
+по-прежнему требует TTY для штатного ввода passphrase. Без TTY нет запросов подтверждения
+или passphrase: `load-user-key` подтверждает уже загруженный ключ, но отказывается
+загружать отсутствующий. `AGENT_LOAD=yes` не обходит это правило. Генерация сохраняет
+успешный статус и сообщает об ошибке загрузки; для автоматизации, которой нужен
+ненулевой код ошибки загрузки, используйте `load-user-key`. Askpass при загрузке отключён.
+
+На новом ПК используйте проверенный checkout этой feature и prerequisites OpenSSH client.
+Сохраните отдельного recovery admin и первый controller:
+
+```bash
+make setup INVENTORY=inventories/laptop2.yml
+make generate-user-key HUMAN_USER=portfolio_laptop2
+make show-public-key HUMAN_USER=portfolio_laptop2
+```
+
+Задайте passphrase и согласитесь на загрузку в agent. Если agent отсутствовал, запустите
+его в родительском shell и выполните `load-user-key`. Передайте на ПК 1 только `.pub`
+и сверяйте SHA256 fingerprint. После отдельного LIVE-разрешения ПК 1 регистрирует
+нового администратора через существующий controller `ansible`:
+
+```bash
+make add-user INVENTORY=inventories/production.yml HUMAN_USER=portfolio_laptop2 \
+  HUMAN_SUDO=admin HUMAN_PUBLIC_KEY=/path/portfolio_laptop2_ed25519.pub
+```
+
+На ПК 2 измените только локальный ignored candidate inventory: сохраните проверенные
+host, текущий порт, Python interpreter и hardening port lists; укажите `bootstrap_login_user`
+вместе с `ansible_user: portfolio_laptop2` и
+`ansible_private_key_file: ~/.ssh/portfolio-infra/portfolio_laptop2_ed25519`.
+Заранее установите независимо проверенные host keys в локальном `known_hosts`.
+На защищённом сервере не повторяйте bootstrap и не используйте auto-trust.
+После LIVE-разрешения все следующие команды используют один ключ:
+
+```bash
+make show-controller INVENTORY=inventories/laptop2.yml  # только локально
+make connect-controller INVENTORY=inventories/laptop2.yml
+# В новой сессии: id -un -> portfolio_laptop2; sudo -n id -u -> 0; exit
+make connect-user INVENTORY=inventories/laptop2.yml HUMAN_USER=portfolio_laptop2
+make verify-access INVENTORY=inventories/laptop2.yml
+```
+
+`verify-access` проверяет Ansible connectivity, login и noninteractive sudo. Все пути
+OpenSSH/streaming Stage 1–5 наследуют `SSH_AUTH_SOCK` и выбирают явный ключ; второй
+незашифрованный ключ не нужен. Незагруженный зашифрованный ключ получает отказ в batch
+mode без password fallback. Финальная SSH security по-прежнему требует отдельного
+проверенного human admin; `verify-user` не может проверять текущего inventory controller.
+
+В отдельной Ubuntu 24.04 VM сначала выполните offline `make check`. Затем проверьте
+локальную генерацию, Y/Enter/N, `AGENT_LOAD=no`, повторную генерацию, отсутствие agent
+и повторный `load-user-key`. Для проверки отказа завершите только тестовый agent или
+уберите `SSH_AUTH_SOCK`; общий desktop agent не останавливайте. Новые SSH/Ansible-сессии
+с тестовой VM требуют отдельного разрешения, зарегистрированного ключа и проверенного
+host trust. Проверьте, что посторонние загруженные identity не заменяют выбранный ключ.
+Offline mocks не доказывают реальную VM-аутентификацию. Первый controller и recovery
+access сохраняются.
 
 ## Переопределения и troubleshooting
 
@@ -710,9 +792,9 @@ make docker-host INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolut
 make verify-docker INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
 ```
 
-Для существующего ключа нужен соседний `.pub`. Используйте dedicated ключ без
-шифрования: encrypted existing keys не смогут аутентифицироваться в
-non-interactive verification этого wrapper. Права существующей key-directory
+Для существующего ключа нужен соседний `.pub`. Зашифрованный ключ работает через
+разблокированный agent в окружении вызывающего shell; сначала выполните
+`make load-user-key HUMAN_USER=… HUMAN_KEY=/absolute/path/to/key`. Права существующей key-directory
 должны быть `0700` или строже; исправляйте небезопасные локальные права осознанно.
 Отсутствующая пара генерируется, но неполная пара автоматически не исправляется
 и не заменяется.
@@ -802,7 +884,7 @@ sudo fragment; verification требует отсутствия non-interactive 
 permissions и совпадение пути с automation key блокируют операцию. Wrapper не
 читает private-key bytes и не отправляет их на сервер. Существующие зашифрованные
 human keys могут использовать уже разблокированный SSH agent с
-`IdentitiesOnly=yes` и выбранным identity; automation не зависит от agent.
+`IdentitiesOnly=yes` и выбранным identity; automation тоже может использовать выбранный ключ через agent.
 Public-only импорт без доступного локального private key отмечается **UNVERIFIED**
 и не разрешает финальную защиту. Используйте отдельный ключ для каждого человека;
 защищайте резервные копии как пароли. `secrets/` и распространённые имена ключей
@@ -1093,8 +1175,8 @@ make remove-user HUMAN_USER=operator \
 доказывается отдельной ключевой identity: копия ключа контроллера по другому пути
 не подходит. Проверки OpenSSH игнорируют client config, дополнительные identity,
 proxy и forwarding; human ssh-agent может использовать только выбранную identity.
-Пути ключей не допускают подстановок OpenSSH. Automation остаётся независимой от
-agent, поэтому выделенный ключ должен работать без запроса passphrase. Recovery-keypair
+Пути ключей не допускают подстановок OpenSSH. Automation тоже использует выбранный
+ключ через локальный agent; заранее загрузите зашифрованный controller key. Recovery-keypair
 должна быть локальной, полной и защищённой теми же правами, что остальные human keys;
 заранее разблокируйте зашифрованный recovery-ключ через `ssh-add`.
 Key-only SSH
@@ -1138,7 +1220,7 @@ Offline-проверки не доказывают доступ к VPS или LI
 2. **Локальные ключи и trust.** На каждом ПК выполните `make setup`, создайте отдельный
    ключ через `generate-user-key`, покажите публичную часть через `show-public-key`.
    Независимо сверьте host fingerprints перед записью локального trust. Для human/recovery
-   используйте passphrase и `ssh-add`, для automation — выделенный незашифрованный ключ.
+   используйте passphrase и `load-user-key`; один ключ устройства подходит для SSH и automation.
    Передавайте только `.pub`. `show-controller` должен показывать выбранные на этом ПК
    inventory user/key. Отсутствующий trust и конфликтующий override должны блокировать доступ.
 3. **Второй контроллер и sudo.** С первого контроллера добавьте public key второго ПК

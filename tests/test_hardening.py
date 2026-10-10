@@ -370,7 +370,7 @@ class HardeningTests(unittest.TestCase):
             calls.append(argv)
             self.assertEqual(argv[argv.index('-p') + 1], '2222')
             self.assertIn('StrictHostKeyChecking=yes', argv)
-            self.assertIn('IdentityAgent=none', argv)
+            self.assertNotIn('IdentityAgent=none', argv)
             self.assertIn('PasswordAuthentication=no', argv)
             if argv[-1] == 'id -un':
                 return subprocess.CompletedProcess(argv, 0, 'ansible\n', '')
@@ -460,8 +460,9 @@ def inspect(module):''')
                     self.assertEqual(remote['ansible_private_key_file'], str(self.key))
                     for option in ('StrictHostKeyChecking=yes', 'ControlMaster=no', 'ControlPath=none',
                                    'PasswordAuthentication=no', 'KbdInteractiveAuthentication=no',
-                                   'BatchMode=yes', 'IdentityAgent=none', 'IdentitiesOnly=yes'):
+                                   'BatchMode=yes', 'IdentitiesOnly=yes'):
                         self.assertIn(option, remote['ansible_ssh_args'])
+                    self.assertNotIn('IdentityAgent=none', remote['ansible_ssh_args'])
                     inputs = json.loads(command[command.index('-e') + 1])
                     self.assertFalse(any(key.startswith('ansible_') for key in inputs))
                     calls.append((Path(command[3]).name, remote, inputs))

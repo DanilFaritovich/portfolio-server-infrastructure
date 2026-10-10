@@ -34,6 +34,7 @@ class CLIMakeTests(unittest.TestCase):
         self.pair(self.controller_key)
         trust_dir = self.home / '.ssh'
         trust_dir.mkdir(mode=0o700, exist_ok=True)
+        trust_dir.chmod(0o700)
         (trust_dir / 'known_hosts').write_text(f'[{self.host}]:{self.port} {PUBLIC}\n')
         (trust_dir / 'known_hosts').chmod(0o600)
         self.executable('ssh-keygen', """#!/bin/sh
@@ -47,6 +48,15 @@ esac
         self.executable('ssh', """#!/bin/sh
 printf '%s\\n' 'unexpected ssh invocation' >> "$FAKE_CALLS"
 exit 97
+""")
+        self.executable('ssh-add', """#!/bin/sh
+printf 'ssh-add %s\\n' "$*" >> "$FAKE_CALLS"
+if [ "$1" = '-l' ]; then
+  if [ -f "$AGENT_IDENTITIES" ]; then cat "$AGENT_IDENTITIES"; exit 0; fi
+  exit 1
+fi
+printf '%s\\n' '256 SHA256:synthetic (ED25519)' > "$AGENT_IDENTITIES"
+exit 0
 """)
 
     def executable(self, name, content):
@@ -65,6 +75,7 @@ exit 97
         env = os.environ.copy()
         env.update({'HOME': str(self.home), 'PATH': str(self.bin) + os.pathsep + env['PATH'],
                     'INVENTORY': str(self.inventory), 'FAKE_CALLS': str(self.calls),
+                    'AGENT_IDENTITIES': str(self.home / 'agent-identities'),
                     'HUMAN_USER': 'person', 'HUMAN_KEY': '', 'KEY_NAME': '',
                     'AUTOMATION_KEY': ''})
         env.update({key: str(value) for key, value in extra.items()})
@@ -106,6 +117,17 @@ exit 97
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('HUMAN_USER', result.stderr)
         self.assertFalse(self.calls.exists(), 'validation must fail before external SSH tools run')
+
+    def test_load_user_key_uses_only_local_mocked_ssh_add(self):
+        (self.home / 'agent-identities').write_text('256 SHA256:synthetic (ED25519)\n')
+        result = self.make('load-user-key', HUMAN_KEY=self.key)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn('ssh-add -l -E sha256', calls)
+        self.assertNotIn('ssh-add -q ' + str(self.key), calls)
+        self.assertIn('SSH key already loaded in ssh-agent.', result.stdout)
+        self.assertNotIn('unexpected ssh invocation', calls)
+        self.assertNotIn('ansible-playbook', calls)
 
 
 if __name__ == '__main__':

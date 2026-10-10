@@ -437,7 +437,7 @@ class SafetySurfaceTests(unittest.TestCase):
         selected = Path(temporary.name) / 'recovery'
         selected.touch(mode=0o600)
         managed = {'ansible_user': 'controller', 'ansible_ssh_args': access.SSH_BASE +
-                   ' -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none'
+                   ' -o BatchMode=yes -o IdentitiesOnly=yes'
                    ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
                    ' -o KbdInteractiveAuthentication=no'}
         with patch.object(access, 'check_key'), patch.object(access, 'public_key_file'), \
@@ -489,9 +489,10 @@ class SafetySurfaceTests(unittest.TestCase):
                               'controller', {'action': 'list-users'})
         command = run.call_args.args[0]
         self.assertIn('controller@host.test', command)
-        for option in ('StrictHostKeyChecking=yes', 'IdentityAgent=none', 'IdentitiesOnly=yes',
+        for option in ('StrictHostKeyChecking=yes', 'IdentitiesOnly=yes',
                        'PasswordAuthentication=no', 'KbdInteractiveAuthentication=no', 'ControlMaster=no'):
             self.assertIn(option, command)
+        self.assertNotIn('IdentityAgent=none', command)
         self.assertEqual('sudo -n /usr/bin/python3 -I -B -', command[-1])
         payload = run.call_args.kwargs['input']
         self.assertNotIn('from ansible', payload)
