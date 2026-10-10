@@ -81,8 +81,63 @@ class HumanWrapperTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 access.human_inputs(self.env | bad)
         valid = access.human_inputs({'HUMAN_USER': 'reader', 'HUMAN_SUDO': 'restricted',
-                                    'HUMAN_SUDO_COMMANDS': '/usr/bin/id', 'HUMAN_GROUPS': 'readers'})
+                                    'HUMAN_SUDO_COMMANDS': '/usr/bin/id', 'HUMAN_GROUPS': 'readers',
+                                    'HUMAN_GROUPS_APPROVED': 'readers'})
         self.assertEqual(valid['human_access_user_sudo_commands'], ['/usr/bin/id'])
+
+    def test_group_policy_matches_ansible_assertions_for_all_sudo_modes(self):
+        from ansible.parsing.dataloader import DataLoader
+        from ansible.playbook.conditional import Conditional
+        from ansible.template import Templar
+
+        tasks = yaml.safe_load((ROOT / 'roles/human_access/tasks/main.yml').read_text())
+        defaults = yaml.safe_load((ROOT / 'roles/human_access/defaults/main.yml').read_text())
+        # Evaluate the actual role's pre-mutation assertions offline, with no playbook execution.
+        cases = [('', '', True), ('readers', '', False), ('readers', 'readers', True),
+                 ('nonexistent', '', False), ('nonexistent', 'nonexistent', True),
+                 ('custom_device_access', '', False), ('custom_device_access', 'custom_device_access', True),
+                 ('readers', 'other', False), ('readers', 'readers,readers', False)]
+        for group in ('root', 'ansible', 'docker', 'lxd', 'disk', 'shadow', 'libvirt', 'libvirt-qemu',
+                      'incus', 'incus-admin', 'adm', 'systemd-journal', 'kvm', 'sudoers', 'wheel',
+                      'storage', 'input', 'video', 'render'):
+            cases.append((group, group, False))
+        for policy in ('none', 'restricted', 'admin'):
+            for groups, approved, accepted in cases + [('sudo', '', policy == 'admin'),
+                                                     ('admin', '', policy == 'admin')]:
+                with self.subTest(policy=policy, groups=groups, approved=approved):
+                    env = {'HUMAN_USER': 'reader', 'HUMAN_SUDO': policy, 'HUMAN_GROUPS': groups,
+                           'HUMAN_GROUPS_APPROVED': approved}
+                    if policy == 'restricted':
+                        env['HUMAN_SUDO_COMMANDS'] = '/usr/bin/id'
+                    if accepted:
+                        values = access.human_inputs(env)
+                        self.assertEqual(values['human_access_user_groups'], groups.split(',') if groups else [])
+                    else:
+                        with self.assertRaises(ValueError):
+                            access.human_inputs(env)
+                    variables = defaults | {'ansible_user': 'ansible', 'ansible_connection': 'ssh',
+                                            'human_access_user_name': 'reader',
+                                            'human_access_user_groups': groups.split(',') if groups else [],
+                                            'human_access_user_approved_groups': approved.split(',') if approved else [],
+                                            'human_access_user_sudo': policy,
+                                            'human_access_user_sudo_commands': ['ALL'] if policy == 'admin' else
+                                            ['/usr/bin/id'] if policy == 'restricted' else []}
+                    loader = DataLoader()
+                    templar = Templar(loader=loader, variables=variables)
+                    results = []
+                    for task in tasks[:2]:
+                        condition = Conditional(loader=loader)
+                        condition.when = task['ansible.builtin.assert']['that']
+                        results.append(condition.evaluate_conditional(templar, variables))
+                    self.assertEqual(all(results), accepted)
+
+    def test_unapproved_group_blocks_before_host_contact_even_without_tty(self):
+        with patch.dict(os.environ, {'HUMAN_GROUPS': 'unreviewed'}), \
+                patch.object(access.sys.stdin, 'isatty', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'HUMAN_GROUPS_APPROVED'):
+                access.human_access('add-user', self.inventory, self.automation)
+        self.assertEqual(self.events, [])
+        self.run_playbook.assert_not_called()
 
     def test_key_storage_boundary_and_separate_automation_key(self):
         with patch.object(access.Path, 'home', return_value=self.directory):

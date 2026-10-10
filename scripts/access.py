@@ -778,16 +778,24 @@ def human_inputs(environment=None, managed_user='ansible'):
     groups = [value.strip() for value in env.get('HUMAN_GROUPS', '').split(',') if value.strip()]
     require(len(groups) == len(set(groups)) and all(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', g) for g in groups),
             'HUMAN_GROUPS must be unique comma-separated Ubuntu group names.')
-    require(not set(groups) & {'root', managed_user, 'docker', 'lxd', 'disk', 'shadow'},
+    require(not set(groups) & {'root', managed_user, 'docker', 'lxd', 'disk', 'shadow', 'libvirt',
+                              'libvirt-qemu', 'incus', 'incus-admin', 'adm', 'systemd-journal',
+                              'kvm', 'sudoers', 'wheel', 'storage', 'input', 'video', 'render'},
             'Root-equivalent/system groups are not supported for human accounts.')
     require(policy == 'admin' or not set(groups) & {'sudo', 'admin'},
             'sudo/admin group membership requires HUMAN_SUDO=admin.')
+    approved = [value.strip() for value in env.get('HUMAN_GROUPS_APPROVED', '').split(',') if value.strip()]
+    require(len(approved) == len(set(approved)) and
+            set(approved) == set(groups) - {'sudo', 'admin'},
+            'Set HUMAN_GROUPS_APPROVED to the exact non-sudo groups only after reviewing their server-side rights. '
+            'Membership may grant sensitive file/log/device access or administrative operations, regardless of HUMAN_SUDO.')
     commands = [value.strip() for value in env.get('HUMAN_SUDO_COMMANDS', '').split(',') if value.strip()]
     require(policy == 'restricted' or not commands, 'HUMAN_SUDO_COMMANDS is only for restricted sudo.')
     require(policy != 'restricted' or (commands and len(commands) == len(set(commands)) and
             all(re.fullmatch(r'/[a-zA-Z0-9_./-]+', c) and '..' not in Path(c).parts for c in commands)),
             'Restricted sudo requires comma-separated absolute executable paths without arguments or wildcards.')
     return {'human_access_user_name': name, 'human_access_user_groups': groups,
+            'human_access_user_approved_groups': approved,
             'human_access_user_sudo': policy,
             'human_access_user_sudo_commands': ['ALL'] if policy == 'admin' else commands}
 
@@ -1170,6 +1178,9 @@ def human_access(mode, inventory, automation_key=None):
     with add_user_public_key() as public:
         print(f"User: {human['human_access_user_name']}\nHUMAN_SUDO: {human['human_access_user_sudo']}\n"
               f'SHA256 fingerprint: {public_fingerprint(public)}')
+        if human['human_access_user_approved_groups']:
+            print('Explicitly approved groups: ' + ', '.join(human['human_access_user_approved_groups']) +
+                  '\nMembership grants their configured file/log/device and administrative rights independently of sudo.')
         if sys.stdin.isatty():
             try:
                 answer = input('LIVE: register this user and public key on the VPS? [y/N] ')

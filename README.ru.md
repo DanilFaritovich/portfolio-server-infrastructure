@@ -1029,7 +1029,7 @@ make verify-ssh-security HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
 `./secrets/portfolio-infra/`, например:
 
 ```bash
-make add-user HUMAN_USER=reader HUMAN_GROUPS=readers HUMAN_SUDO=none \
+make add-user HUMAN_USER=reader HUMAN_GROUPS=readers HUMAN_GROUPS_APPROVED=readers HUMAN_SUDO=none \
   HUMAN_KEY="$PWD/secrets/portfolio-infra/reader_ed25519"
 # Импорт одного public key без генерации/копирования private key.
 make add-user HUMAN_USER=operator2 HUMAN_SUDO=admin \
@@ -1049,9 +1049,24 @@ make add-user HUMAN_USER=auditor HUMAN_SUDO=restricted \
 Restricted executables должны иметь canonical path, root ownership и execute bit,
 с защищёнными root-owned parents; mutable files и symlinks запрещены.
 `HUMAN_GROUPS` — добавляемые группы через запятую; отсутствующие создаются.
-Root/system и распространённые runtime privilege groups запрещены; `sudo`/`admin`
-требуют admin policy. Права custom groups проверяйте отдельно. `none` не добавляет
-sudo fragment; verification требует отсутствия non-interactive sudo grant.
+Известные привилегированные группы запрещены даже с `HUMAN_SUDO=admin`: root/controller,
+группы Docker/LXD/Incus/libvirt, `disk`, `shadow`, `adm`, `systemd-journal`, `kvm`,
+`sudoers`, `wheel`, `storage`, `input`, `video` и `render`. `sudo`/`admin` требуют
+admin policy. Любая другая группа, включая неизвестную или отсутствующую,
+по умолчанию блокируется: имя и GID не доказывают безопасность. Перед одобрением
+проверьте реальные права на файлы, журналы, устройства, ACL, service sockets
+и административные политики сервера. Укажите в `HUMAN_GROUPS_APPROVED` точный список
+групп через запятую, кроме `sudo`/`admin`, явно принимая их права независимо от
+`HUMAN_SUDO`. Не одобряйте непроверенные группы. Отдельное одобрение обязательно
+в интерактивном и неинтерактивном режиме; prompt и sudo policy не подставляют его
+автоматически. Существующим скриптам с такими `HUMAN_GROUPS` теперь нужно передавать
+одобрение. Пустой список групп и `sudo`/`admin` при admin policy работают как раньше.
+Прямой запуск `add-user.yml` требует эквивалентную list-переменную
+`human_access_user_approved_groups` (по умолчанию `[]`) до любых изменений.
+Одобрение означает принятие прав оператором, а не автоматический анализ Linux permissions;
+после изменений конфигурации сервера проверяйте права заново. Миграции существующих
+пользователей и групп нет. `none` не добавляет sudo fragment; verification требует
+отсутствия non-interactive sudo grant.
 
 `add-user` принимает вставленный public key или `HUMAN_PUBLIC_KEY` и не создаёт
 private key. `generate-user-key` запрашивает passphrase. Каталоги имеют `0700`, private keys — `0600`

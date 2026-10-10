@@ -163,7 +163,10 @@ class EngineTests(unittest.TestCase):
     def test_remove_retains_files_revokes_keys_sudo_and_is_idempotent(self):
         retained = self.home / 'operator/work.txt'
         retained.write_text('keep')
-        result = engine.execute(self.params('remove-user'))
+        with patch.object(engine.Runner, 'run_command', side_effect=self.command) as commands:
+            result = engine.execute(self.params('remove-user'))
+        probes = [call.args[0] for call in commands.call_args_list if call.args[0][0] == 'pgrep']
+        self.assertEqual(probes, [['pgrep', '-U', str(os.getuid())], ['pgrep', '-u', str(os.getuid())]])
         self.assertTrue(result['files_preserved'])
         self.assertEqual('keep', retained.read_text())
         self.assertEqual('', (self.home / 'operator/.ssh/authorized_keys').read_text())
@@ -171,13 +174,40 @@ class EngineTests(unittest.TestCase):
         repeat = engine.execute({'action': 'remove-user', 'name': 'operator', 'controller': 'controller'})
         self.assertFalse(repeat['changed'])
 
-    def test_remove_does_not_force_busy_account(self):
-        with patch.object(engine.Runner, 'run_command', side_effect=lambda argv, **kw:
-                          (0, '123', '') if argv[0] == 'pgrep' else self.command(argv, **kw)):
-            with self.assertRaises(engine.PreflightError):
-                engine.execute(self.params('remove-user'))
-        self.assertFalse(self.deleted)
-        self.assertTrue((self.sudo / 'portfolio-human-operator').exists())
+    def test_process_matches_and_lookup_errors_preserve_all_credentials(self):
+        paths = [self.home / 'operator/.ssh/authorized_keys', self.state / 'operator.keys.json',
+                 self.sudo / 'portfolio-human-operator', self.state / 'operator.json']
+        original = [path.read_bytes() for path in paths]
+        for selector in ('-U', '-u'):
+            for rc in (0, 2, 3, -9):
+                with self.subTest(selector=selector, rc=rc):
+                    def probe(argv, **kwargs):
+                        if argv[:2] == ['pgrep', selector]:
+                            return rc, '123' if rc == 0 else '', ''
+                        return self.command(argv, **kwargs)
+                    with patch.object(engine.Runner, 'run_command', side_effect=probe):
+                        with self.assertRaisesRegex(engine.PreflightError, 'active processes or process lookup failed'):
+                            engine.execute(self.params('remove-user'))
+                    self.assertEqual(original, [path.read_bytes() for path in paths])
+                    self.assertFalse(self.deleted)
+                    self.assertFalse((self.state / 'operator.removed').exists())
+
+    def test_unavailable_process_probe_preserves_credentials(self):
+        paths = [self.home / 'operator/.ssh/authorized_keys', self.state / 'operator.keys.json',
+                 self.sudo / 'portfolio-human-operator', self.state / 'operator.json']
+        original = [path.read_bytes() for path in paths]
+        for selector in ('-U', '-u'):
+            for error in (FileNotFoundError('fixture'), subprocess.TimeoutExpired('pgrep', 30)):
+                def probe(argv, **kwargs):
+                    if argv[:2] == ['pgrep', selector]:
+                        raise error
+                    return self.command(argv, **kwargs)
+                with self.subTest(selector=selector, error=type(error).__name__), \
+                        patch.object(engine.Runner, 'run_command', side_effect=probe):
+                    with self.assertRaises(type(error)):
+                        engine.execute(self.params('remove-user'))
+                self.assertEqual(original, [path.read_bytes() for path in paths])
+                self.assertFalse(self.deleted)
 
     def test_userdel_failure_reports_partial_revocation_without_receipt(self):
         params = self.params('remove-user')

@@ -293,9 +293,11 @@ def execute(params):
             content = ''.join(line for line in content.splitlines(keepends=True) if line.rstrip('\r\n') != key)
         else:
             require(all(entry['managed'] for entry in before['keys']), 'Unmanaged keys block account removal.')
-            # userdel rejects busy accounts; check before revoking credentials as well.
-            rc, _, _ = Runner({}).run_command(['pgrep', '-u', str(before['uid'])])
-            require(rc == 1, 'Account has active processes or process lookup failed; stop them manually.')
+            # Separate probes implement OR: pgrep combines -U and -u with AND.
+            # procps pgrep(1): only status 1 means no matches; errors fail closed.
+            for selector in ('-U', '-u'):
+                rc, _, _ = Runner({}).run_command(['pgrep', selector, str(before['uid'])])
+                require(rc == 1, 'Account has active processes or process lookup failed; stop them manually.')
             login_defs = LOGIN_DEFS
             safe(login_defs)
             require(not any(line.split('#', 1)[0].strip().startswith('USERDEL_CMD')

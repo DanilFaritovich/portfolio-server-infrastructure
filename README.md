@@ -1023,7 +1023,7 @@ from the automation key. `HUMAN_KEY` overrides that path. The only permitted
 repository location is `./secrets/portfolio-infra/`; for example:
 
 ```bash
-make add-user HUMAN_USER=reader HUMAN_GROUPS=readers HUMAN_SUDO=none \
+make add-user HUMAN_USER=reader HUMAN_GROUPS=readers HUMAN_GROUPS_APPROVED=readers HUMAN_SUDO=none \
   HUMAN_KEY="$PWD/secrets/portfolio-infra/reader_ed25519"
 # Import one existing public key without generating or copying a private key.
 make add-user HUMAN_USER=operator2 HUMAN_SUDO=admin \
@@ -1043,9 +1043,22 @@ such as a shell, interpreter or service manager can still grant full root power.
 Restricted executable paths must be canonical, executable and root-owned, with
 protected root-owned parents; mutable files and symlinks are refused.
 `HUMAN_GROUPS` is a comma-separated additive list; missing groups are created.
-Root/system and common runtime privilege groups are refused; `sudo`/`admin` groups
-require the admin policy. Review custom group privileges separately. `none` adds
-no sudo fragment and verification requires no non-interactive sudo grant.
+Known privileged groups are refused even with `HUMAN_SUDO=admin`: root/controller,
+Docker/LXD/Incus/libvirt groups, `disk`, `shadow`, `adm`, `systemd-journal`, `kvm`,
+`sudoers`, `wheel`, `storage`, `input`, `video` and `render`. `sudo`/`admin` groups
+require the admin policy. Every other group, including an unknown or missing group,
+is blocked by default: names and GIDs do not prove safety. Review its actual server-side
+file/log/device permissions, ACLs, service sockets and administrative policy before approval.
+Set `HUMAN_GROUPS_APPROVED` to the exact comma-separated non-sudo groups to explicitly
+accept those rights, independently of `HUMAN_SUDO`. Do not approve unaudited groups.
+This separate approval is required in interactive and noninteractive usage; no prompt or
+sudo policy supplies it implicitly. Existing scripts with non-sudo `HUMAN_GROUPS` must
+now supply this approval. Empty groups and admin-policy `sudo`/`admin` membership work
+as before. Direct `add-user.yml` calls require the equivalent list variable
+`human_access_user_approved_groups` (default `[]`) before any mutation. Approval is
+operator acceptance, not automatic Linux permission analysis; re-review after server
+configuration changes. Existing users/groups are not migrated. `none` adds no sudo
+fragment and verification requires no non-interactive sudo grant.
 
 `add-user` accepts a pasted public key or `HUMAN_PUBLIC_KEY`; it never generates
 a private key. `generate-user-key` prompts for a passphrase. Directories are private (`0700`), and private
