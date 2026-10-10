@@ -847,7 +847,8 @@ def read_public_key(path):
 
 def public_key_identity(public):
     """Validate public material only; comments and file paths do not identify a key."""
-    return tuple(read_public_key(public_key_file(public)).split()[:2])
+    kind, encoded = read_public_key(public_key_file(public)).split()[:2]
+    return kind, base64.b64decode(encoded, validate=True)
 
 
 def require_independent_key(public, controller_key, message):
@@ -1309,7 +1310,10 @@ def user_management(mode, inventory, override=None):
     params = {'action': mode, 'name': name}
     if mode == 'add-user-key':
         public = public_key_file(os.environ.get('HUMAN_PUBLIC_KEY', ''))
-        params['key'] = public.read_text().strip()
+        # Freeze the validated input before identity checks and any host contact.
+        with public_key_snapshot(read_public_key(public)) as snapshot:
+            require_independent_key(snapshot, key, 'Human and controller must use different SSH key identities.')
+            params['key'] = read_public_key(snapshot).strip()
     if mode == 'revoke-user-key':
         digest = os.environ.get('KEY_FINGERPRINT', '')
         require(re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', digest), 'Set KEY_FINGERPRINT to an exact SHA256 fingerprint.')
@@ -1354,8 +1358,15 @@ def user_management(mode, inventory, override=None):
                    ' -o KbdInteractiveAuthentication=no'}
         human = {'human_access_user_name': recovery, 'human_access_user_sudo': 'admin',
                  'human_access_user_groups': retained['groups'], 'human_access_user_sudo_commands': ['ALL']}
+        selected = public_fingerprint(Path(str(recovery_key) + '.pub'))
         verify_human(inventory, alias, host, port, managed, inputs, human, recovery_key)
-        params.update(recovery_user=recovery, recovery_token=retained['token'])
+        require(public_fingerprint(Path(str(recovery_key) + '.pub')) == selected,
+                'Recovery public identity changed during access proof.')
+        target_keys = {entry['fingerprint'] for entry in before['keys']}
+        recovery_keys = {entry['fingerprint'] for entry in retained['keys']}
+        require(not target_keys & recovery_keys, 'Target and recovery SSH keys overlap.')
+        require(selected in recovery_keys, 'Selected recovery identity is absent from the retained account.')
+        params.update(recovery_user=recovery, recovery_token=retained['token'], recovery_fingerprint=selected)
     require(sys.stdin.isatty(), 'User/key mutation requires interactive recovery confirmation.')
     print(json.dumps(before, indent=2))
     if mode == 'add-user-key':

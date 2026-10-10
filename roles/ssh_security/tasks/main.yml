@@ -18,6 +18,18 @@
   register: security_automation_root
   failed_when: security_automation_root.rc != 0 or security_automation_root.stdout != '0'
 
+- name: Check server-side administrator identity independence before final policy work
+  portfolio_human_info:
+    name: "{{ human_access_user_name }}"
+    groups: "{{ human_access_user_groups }}"
+    sudo: "{{ human_access_user_sudo }}"
+    commands: "{{ human_access_user_sudo_commands }}"
+    controller: "{{ ansible_user }}"
+    public_key: "{{ lookup('ansible.builtin.file', human_access_user_private_key_path ~ '.pub') | trim }}"
+    identity_only: true
+  become: true
+  no_log: true
+
 - name: Re-prove human administrator access with a separate connection before policy work
   ansible.builtin.include_role:
     name: human_access

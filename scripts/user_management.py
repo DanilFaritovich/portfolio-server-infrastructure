@@ -4,7 +4,6 @@ Only protected server records establish account ownership. Key ownership is reco
 separately; legacy keys must be explicitly added before they can be revoked.
 """
 
-import base64
 import fcntl
 import hashlib
 import os
@@ -12,15 +11,11 @@ import json
 from pathlib import Path
 import re
 import stat
-import shlex
 import subprocess
 import tempfile
 
 
 LOGIN_DEFS = Path('/etc/login.defs')
-SSH_MAIN = Path('/etc/ssh/sshd_config')
-SSH_INCLUDES = Path('/etc/ssh/sshd_config.d')
-SSH_PENDING = Path('/etc/ssh/portfolio-security.pending')
 USERDEL_HOOKS = (Path('/etc/shadow-maint/userdel-pre.d'), Path('/etc/shadow-maint/userdel-post.d'))
 
 
@@ -34,58 +29,8 @@ class Runner:
         return result.returncode, result.stdout, result.stderr
 
 
-def fingerprint(line):
-    lexer = shlex.shlex(line, posix=True)
-    lexer.whitespace_split = True
-    lexer.commenters = ''
-    for value in lexer:
-        if re.fullmatch(r'ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)', value):
-            blob = base64.b64decode(next(lexer), validate=True)
-            require(len(blob) >= 4, 'Invalid SSH key blob.')
-            length = int.from_bytes(blob[:4], 'big')
-            require(blob[4:4 + length].decode('ascii') == value, 'SSH key type mismatch.')
-            return 'SHA256:' + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip('=')
-    raise PreflightError('Unsupported authorized_keys entry; review manually.')
-
-
-def ssh_sources():
-    require(not SSH_PENDING.exists() and not SSH_PENDING.is_symlink(), 'Pending SSH activation; use recovery access.')
-    safe(SSH_MAIN)
-    safe(SSH_INCLUDES, directory=True)
-    files = [SSH_MAIN, *sorted(SSH_INCLUDES.glob('*.conf'))]
-    digests = []
-    for path in files:
-        safe(path)
-        content = path.read_text()
-        for line in content.splitlines():
-            tokens = re.split(r'[\s=]+', line.split('#', 1)[0].strip())
-            require(not tokens or tokens[0].lower() != 'match', 'Conditional SSH Match policy is unsupported.')
-            if tokens and tokens[0].lower() == 'include':
-                require(path == SSH_MAIN and re.fullmatch(
-                    r'\s*Include[ \t]+/etc/ssh/sshd_config\.d/\*\.conf[ \t]*(?:#.*)?', line, re.I),
-                    'Unsupported SSH includes; review manually.')
-        digests.append([str(path), hashlib.sha256(content.encode()).hexdigest()])
-    return digests
-
-
 def read_keys(name, uid):
-    home_fd = os.open(HOME_ROOT / name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        ssh_fd = os.open('.ssh', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd)
-        try:
-            for descriptor in (home_fd, ssh_fd):
-                info = os.fstat(descriptor)
-                require(info.st_uid == uid and info.st_mode & 0o022 == 0, 'Unsafe SSH directory.')
-            descriptor = os.open('authorized_keys', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=ssh_fd)
-            with os.fdopen(descriptor, newline='') as keys:
-                info = os.fstat(keys.fileno())
-                require(stat.S_ISREG(info.st_mode) and info.st_uid == uid and info.st_mode & 0o022 == 0
-                        and info.st_size <= 1024 * 1024, 'Unsafe or oversized authorized_keys.')
-                return keys.read()
-        finally:
-            os.close(ssh_fd)
-    finally:
-        os.close(home_fd)
+    return read_authorized_keys(HOME_ROOT / name, uid)
 
 
 def read_account(name, controller):
@@ -130,10 +75,7 @@ def read_account(name, controller):
     keys_path = home / '.ssh/authorized_keys'
     require(keys_path.is_file(), 'Missing authorized_keys; review manually.')
     content = read_keys(name, record['uid'])
-    entries = []
-    for line in content.splitlines():
-        if line.strip() and not line.lstrip().startswith('#'):
-            entries.append({'key': line, 'fingerprint': fingerprint(line)})
+    entries = key_entries(content)
     ledger_path = STATE_ROOT / (name + '.keys.json')
     owned = []
     if ledger_path.exists() or ledger_path.is_symlink():
@@ -142,13 +84,17 @@ def read_account(name, controller):
         require(isinstance(owned, list) and all(isinstance(key, str) for key in owned), 'Invalid key ledger.')
     for entry in entries:
         entry['managed'] = entry['key'] in owned
-    snapshot = json.dumps([record, content, owned, ssh_sources()], sort_keys=True).encode()
+    snapshot = json.dumps([record, content, owned, ssh_sources(), controller_state(Runner({}), controller)], sort_keys=True).encode()
     return {'name': name, 'sudo': record['sudo'], 'groups': record['groups'], 'commands': record['commands'],
             'uid': record['uid'], 'gid': record['gid'], 'keys': entries,
             'token': hashlib.sha256(snapshot).hexdigest()}, content, owned
 
 
-def atomic_keys(name, content, uid, gid, expected=None):
+def key_directory_identity(info):
+    return info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid
+
+
+def atomic_keys(name, content, uid, gid, expected=None, validate=None):
     # Pin every user-controlled directory with O_NOFOLLOW. Rename relative to the
     # pinned SSH directory so a concurrent home/symlink replacement cannot redirect root.
     home_fd = os.open(HOME_ROOT / name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -158,7 +104,7 @@ def atomic_keys(name, content, uid, gid, expected=None):
             for fd in (home_fd, ssh_fd):
                 info = os.fstat(fd)
                 require(info.st_uid == uid and info.st_mode & 0o022 == 0, 'SSH directory changed during mutation.')
-            key_fd = os.open('authorized_keys', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=ssh_fd)
+            key_fd = os.open('authorized_keys', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=ssh_fd)
             with os.fdopen(key_fd, newline='') as current:
                 metadata = os.fstat(current.fileno())
                 require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == uid and metadata.st_mode & 0o022 == 0,
@@ -173,6 +119,13 @@ def atomic_keys(name, content, uid, gid, expected=None):
                     output.write(content)
                     output.flush()
                     os.fsync(output.fileno())
+                if validate is not None:
+                    validate()
+                # Recheck content after staging and bind the pinned directory to the live path.
+                require(key_directory_identity(os.stat(HOME_ROOT / name, follow_symlinks=False)) == key_directory_identity(os.fstat(home_fd))
+                        and key_directory_identity(os.stat(HOME_ROOT / name / '.ssh', follow_symlinks=False)) == key_directory_identity(os.fstat(ssh_fd)),
+                        'SSH directory replaced during mutation.')
+                require(expected is None or read_keys(name, uid) == expected, 'Keys changed during staged write.')
                 os.rename(temporary, 'authorized_keys', src_dir_fd=ssh_fd, dst_dir_fd=ssh_fd)
                 os.fsync(ssh_fd)
             finally:
@@ -264,10 +217,25 @@ def execute(params):
         fcntl.flock(lock, fcntl.LOCK_EX)
         before, content, owned = read_account(name, controller)
         require(params.get('token') == before['token'], 'Account/key state changed after preflight; stop and inspect.')
-        if action in ('revoke-user-key', 'remove-user'):
-            recovery, _, _ = read_account(params.get('recovery_user', ''), controller)
-            require(recovery['name'] != name and recovery['sudo'] == 'admin' and recovery['keys']
-                    and params.get('recovery_token') == recovery['token'], 'A separately proven retained human admin is required.')
+        def validate_recovery(target_keys):
+            retained = read_account(params.get('recovery_user', ''), controller)[0]
+            require(retained['name'] != name and retained['sudo'] == 'admin' and retained['keys']
+                    and retained['token'] == params.get('recovery_token'),
+                    'Recovery state changed or a separately proven retained human admin is unavailable.')
+            recovery_keys = {entry['fingerprint'] for entry in retained['keys']}
+            controller_keys = set(controller_state(Runner({}), controller)['fingerprints'])
+            require(not target_keys & recovery_keys, 'Target and recovery SSH keys overlap.')
+            require(params.get('recovery_fingerprint') in recovery_keys
+                    and params['recovery_fingerprint'] not in controller_keys,
+                    'Proven recovery identity must be retained and independent of controller.')
+
+        def validate():
+            current = read_account(name, controller)[0]
+            require(current['token'] == params.get('token'), 'Account/key state changed during mutation.')
+            if action in ('revoke-user-key', 'remove-user'):
+                validate_recovery({entry['fingerprint'] for entry in current['keys']})
+
+        validate()
         original = content
         if action == 'add-user-key':
             key = params['key'].strip()
@@ -275,6 +243,8 @@ def execute(params):
                 r'(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,3}( [^\r\n]*)?', key),
                 'Only one plain public key is supported.')
             digest = fingerprint(key)
+            require(digest not in controller_state(Runner({}), controller)['fingerprints'],
+                    'Human and controller SSH identities must be independent.')
             matches = [entry for entry in before['keys'] if entry['fingerprint'] == digest]
             require(not matches or len(matches) == 1 and matches[0]['key'] == key,
                     'Existing key has different options/comment or duplicate identity; review manually.')
@@ -307,10 +277,13 @@ def execute(params):
                     safe(hooks, directory=True)
                     require(not any(hooks.iterdir()), 'Custom userdel hooks are unsupported.')
             content = ''
-        if content != read_keys(name, before['uid']):
-            atomic_keys(name, content, before['uid'], before['gid'], expected=original)
+        validate()
+        if content != original:
+            atomic_keys(name, content, before['uid'], before['gid'], expected=original, validate=validate)
         if action == 'add-user-key':
             write_ledger(name, owned)
+        if action in ('revoke-user-key', 'remove-user'):
+            validate_recovery({entry['fingerprint'] for entry in before['keys']})
         if action == 'remove-user':
             require(read_account(name, controller)[1] == '', 'Credential revocation verification failed; stop and inspect.')
             fragment = SUDO_ROOT / ('portfolio-human-' + name)

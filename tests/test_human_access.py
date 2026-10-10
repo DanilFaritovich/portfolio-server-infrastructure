@@ -467,6 +467,32 @@ class HumanAccountPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Group removal'):
             human_info.inspect(self.module)
 
+    def test_removed_receipt_blocks_direct_ansible_creation(self):
+        (human_info.STATE_ROOT / 'operator.removed').write_text('{}')
+        with self.assertRaisesRegex(human_info.PreflightError, 'cannot be recreated'):
+            human_info.inspect(self.module)
+        self.module.run_command.assert_not_called()
+
+    def test_direct_ansible_cannot_mutate_existing_accounts_or_add_controller_key(self):
+        from test_user_management import key
+        self.module.params.update(controller='controller', public_key=key(2))
+        with patch.object(human_info, 'controller_state', return_value={'fingerprints': [human_info.fingerprint(key(1))]}), patch.object(human_info, 'ssh_sources', return_value=[]):
+            self.assertFalse(human_info.inspect(self.module))
+            (human_info.STATE_ROOT / 'operator.json').write_text('{}')
+            with self.assertRaisesRegex(human_info.PreflightError, 'locked add-user-key'):
+                human_info.inspect(self.module)
+            self.module.params['identity_only'] = True
+            self.assertFalse(human_info.inspect(self.module))
+            self.module.params['public_key'] = key(1) + ' another-comment'
+            with self.assertRaisesRegex(human_info.PreflightError, 'independent'):
+                human_info.inspect(self.module)
+
+    def test_existing_group_addition_is_not_implicitly_approved(self):
+        (human_info.STATE_ROOT / 'operator.json').write_text(json.dumps(self.module.params))
+        self.module.params['groups'] = ['readers']
+        with self.assertRaisesRegex(human_info.PreflightError, 'separately reviewed migration'):
+            human_info.inspect(self.module)
+
     def test_untrusted_metadata_is_rejected(self):
         original = load('human_metadata_unpatched', 'library/portfolio_human_info.py')
         path = Mock(parents=[])

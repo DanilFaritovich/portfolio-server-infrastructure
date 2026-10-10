@@ -1340,6 +1340,16 @@ multiple entries blocks the operation. Unmanaged accounts cannot be adopted; unm
 keys cannot be revoked, and any unmanaged key blocks account removal. These server
 records establish ownership, while actual VPS state remains the source of access facts.
 
+Human-key registration rejects every identity currently authorized for the controller,
+including legacy keys and keys with different comments/options. The check runs locally
+for the selected controller key and on the server for its complete supported key set.
+Direct `add-user.yml` calls enforce identity checks and removal receipts; they only
+create fresh accounts. Existing accounts must use `make add-user` / `make add-user-key`
+so registration uses the locked additive engine without changing privileges, groups or
+existing key options. Direct `secure-ssh.yml` calls also check server-side identity
+independence. Certificate-authority entries and alternate controller authorization
+sources are unsupported and fail closed.
+
 For revocation/removal, supply another managed human administrator and its local key:
 
 ```sh
@@ -1351,7 +1361,11 @@ make remove-user HUMAN_USER=operator \
 
 The retained administrator must differ from the target and current controller. Its
 key identity must also differ from the controller key; copying that key to another
-path does not qualify. OpenSSH verification ignores client configuration, additional
+path does not qualify. Target and recovery accounts must have disjoint sets of all
+current key fingerprints, including unmanaged entries and entries with SSH options.
+The selected, freshly proven recovery fingerprint must remain authorized and must not
+match any server-authorized controller key. OpenSSH verification ignores client
+configuration, additional
 identities, proxies and forwarding; only the selected identity may use the human's
 existing agent. Key paths cannot contain OpenSSH expansion tokens. Managed automation
 uses the same selected-agent policy; load encrypted controller keys before running targets.
@@ -1362,7 +1376,15 @@ Without that proof the last confirmed human administrative access cannot be remo
 Keep provider-console recovery available. Mutations verify Stage 3 and managed access,
 show the current state/request, require default-deny TTY confirmation, and reject state
 changes after preflight. Server-side operations serialize and check key contents before
-atomic replacement. No SSH daemon, ports, authentication policy or services are changed.
+atomic replacement. Target/controller snapshots and recovery proof are rechecked after
+staging the replacement, immediately before rename; destructive operations also recheck
+recovery after credential changes and stop on drift without rollback or retry.
+The management lock serializes this engine's mutations, not external root or user edits
+to user-owned SSH directories. Those edits may still race after the last check; the
+operation is not a filesystem/account transaction. Fresh-account creation is a separate
+multi-task Ansible operation: serialize operator runs and inspect interrupted creation
+rather than automatically adopting or repairing it. No SSH daemon, ports, authentication
+policy or services are changed.
 A successful mutation checks its exact server result and re-proves managed access.
 
 Removal blocks active user processes, custom userdel hooks, unknown privilege/group state,

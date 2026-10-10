@@ -18,6 +18,7 @@ engine = types.ModuleType('user_engine')
 source = (ROOT / 'library/portfolio_human_info.py').read_text().split('def main():')[0]
 exec(compile(source.replace('from ansible.module_utils.basic import AnsibleModule', ''), 'human_info', 'exec'), engine.__dict__)
 exec(compile((ROOT / 'scripts/user_management.py').read_text(), 'user_management', 'exec'), engine.__dict__)
+server_controller_state = engine.controller_state
 runner_run_command = engine.Runner.run_command
 spec = importlib.util.spec_from_file_location('management_access', ROOT / 'scripts/access.py')
 access = importlib.util.module_from_spec(spec)
@@ -47,18 +48,19 @@ class EngineTests(unittest.TestCase):
             directory = self.home / name / '.ssh'
             directory.mkdir(parents=True, mode=0o700)
             (self.home / name).chmod(0o750)
-            (directory / 'authorized_keys').write_text(key(1) + '\n')
+            (directory / 'authorized_keys').write_text(key(1 if name == 'operator' else 4) + '\n')
             (directory / 'authorized_keys').chmod(0o600)
             record = {'name': name, 'groups': [], 'sudo': 'admin', 'commands': ['ALL'],
                       'uid': os.getuid(), 'gid': os.getgid()}
             (self.state / (name + '.json')).write_text(json.dumps(record))
-            (self.state / (name + '.keys.json')).write_text(json.dumps([key(1)]))
+            (self.state / (name + '.keys.json')).write_text(json.dumps([key(1 if name == 'operator' else 4)]))
             (self.sudo / ('portfolio-human-' + name)).write_text(name + ' ALL=(ALL:ALL) NOPASSWD: ALL\n')
         for name, value in (('HOME_ROOT', self.home), ('STATE_ROOT', self.state), ('SUDO_ROOT', self.sudo), ('LOGIN_DEFS', self.login_defs), ('USERDEL_HOOKS', ())):
             mocked = patch.object(engine, name, value)
             mocked.start()
             self.addCleanup(mocked.stop)
         for mocked in (patch.object(engine, 'safe'), patch.object(engine, 'inspect'), patch.object(engine, 'ssh_sources', return_value=[]),
+                       patch.object(engine, 'controller_state', return_value={'fingerprints': [engine.fingerprint(key(9))]}),
                        patch.object(engine.Runner, 'run_command', side_effect=self.command)):
             mocked.start()
             self.addCleanup(mocked.stop)
@@ -88,7 +90,100 @@ class EngineTests(unittest.TestCase):
         before = engine.read_account('operator', 'controller')[0]
         recovery = engine.read_account('recovery', 'controller')[0]
         return {'action': action, 'name': 'operator', 'controller': 'controller', 'confirmed': True,
+                'recovery_fingerprint': engine.fingerprint(key(4)),
                 'token': before['token'], 'recovery_user': 'recovery', 'recovery_token': recovery['token']} | extra
+
+    def test_controller_key_addition_and_legacy_registration_are_refused(self):
+        for comment in ('', ' different-comment'):
+            with self.subTest(comment=comment), self.assertRaisesRegex(engine.PreflightError, 'independent'):
+                engine.execute(self.params('add-user-key', key=key(9) + comment))
+        path = self.home / 'operator/.ssh/authorized_keys'
+        path.write_text(key(9) + '\n')
+        with self.assertRaisesRegex(engine.PreflightError, 'independent'):
+            engine.execute(self.params('add-user-key', key=key(9)))
+        self.assertEqual([key(1)], json.loads((self.state / 'operator.keys.json').read_text()))
+
+    def test_target_recovery_overlap_blocks_both_destructive_operations(self):
+        target = self.home / 'operator/.ssh/authorized_keys'
+        recovery = self.home / 'recovery/.ssh/authorized_keys'
+        for line in (key(1) + ' other-comment', 'restrict ' + key(1)):
+            recovery.write_text(key(4) + '\n' + line + '\n')
+            for action in ('remove-user', 'revoke-user-key'):
+                with self.subTest(action=action, line=line), self.assertRaisesRegex(engine.PreflightError, 'overlap'):
+                    engine.execute(self.params(action, fingerprint=engine.fingerprint(key(1))))
+                self.assertEqual(key(1) + '\n', target.read_text())
+                self.assertFalse(self.deleted)
+
+    def test_missing_or_controller_recovery_proof_identity_is_refused(self):
+        recovery = self.home / 'recovery/.ssh/authorized_keys'
+        recovery.write_text(key(4) + '\n' + key(9) + '\n')
+        for selected in (None, engine.fingerprint(key(7)), engine.fingerprint(key(9))):
+            for action in ('remove-user', 'revoke-user-key'):
+                with self.subTest(action=action, selected=selected), self.assertRaisesRegex(engine.PreflightError, 'Proven recovery'):
+                    engine.execute(self.params(action, recovery_fingerprint=selected, fingerprint=engine.fingerprint(key(1))))
+        self.assertFalse(self.deleted)
+
+    def test_staged_write_rechecks_recovery_target_and_controller(self):
+        # Inject concurrent edits after preflight and final validation, during fsync
+        # of the staged key file. Nothing may rename over the reviewed credentials.
+        for changed in ('recovery', 'operator', 'controller'):
+            for action in ('add-user-key', 'revoke-user-key', 'remove-user'):
+                if changed == 'recovery' and action == 'add-user-key':
+                    continue
+                with self.subTest(changed=changed, action=action):
+                    params = self.params(action, key=key(2), fingerprint=engine.fingerprint(key(1)))
+                    original = (self.home / 'operator/.ssh/authorized_keys').read_text()
+                    controller = {'fingerprints': [engine.fingerprint(key(9))]}
+                    edited = False
+                    def concurrent(_fd):
+                        nonlocal edited
+                        if not edited:
+                            edited = True
+                            if changed == 'controller':
+                                controller['fingerprints'].append(engine.fingerprint(key(2)))
+                            else:
+                                with (self.home / changed / '.ssh/authorized_keys').open('a') as output:
+                                    output.write(key(6) + '\n')
+                    with patch.object(engine, 'controller_state', side_effect=lambda *args: controller.copy()), \
+                            patch.object(engine.os, 'fsync', side_effect=concurrent), \
+                            self.assertRaises(engine.PreflightError):
+                        engine.execute(params)
+                    expected = original + (key(6) + '\n' if changed == 'operator' else '')
+                    self.assertEqual(expected, (self.home / 'operator/.ssh/authorized_keys').read_text())
+                    self.assertFalse(self.deleted)
+                    for account, seed in (('operator', 1), ('recovery', 4)):
+                        (self.home / account / '.ssh/authorized_keys').write_text(key(seed) + '\n')
+
+    def test_controller_snapshot_binds_server_authorized_keys_and_policy(self):
+        home = self.home / 'controller'
+        (home / '.ssh').mkdir(parents=True, mode=0o700)
+        home.chmod(0o750)
+        (home / '.ssh/authorized_keys').write_text('restrict ' + key(9) + '\n')
+        (home / '.ssh/authorized_keys').chmod(0o600)
+        def command(argv, **kwargs):
+            if argv[:2] == ['getent', 'passwd'] and argv[-1] == 'controller':
+                return 0, f'controller:x:{os.getuid()}:{os.getgid()}::{home}:/bin/bash', ''
+            return self.command(argv, **kwargs)
+        with patch.object(engine.Runner, 'run_command', side_effect=command):
+            state = server_controller_state(engine.Runner({}), 'controller')
+            self.assertEqual([engine.fingerprint(key(9))], state['fingerprints'])
+            (home / '.ssh/authorized_keys2').write_text(key(8))
+            with self.assertRaisesRegex(engine.PreflightError, 'Alternate controller'):
+                server_controller_state(engine.Runner({}), 'controller')
+
+    def test_unsupported_entry_cannot_hide_behind_supported_key_in_comment(self):
+        with self.assertRaises(engine.PreflightError):
+            engine.fingerprint('sk-ssh-ed25519@openssh.com AAAA ' + key(1))
+
+    def test_certificate_authority_entries_fail_closed(self):
+        for options in ('cert-authority', 'restrict,cert-authority', 'cert-authority,restrict', 'CERT-AUTHORITY'):
+            with self.subTest(options=options), self.assertRaisesRegex(engine.PreflightError, 'Certificate-authority'):
+                engine.fingerprint(options + ' ' + key(1))
+
+    def test_hardlinked_authorized_keys_are_refused(self):
+        os.link(self.home / 'operator/.ssh/authorized_keys', self.home / 'linked')
+        with self.assertRaises(engine.PreflightError):
+            engine.read_keys('operator', os.getuid())
 
     def test_add_preserves_legacy_keys_and_repeat_is_unchanged(self):
         path = self.home / 'operator/.ssh/authorized_keys'
@@ -369,11 +464,12 @@ class WrapperTests(unittest.TestCase):
             mocked.start()
             self.addCleanup(mocked.stop)
 
-    def probe(self, host, port, interpreter, key, controller, params):
+    def probe(self, host, port, interpreter, selected_key, controller, params):
         self.assertEqual('controller', controller)
-        self.assertEqual(self.key, key)
+        self.assertEqual(self.key, selected_key)
         self.events.append('mutate' if params.get('confirmed') else 'inspect')
-        return {'token': 'fresh', 'sudo': 'admin', 'groups': []}
+        return {'token': 'fresh', 'sudo': 'admin', 'groups': [],
+                'keys': [{'fingerprint': engine.fingerprint(key(2 if params.get('name') == 'recovery' else 3))}]}
 
     def test_remove_proves_recovery_before_confirmation_and_verifies_after(self):
         with patch('builtins.input', side_effect=lambda *args: self.events.append('confirm') or 'yes'):
@@ -457,6 +553,33 @@ class WrapperTests(unittest.TestCase):
         self.assertIn('\\u001b', display)
         self.assertNotIn('mutate', self.events)
 
+    def test_add_controller_identity_fails_before_any_host_contact(self):
+        public = Path(self.temp.name) / 'copied.pub'
+        public.write_text(key(1) + ' another-comment')
+        public.chmod(0o600)
+        with patch.dict(os.environ, HUMAN_PUBLIC_KEY=str(public)), self.assertRaisesRegex(ValueError, 'different SSH'):
+            access.user_management('add-user-key', Path('/synthetic/inventory'))
+        self.assertEqual([], self.events)
+
+    def test_recovery_target_overlap_fails_before_confirmation(self):
+        def overlap(*args):
+            return {'token': 'fresh', 'sudo': 'admin', 'groups': [],
+                    'keys': [{'fingerprint': engine.fingerprint(key(2))}]}
+        with patch.object(access, 'user_probe', side_effect=overlap), patch('builtins.input') as confirm, \
+                self.assertRaisesRegex(ValueError, 'overlap'):
+            access.user_management('remove-user', Path('/synthetic/inventory'))
+        confirm.assert_not_called()
+        self.assertNotIn('mutate', self.events)
+
+    def test_recovery_public_key_swap_during_proof_is_refused(self):
+        def swap(*args):
+            Path(str(self.recovery_key) + '.pub').write_text(key(5))
+        with patch.object(access, 'verify_human', side_effect=swap), patch('builtins.input') as confirm, \
+                self.assertRaisesRegex(ValueError, 'changed during access proof'):
+            access.user_management('remove-user', Path('/synthetic/inventory'))
+        confirm.assert_not_called()
+        self.assertNotIn('mutate', self.events)
+
     def test_read_only_command_never_mutates(self):
         access.user_management('list-users', Path('/synthetic/inventory'))
         self.assertEqual(['inspect'], self.events)
@@ -475,7 +598,8 @@ class WrapperTests(unittest.TestCase):
             if params.get('confirmed'):
                 self.events.append('mutate')
                 raise ValueError('incomplete')
-            return {'token': 'fresh', 'sudo': 'admin', 'groups': []}
+            return {'token': 'fresh', 'sudo': 'admin', 'groups': [],
+                'keys': [{'fingerprint': engine.fingerprint(key(2 if params.get('name') == 'recovery' else 3))}]}
         with patch.object(access, 'user_probe', side_effect=failure), patch('builtins.input', return_value='yes'):
             with self.assertRaises(ValueError):
                 access.user_management('remove-user', Path('/synthetic/inventory'))

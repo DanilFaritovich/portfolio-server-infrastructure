@@ -61,6 +61,8 @@
 
 - name: Inspect account ownership and privilege state before mutation
   portfolio_human_info:
+    controller: "{{ ansible_user }}"
+    public_key: "{{ bootstrap_user_public_key }}"
     name: "{{ human_access_user_name }}"
     groups: "{{ human_access_user_groups }}"
     sudo: "{{ human_access_user_sudo }}"

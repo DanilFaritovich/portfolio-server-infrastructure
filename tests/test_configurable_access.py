@@ -100,7 +100,7 @@ class ConfigurableAccessTests(unittest.TestCase):
 
     def test_add_user_imported_key_is_installed_but_remains_unverified(self):
         public_key = self.directory / 'import.pub'
-        content = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFfixture synthetic\n'
+        content = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA synthetic\n'
         public_key.write_text(content)
         probes = []
 
