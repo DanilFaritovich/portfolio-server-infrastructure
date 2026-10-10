@@ -162,6 +162,8 @@ password prompts и agent. Paramiko используется только для
 | `make load-user-key` | Загрузить выбранный существующий ключ в локальный agent | **LOCAL / только agent** |
 | `make show-public-key` | Показать public key и SHA256 fingerprint | **LOCAL / read-only** |
 | `make copy-public-key` | Скопировать public key; предложить установку отсутствующей clipboard-утилиты | **LOCAL / clipboard, опционально APT** |
+| `make show-server-trust` | Экспортировать доверенные OpenSSH host keys и SHA256 fingerprints | **LOCAL / read-only** |
+| `make trust-server` | Импортировать независимо проверенные host keys после подтверждения | **LOCAL / только пользовательский known_hosts** |
 | `make show-controller` | Показать доступ из inventory и SSH-команду | **LOCAL / read-only** |
 | `make connect-controller` | Интерактивный SSH под рабочим пользователем inventory | **LIVE / интерактивная сессия** |
 | `make connect-user` | Интерактивный SSH под указанным пользователем | **LIVE / интерактивная сессия** |
@@ -685,9 +687,9 @@ inventory, полный путь к ключу и готовую SSH-коман�
 
 Все три команды требуют существующую доверенную запись в `~/.ssh/known_hosts` для
 `host` либо `[host]:port`. Отсутствие trust блокирует локальную проверку; изменившийся
-host key вызывает отказ при подключении. Автоматического scan, принятия или замены trust нет. До осознанной настройки отсутствующей
-записи проверьте identity через provider console или уже доверенный административный
-маршрут. Trust file и каталог должны принадлежать вам, не быть writable для group/others
+host key вызывает отказ при подключении. Автоматического scan, принятия или замены
+trust нет. Для осознанной настройки отсутствующего trust используйте описанные ниже
+`show-server-trust` и `trust-server`. Trust file и каталог должны принадлежать вам, не быть writable для group/others
 и не быть symlinks. SSH использует strict host checking, выбранный identity и key-only
 authentication; password/keyboard-interactive fallback, agent forwarding, другие
 forwarding и connection sharing отключены. SSH client config не используется, чтобы
@@ -699,6 +701,68 @@ characters и OpenSSH expansion tokens запрещены. Разблокиро�
 ключ требует разблокированного agent в окружении вызывающего shell. Незашифрованные
 ключи продолжают работать без agent. `INVENTORY` и legacy `AUTOMATION_KEY`
 следуют правилам задачи 1; конфликт managed-key override блокирует команду.
+
+### Перенос доверия к серверу на второй компьютер
+
+SSH host keys определяют сервер и отличаются от пользовательских ключей входа.
+Обе команды работают локально, не требуют private keys или рабочего входа,
+не обращаются к VPS и не используют `ssh-keyscan`.
+
+1. На уже доверенном ПК экспортируйте существующий trust:
+
+   ```bash
+   make show-server-trust INVENTORY=inventories/production.yml
+   ```
+
+   Команда читает используемый проектом источник OpenSSH trust, `~/.ssh/known_hosts`,
+   через OpenSSH lookup, включая hashed-записи и нестандартные порты. Она показывает
+   host, port, каждый публичный host key и SHA256 fingerprint, затем одну JSON-строку
+   для переноса. Другие trust files из client config или системного SSH не используются.
+2. Передайте JSON-строку на ПК 2 через канал с проверенным отправителем. Проверьте
+   источник и сравните fingerprints с ПК 1. Экспорт не доказывает задним числом,
+   как trust появился на ПК 1: исходный компьютер уже должен быть доверенным.
+3. На ПК 2 подготовьте локальный ignored inventory с точно таким же hostname/IP
+   сервера и текущим портом, затем выполните импорт:
+
+   ```bash
+   make trust-server INVENTORY=inventories/laptop2.yml
+   ```
+
+   Вставьте JSON-строку в `Host trust data:`. CLI проверит public keys через OpenSSH,
+   пересчитает fingerprints и сравнит host/port с inventory. Проверьте показанные
+   данные и введите `yes` только после независимой проверки источника.
+   Enter, N, EOF или прерывание отменяют импорт. В non-interactive режиме команда
+   завершается без чтения ввода и записи trust.
+4. Когда выбранный локальный ключ входа доступен, а его public key зарегистрирован
+   на VPS, используйте существующие команды:
+
+   ```bash
+   make show-controller INVENTORY=inventories/laptop2.yml  # локальная проверка
+   make connect-controller INVENTORY=inventories/laptop2.yml  # LIVE SSH
+   make verify-access INVENTORY=inventories/laptop2.yml  # LIVE проверка SSH/sudo
+   ```
+
+Импорт сохраняет посторонние записи и комментарии, распознаёт конфликты и повторные
+ключи (включая hashed-записи) и атомарно заменяет пользовательский trust file только
+при добавлении ключей. Новый каталог `.ssh` получает 0700, записанный `known_hosts` —
+0600. Закрытый локальный lock сериализует импорты; обнаруженное изменение файла после
+проверки блокирует запись. Не редактируйте файл одновременно другими SSH tools.
+Небезопасный владелец/права, symlinks/hardlinks, revoked keys и certificate-authority
+записи блокируют импорт. Конфликт требует диагностики identity/rotation администратором:
+команда не заменяет конфликтующие ключи. Strict checking сохраняется для интерактивного
+SSH и существующего Ansible. Сам импорт trust не даёт права входа или sudo.
+
+Если доверенного ПК нет, получите public SSH host key и его SHA256 fingerprint
+у администратора или через аутентифицированную консоль VPS-провайдера. Попросите
+данные в том же формате, с заполненными проверенными значениями:
+
+```json
+{"version":1,"host":"SERVER_HOST_FROM_INVENTORY","port":2244,"keys":[{"public_key":"ssh-ed25519 VERIFIED_PUBLIC_HOST_KEY","fingerprint":"SHA256:VERIFIED_FINGERPRINT"}]}
+```
+
+Одного fingerprint недостаточно для записи public key. Совпадение fingerprint,
+полученного вместе с непроверенным сетевым ключом, не доказывает identity сервера.
+Не повторяйте password bootstrap на защищённом сервере ради отсутствующего локального trust.
 
 ### Загрузка в agent и новый компьютер с одним зашифрованным ключом
 
@@ -789,7 +853,8 @@ make add-user HUMAN_USER=portfolio_laptop2 HUMAN_SUDO=admin \
 host, текущий порт, Python interpreter и hardening port lists; укажите `bootstrap_login_user`
 вместе с `ansible_user: portfolio_laptop2` и
 `ansible_private_key_file: ~/.ssh/portfolio-infra/portfolio_laptop2_ed25519`.
-Заранее установите независимо проверенные host keys в локальном `known_hosts`.
+Используйте `make show-server-trust` на ПК 1 и `make trust-server
+INVENTORY=inventories/laptop2.yml` на ПК 2 по сценарию выше.
 На защищённом сервере не повторяйте bootstrap и не используйте auto-trust.
 После LIVE-разрешения все следующие команды используют один ключ:
 

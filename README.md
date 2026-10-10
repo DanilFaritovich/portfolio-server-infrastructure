@@ -164,6 +164,8 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make load-user-key` | Load the selected existing key into the local SSH agent | **LOCAL / agent only** |
 | `make show-public-key` | Display public key and SHA256 fingerprint | **LOCAL / read-only** |
 | `make copy-public-key` | Copy the complete public key; offer missing clipboard package installation | **LOCAL / clipboard, optional APT install** |
+| `make show-server-trust` | Export existing OpenSSH server host trust and SHA256 fingerprints | **LOCAL / read-only** |
+| `make trust-server` | Import independently verified host keys after explicit confirmation | **LOCAL / user known_hosts only** |
 | `make show-controller` | Display inventory access and SSH command | **LOCAL / read-only** |
 | `make connect-controller` | Interactive SSH as the inventory managed user | **LIVE / interactive session** |
 | `make connect-user` | Interactive SSH as the selected human user | **LIVE / interactive session** |
@@ -683,8 +685,8 @@ playbooks. What you run inside that shell can change the VPS.
 
 All three commands require an existing trusted entry in `~/.ssh/known_hosts` for
 `host` or `[host]:port`. Missing trust blocks local preflight; a changed host key
-fails during connection. These commands never scan, accept or replace trust. Verify server identity through the provider console or an
-already trusted administrative route before deliberately configuring missing trust.
+fails during connection. These commands never scan, accept or replace trust. Use
+`show-server-trust` and `trust-server` below to configure missing trust deliberately.
 The trust file/directory must be owned by you, not writable by group/others and not
 symlinks. SSH uses strict host checking, the selected identity and key-only authentication;
 password/keyboard-interactive fallback, agent forwarding, other forwarding and connection
@@ -697,6 +699,68 @@ inspectors. All select the explicit key with `IdentitiesOnly=yes`; an encrypted 
 requires the same invoking shell to have access to its unlocked agent. Unencrypted
 keys continue working without an agent. `INVENTORY` and legacy `AUTOMATION_KEY` follow
 the task 1 rules; conflicting managed-key overrides fail.
+
+### Transfer server trust to a second computer
+
+Server host keys identify the VPS; they are separate from your user login keys.
+These two commands are entirely local, require no private keys or working login,
+and never contact the VPS or use `ssh-keyscan`.
+
+1. On the already trusted PC, export the server's existing trust:
+
+   ```bash
+   make show-server-trust INVENTORY=inventories/production.yml
+   ```
+
+   The command reads the project's OpenSSH trust source, `~/.ssh/known_hosts`,
+   using OpenSSH lookup, including hashed entries and nonstandard ports. It prints
+   host, port, each public host key and SHA256 fingerprint, then one JSON transfer
+   line. It does not consult alternative client-config or system trust files.
+2. Transfer that JSON line through an authenticated channel to PC 2. Verify its
+   source and compare fingerprints with PC 1. Export cannot retrospectively prove
+   how PC 1 originally established trust; the source computer must already be trusted.
+3. On PC 2, prepare its local ignored inventory with exactly the same server
+   hostname/IP and current port, then import:
+
+   ```bash
+   make trust-server INVENTORY=inventories/laptop2.yml
+   ```
+
+   Paste the JSON line at `Host trust data:`. The CLI validates public keys with
+   OpenSSH, recalculates fingerprints and checks host/port against the inventory.
+   Review the displayed details; enter `yes` only after independently verifying
+   the source. Enter, N, EOF or interruption cancels. Non-interactive import fails
+   without reading input or writing trust.
+4. Once the selected local login key is available and its public key is registered
+   on the VPS, use the existing commands:
+
+   ```bash
+   make show-controller INVENTORY=inventories/laptop2.yml  # local preflight
+   make connect-controller INVENTORY=inventories/laptop2.yml  # LIVE SSH
+   make verify-access INVENTORY=inventories/laptop2.yml  # LIVE SSH/sudo verification
+   ```
+
+Import preserves unrelated entries and comments, detects existing-key conflicts and
+repeated keys (including hashed entries), and atomically replaces the user trust file
+only when additions are needed. New `.ssh` directories use 0700; written `known_hosts`
+uses 0600. A private local lock serializes imports; changes detected since review stop
+the write. Avoid simultaneous edits by other SSH tools. Unsafe ownership, writable
+paths, symlinks/hardlinks, revoked keys and certificate-authority entries block import.
+Conflicting trust requires administrator-led identity/rotation diagnosis; this command
+does not replace conflicting keys. Strict checking remains enabled for interactive
+SSH and existing Ansible workflows. Trust import alone does not grant login or sudo.
+
+Without an already trusted PC, obtain the public SSH host key and its SHA256
+fingerprint from your administrator or an authenticated VPS provider console. Ask
+for the same transfer format, populated with verified values:
+
+```json
+{"version":1,"host":"SERVER_HOST_FROM_INVENTORY","port":2244,"keys":[{"public_key":"ssh-ed25519 VERIFIED_PUBLIC_HOST_KEY","fingerprint":"SHA256:VERIFIED_FINGERPRINT"}]}
+```
+
+A fingerprint alone does not provide the public key, and matching a fingerprint
+supplied alongside an untrusted network key does not authenticate the server.
+Do not rerun password bootstrap on a secured server to bypass missing local trust.
 
 ### Agent loading and a new computer with one encrypted key
 
@@ -788,7 +852,8 @@ On PC 2, edit only its ignored candidate inventory: preserve the verified host,
 current port, Python interpreter and hardening port lists; set `bootstrap_login_user`
 alongside `ansible_user: portfolio_laptop2` and
 `ansible_private_key_file: ~/.ssh/portfolio-infra/portfolio_laptop2_ed25519`.
-Record independently verified host keys in local `known_hosts`; do not rerun bootstrap
+Use `make show-server-trust` on PC 1 and `make trust-server
+INVENTORY=inventories/laptop2.yml` on PC 2 as described above; do not rerun bootstrap
 or auto-accept trust on a secured server. The same key is used below, after LIVE approval:
 
 ```bash

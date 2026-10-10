@@ -216,7 +216,8 @@ def known_host(host, port, allow_trust=False):
 
     if trusted():
         return
-    require(allow_trust, 'Host is not trusted. Run make bootstrap-user for interactive first-use trust.')
+    require(allow_trust, 'Host is not trusted. Use make show-server-trust on a trusted computer, '
+            'then make trust-server here with the same inventory.')
     require(sys.stdin.isatty(), 'First-use trust requires an interactive terminal.')
     scan = subprocess.run(['ssh-keyscan', '-T', '15', '-p', str(port), '-t', 'ed25519,ecdsa,rsa', host],
                           capture_output=True, text=True, timeout=60)
@@ -268,6 +269,185 @@ def known_host(host, port, allow_trust=False):
             target.write(entry.encode('ascii'))
             target.flush()
     print('Host key saved to ~/.ssh/known_hosts. Strict host-key checking remains enabled.', flush=True)
+
+
+TRUST_GUIDANCE = ('Use make show-server-trust on an already trusted computer with the same inventory. '
+                  'Without that source, ask your administrator or use the authenticated VPS provider console '
+                  'to obtain the public SSH host key and its verified SHA256 fingerprint. '
+                  'A network scan alone cannot establish trust.')
+
+
+def trust_file_signature(info):
+    # Reads may update atime; inode, metadata and content changes invalidate review.
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def trust_snapshot(path):
+    """Read only the public trust file; reject unsafe paths before inspection."""
+    validate_cli_path(path)
+    require(not path.is_symlink(), 'Known-host trust paths must not use symlinks.')
+    for parent in path.parents:
+        require(not parent.is_symlink(), 'Known-host trust paths must not use symlinks.')
+    if path.parent.exists():
+        info = path.parent.stat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and info.st_mode & 0o022 == 0,
+                'Known-host directory must be owned by you and not writable by group or others.')
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(descriptor, 'rb') as source:
+        info = os.fstat(source.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                info.st_mode & 0o022 == 0 and info.st_nlink == 1 and info.st_size <= 4 * 1024 * 1024,
+                'Known-host file must be a small regular file owned by you, without hardlinks or unsafe permissions.')
+        content = source.read(4 * 1024 * 1024 + 1)
+        require(trust_file_signature(os.fstat(source.fileno())) == trust_file_signature(info) and len(content) == info.st_size,
+                'Known-host file changed during inspection; no trust was saved.')
+    return trust_file_signature(info), content
+
+
+def host_key_fingerprint(public):
+    validate_public_key_text(public)
+    require(len(public.split()) == 2 and public == ' '.join(public.split()),
+            'Host key must contain only the public algorithm and key separated by one space.')
+    result = subprocess.run(['ssh-keygen', '-l', '-E', 'sha256', '-f', '-'],
+                            input=public + '\n', capture_output=True, text=True, check=False, timeout=10)
+    fields = result.stdout.split()
+    require(result.returncode == 0 and len(fields) >= 2 and
+            re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', fields[1]), 'Invalid public SSH host key or SHA256 fingerprint.')
+    return fields[1]
+
+
+def trusted_host_keys(snapshot, host, port):
+    if snapshot is None:
+        return {}
+    name = host if port == 22 else f'[{host}]:{port}'
+    # Inspect a stable public snapshot with OpenSSH's own hashed/wildcard lookup.
+    with tempfile.TemporaryDirectory(prefix='portfolio-host-trust-') as directory:
+        source = Path(directory) / 'known_hosts'
+        source.write_bytes(snapshot[1])
+        source.chmod(0o600)
+        result = subprocess.run(['ssh-keygen', '-F', name, '-f', str(source)],
+                                capture_output=True, text=True, check=False, timeout=10)
+    require(result.returncode in (0, 1), 'Cannot inspect existing OpenSSH host trust.')
+    keys = {}
+    for line in result.stdout.splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        fields = line.split()
+        require(len(fields) >= 3 and not fields[0].startswith('@'),
+                'Marked/revoked/certificate host trust is unsupported; resolve it with your administrator.')
+        public = ' '.join(fields[1:3])
+        fingerprint = host_key_fingerprint(public)
+        kind = fields[1]
+        require(kind not in keys or keys[kind]['public_key'] == public,
+                'Conflicting existing SSH host keys; no trust was saved.')
+        keys[kind] = {'public_key': public, 'fingerprint': fingerprint}
+    require(result.returncode != 0 or keys, 'No usable SSH host keys in the OpenSSH trust lookup.')
+    return keys
+
+
+def parse_server_trust(text, host, port):
+    require(len(text) <= 65536, 'Host trust data is too large.')
+    try:
+        data = json.loads(text)
+        require(isinstance(data, dict) and set(data) == {'version', 'host', 'port', 'keys'} and
+                type(data['version']) is int and data['version'] == 1 and
+                data['host'] == host and type(data['port']) is int and data['port'] == port,
+                'Host trust hostname/IP or port does not match inventory, or the transfer format is invalid.')
+        require(isinstance(data['keys'], list) and 1 <= len(data['keys']) <= 16, 'Expected a non-empty host key list.')
+        keys = {}
+        for key in data['keys']:
+            require(isinstance(key, dict) and set(key) == {'public_key', 'fingerprint'} and
+                    isinstance(key['public_key'], str) and isinstance(key['fingerprint'], str),
+                    'Invalid host key transfer entry.')
+            fingerprint = host_key_fingerprint(key['public_key'])
+            require(fingerprint == key['fingerprint'], 'SSH host key SHA256 fingerprint mismatch; no trust was saved.')
+            kind = key['public_key'].split()[0]
+            require(kind not in keys, 'Duplicate host key algorithm in transfer data.')
+            keys[kind] = key
+        return keys
+    except (json.JSONDecodeError, TypeError, KeyError):
+        raise ValueError('Invalid host trust transfer data; paste the single JSON line from make show-server-trust.') from None
+
+
+def check_trust_conflicts(existing, imported):
+    require(all(kind in imported and entry == imported[kind] for kind, entry in existing.items()),
+            'Existing SSH host trust conflicts with the imported keys; no entries were replaced. '
+            'Resolve host identity/rotation with your administrator.')
+
+
+def save_server_trust(path, snapshot, host, port, existing, imported):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    require(trust_snapshot(path) == snapshot, 'Known-host trust changed since review; no trust was saved.')
+    lock_path = path.parent / '.portfolio-known-hosts.lock'
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(descriptor, 'r+b') as lock:
+        info = os.fstat(lock.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                info.st_mode & 0o077 == 0 and info.st_nlink == 1, 'Unsafe known-host trust lock.')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        require(trust_snapshot(path) == snapshot, 'Known-host trust changed since review; no trust was saved.')
+        name = host if port == 22 else f'[{host}]:{port}'
+        additions = [f'{name} {entry["public_key"]}\n' for kind, entry in imported.items() if kind not in existing]
+        if not additions:
+            return False
+        content = snapshot[1] if snapshot else b''
+        if content and not content.endswith(b'\n'):
+            content += b'\n'
+        content += ''.join(additions).encode('ascii')
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.known_hosts-', delete=False) as target:
+                temporary = Path(target.name)
+                os.fchmod(target.fileno(), 0o600)
+                target.write(content)
+                target.flush()
+                os.fsync(target.fileno())
+            require(trust_snapshot(path) == snapshot, 'Known-host trust changed during write; no trust was saved.')
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    return True
+
+
+def server_trust(mode, inventory):
+    require(shutil.which('ssh-keygen'), 'Missing OpenSSH ssh-keygen. Install the OpenSSH client tools.')
+    _, host, port, _, _ = load_host(inventory, validate_hardening=False)
+    path = Path.home() / '.ssh/known_hosts'
+    if mode == 'trust-server':
+        require(sys.stdin.isatty(), 'Host trust import requires an interactive terminal. ' + TRUST_GUIDANCE)
+    snapshot = trust_snapshot(path)
+    existing = trusted_host_keys(snapshot, host, port)
+    if mode == 'show-server-trust':
+        require(existing, 'No existing trusted SSH host key for this inventory. ' + TRUST_GUIDANCE)
+        keys = existing
+    else:
+        print('Paste trusted host data from make show-server-trust (one JSON line).\n' + TRUST_GUIDANCE)
+        try:
+            text = input('Host trust data: ')
+        except (EOFError, KeyboardInterrupt):
+            raise ValueError('Host trust import cancelled; no trust was saved.') from None
+        keys = parse_server_trust(text, host, port)
+        check_trust_conflicts(existing, keys)
+    print(f'Server: {host}\nSSH port: {port}')
+    for entry in keys.values():
+        print('Public host key: ' + entry['public_key'] + '\nSHA256 fingerprint: ' + entry['fingerprint'])
+    if mode == 'show-server-trust':
+        print('Transfer data (paste this single JSON line on the new computer):')
+        print(json.dumps({'version': 1, 'host': host, 'port': port, 'keys': list(keys.values())}, separators=(',', ':')))
+    else:
+        try:
+            answer = input('Confirm these keys came from an independently verified source. Trust this server? [y/N]: ')
+        except (EOFError, KeyboardInterrupt):
+            raise ValueError('Host trust import cancelled; no trust was saved.') from None
+        require(answer.strip().lower() in ('y', 'yes'), 'Host trust declined; no trust was saved.')
+        changed = save_server_trust(path, snapshot, host, port, existing, keys)
+        print('Host trust saved to ~/.ssh/known_hosts.' if changed else 'Host trust already present; known_hosts unchanged.')
+        print('Strict host-key checking remains enabled.')
 
 
 def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=False, check=False, diff=False):
@@ -722,7 +902,8 @@ def interactive_ssh_command(host, port, user, key):
     validate_cli_path(trusted)
     require(not any(path.is_symlink() for path in [trusted, *trusted.parents]),
             'Known-host trust paths must not use symlinks.')
-    require(trusted.is_file(), 'Existing known_hosts trust is required; verify the server identity before connecting.')
+    require(trusted.is_file(), 'Existing known_hosts trust is required. '
+            'Run make show-server-trust on a trusted computer, then make trust-server here with the same inventory.')
     for path in (trusted.parent, trusted):
         info = path.stat()
         require(info.st_uid == os.getuid() and info.st_mode & 0o022 == 0 and
@@ -1122,7 +1303,7 @@ def operations(mode, inventory, key=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
+    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'show-server-trust', 'trust-server', 'generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=None, help='Legacy key override; explicit inventories own the key path.')
     args = parser.parse_args()
@@ -1131,6 +1312,8 @@ def main():
     try:
         if args.mode == 'setup':
             setup_inventory(inventory)
+        elif args.mode in ('show-server-trust', 'trust-server'):
+            server_trust(args.mode, inventory)
         elif args.mode in ('generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key'):
             local_key(args.mode)
         elif args.mode in ('show-controller', 'connect-controller', 'connect-user'):
@@ -1147,6 +1330,11 @@ def main():
         print(f'Error: {error}', file=sys.stderr)
         return 1
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        if args.mode in ('show-server-trust', 'trust-server'):
+            print('Local host-trust operation failed; no success was confirmed. '
+                  'Check local OpenSSH tools and known_hosts permissions; inspect trust before retrying. '
+                  + TRUST_GUIDANCE, file=sys.stderr)
+            return 1
         print('A local prerequisite, SSH or Ansible stage failed; stopping. '
               'For an encrypted key, run make load-user-key in the same shell with the selected key. '
               'Keep recovery access.', file=sys.stderr)

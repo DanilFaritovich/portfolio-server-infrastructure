@@ -11,6 +11,7 @@ export ANSIBLE_HOME := $(CURDIR)/.ansible
 export PATH := $(abspath $(VENV))/bin:$(PATH)
 
 .PHONY: list-users show-user list-user-keys add-user-key revoke-user-key remove-user generate-user-key load-user-key show-public-key copy-public-key show-controller connect-controller connect-user deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
+.PHONY: show-server-trust trust-server
 
 # Human account inputs are supplied by the caller; USER is intentionally untouched.
 export AGENT_LOAD KEY_FINGERPRINT RECOVERY_USER RECOVERY_KEY KEY_NAME HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
@@ -29,6 +30,10 @@ generate-user-key load-user-key show-public-key copy-public-key:
 	@$(VENV)/bin/python scripts/access.py $@
 
 # LOCAL only: resolve inventory and validate local key/trust, without host contact.
+show-server-trust trust-server:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY"
+
 show-controller:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
