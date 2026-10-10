@@ -23,6 +23,9 @@ class PublicKeyTransferTests(unittest.TestCase):
         self.content = PUBLIC + ' laptop-2\n'
         self.public.write_text(self.content)
         self.public.chmod(0o600)
+        (self.home / 'controller.pub').write_text(
+            'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB controller\n')
+        (self.home / 'controller.pub').chmod(0o600)
         self.env = {'HUMAN_USER': 'person', 'HUMAN_SUDO': 'admin'}
         self.calls = []
         for mock in (patch.dict(os.environ, self.env, clear=True),

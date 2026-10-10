@@ -39,7 +39,12 @@ class HumanWrapperTests(unittest.TestCase):
                        'firewall_allowed_tcp_ports': [80, 443]}
         self.env = {'HUMAN_USER': 'operator', 'HUMAN_SUDO': 'admin', 'HUMAN_KEY': str(self.key)}
         self.events = []
-        self.public_key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFfixture synthetic\n'
+        self.public_key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA human\n'
+        self.controller_public = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB controller\n'
+        Path(str(self.key) + '.pub').write_text(self.public_key)
+        Path(str(self.automation) + '.pub').write_text(self.controller_public)
+        for public in (Path(str(self.key) + '.pub'), Path(str(self.automation) + '.pub')):
+            public.chmod(0o600)
         for name, options in (
             ('prerequisites', {}), ('check_key', {}), ('known_host', {}),
             ('managed_access', {'return_value': ('ansible', self.automation)}),
@@ -169,6 +174,67 @@ class HumanWrapperTests(unittest.TestCase):
                                        'user_probe:show-user', 'user_probe:add-user-key'])
         self.prepare_key.assert_not_called()
         self.verify_human.assert_not_called()
+        self.assertFalse(self.key.exists())
+
+    def assert_no_live_calls(self):
+        self.assertEqual(self.events, [])
+        for boundary in (self.known_host, self.verify_hardening, self.verify_human,
+                         self.run_playbook, self.user_probe, self.verify_auth_methods):
+            boundary.assert_not_called()
+
+    def test_copied_identity_with_different_comments_blocks_all_human_stages(self):
+        public = Path(str(self.key) + '.pub')
+        copied = ' '.join(self.controller_public.split()[:2]) + ' another-pc\n'
+        public.write_text(copied)
+        for mode in ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'):
+            for imported in (False, True):
+                with self.subTest(mode=mode, imported=imported), \
+                        patch.dict(os.environ, {'HUMAN_PUBLIC_KEY': str(public)} if imported else {}), \
+                        patch('builtins.input', return_value=copied.strip()):
+                    with self.assertRaisesRegex(ValueError, 'SSH key identities'):
+                        access.human_access(mode, self.inventory, self.automation)
+                self.assert_no_live_calls()
+
+    def test_import_cannot_hide_controller_identity_in_selected_human_pair(self):
+        imported = self.directory / 'import.pub'
+        imported.write_text(self.public_key)
+        Path(str(self.key) + '.pub').write_text(self.controller_public)
+        for mode in ('verify-user', 'secure-ssh'):
+            with self.subTest(mode=mode), patch.dict(os.environ, HUMAN_PUBLIC_KEY=str(imported)), \
+                    self.assertRaisesRegex(ValueError, 'must correspond'):
+                access.human_access(mode, self.inventory, self.automation)
+            self.assert_no_live_calls()
+
+    def test_invalid_or_missing_public_material_blocks_before_live_calls(self):
+        original = load('identity_validation_access', 'scripts/access.py')
+        for selected in (self.key, self.automation):
+            public = Path(str(selected) + '.pub')
+            saved = public.read_text()
+            for invalid in (None, 'invalid', 'ssh-ed25519 AAAA invalid-blob',
+                            'from="host" ' + self.public_key, self.public_key * 2):
+                with self.subTest(selected=selected.name, invalid=invalid):
+                    if invalid is None:
+                        public.unlink()
+                    else:
+                        public.write_text(invalid)
+                    for mode in ('add-user', 'verify-user', 'secure-ssh'):
+                        with patch.object(access, 'public_key_file', original.public_key_file), \
+                                patch.dict(os.environ, HUMAN_PUBLIC_KEY=str(self.key) + '.pub'), \
+                                self.assertRaises((ValueError, OSError)):
+                            access.human_access(mode, self.inventory, self.automation)
+                        self.assert_no_live_calls()
+                    public.write_text(saved)
+                    public.chmod(0o600)
+
+    def test_public_identity_validates_without_reading_private_material(self):
+        original = load('public_identity_access', 'scripts/access.py')
+        public = Path(str(self.key) + '.pub')
+        controller = Path(str(self.automation) + '.pub')
+        self.assertNotEqual(original.public_key_identity(public), original.public_key_identity(controller))
+        public.write_text(' '.join(self.controller_public.split()[:2]) + ' changed-comment\n')
+        self.assertEqual(original.public_key_identity(public), original.public_key_identity(controller))
+        self.assertFalse(self.key.exists())
+        self.assertFalse(self.automation.exists())
 
     def test_access_failure_blocks_any_ssh_mutation(self):
         self.verify_human.side_effect = subprocess.CalledProcessError(1, ['fixture'])

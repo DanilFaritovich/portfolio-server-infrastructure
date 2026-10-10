@@ -24,6 +24,8 @@ class ConfigurableAccessTests(unittest.TestCase):
         self.key = self.directory / 'operator_ed25519'
         self.key.touch(mode=0o600)
         Path(str(self.key) + '.pub').touch(mode=0o600)
+        Path(str(self.key) + '.pub').write_text(
+            'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB controller\n')
         self.host = {'ansible_host': 'fixture.example.test', 'ansible_port': 2222,
                      'bootstrap_login_user': 'root', 'ansible_user': 'automation',
                      'ansible_private_key_file': str(self.key)}
@@ -78,9 +80,12 @@ class ConfigurableAccessTests(unittest.TestCase):
                     self.assertFalse(call.kwargs.get('ask_pass', False))
 
     def test_stage_4_checks_selected_automation_and_admin_runtime_policy(self):
+        (self.directory / 'person.pub').write_text(
+            'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA person\n')
         env = {'HUMAN_USER': 'person', 'HUMAN_SUDO': 'admin', 'HUMAN_KEY': str(self.directory / 'person')}
         with patch.dict(access.os.environ, env, clear=True), patch.object(access, 'check_key'), \
-                patch.object(access, 'public_key_file'), patch.object(access, 'run_playbook') as run, \
+                patch.object(access, 'public_key_file', side_effect=lambda value: Path(value)), \
+                patch.object(access, 'run_playbook') as run, \
                 patch.object(access, 'verify_auth_methods') as auth:
             access.human_access('verify-ssh-security', self.inventory)
         for call in run.call_args_list:

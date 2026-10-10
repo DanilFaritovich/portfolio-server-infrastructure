@@ -387,7 +387,7 @@ class WrapperTests(unittest.TestCase):
             with patch.dict(os.environ, HUMAN_PUBLIC_KEY=str(public), HUMAN_SUDO='admin'), \
                     patch('builtins.input', return_value='yes'), \
                     patch.object(access, 'public_fingerprint', return_value='SHA256:synthetic'), \
-                    patch.object(access, 'public_key_file', return_value=public), \
+                    patch.object(access, 'public_key_file', side_effect=lambda value: Path(value)), \
                     patch.object(access, 'verify_hardening'), \
                     patch.object(access, 'user_probe', return_value={'existing': True, 'token': 'fresh'}) as probe, \
                     patch.object(access, 'run_playbook') as playbook:
@@ -408,11 +408,32 @@ class WrapperTests(unittest.TestCase):
 
     def test_copied_controller_identity_cannot_be_used_as_recovery(self):
         Path(str(self.recovery_key) + '.pub').write_text(key(1) + ' different-comment')
-        with patch('builtins.input') as confirmation, self.assertRaisesRegex(ValueError, 'different SSH key identities'):
-            access.user_management('remove-user', Path('/synthetic/inventory'))
-        confirmation.assert_not_called()
-        self.assertNotIn('recovery-proof', self.events)
-        self.assertNotIn('mutate', self.events)
+        for mode in ('remove-user', 'revoke-user-key'):
+            with self.subTest(mode=mode), patch.dict(os.environ, KEY_FINGERPRINT='SHA256:' + 'A' * 43), \
+                    patch('builtins.input') as confirmation, \
+                    self.assertRaisesRegex(ValueError, 'different SSH key identities'):
+                access.user_management(mode, Path('/synthetic/inventory'))
+            confirmation.assert_not_called()
+            self.assertEqual([], self.events)
+
+    def test_invalid_recovery_or_controller_public_key_blocks_all_live_probes(self):
+        for selected in (self.recovery_key, self.controller_key):
+            public = Path(str(selected) + '.pub')
+            saved = public.read_text()
+            for invalid in (None, 'invalid', 'ssh-ed25519 AAAA invalid-blob'):
+                with self.subTest(selected=selected.name, invalid=invalid):
+                    if invalid is None:
+                        public.unlink()
+                    else:
+                        public.write_text(invalid)
+                    for mode in ('remove-user', 'revoke-user-key'):
+                        with patch.dict(os.environ, KEY_FINGERPRINT='SHA256:' + 'A' * 43), \
+                                patch('builtins.input') as confirmation, self.assertRaises((ValueError, OSError)):
+                            access.user_management(mode, Path('/synthetic/inventory'))
+                        confirmation.assert_not_called()
+                        self.assertEqual([], self.events)
+                    public.write_text(saved)
+                    public.chmod(0o600)
 
     def test_recovery_ssh_or_sudo_failure_never_confirms_or_mutates(self):
         for error in (ValueError('SSH failed'), subprocess.CalledProcessError(1, 'sudo')):

@@ -845,6 +845,15 @@ def read_public_key(path):
         raise ValueError('Public key must be UTF-8 plain text.') from None
 
 
+def public_key_identity(public):
+    """Validate public material only; comments and file paths do not identify a key."""
+    return tuple(read_public_key(public_key_file(public)).split()[:2])
+
+
+def require_independent_key(public, controller_key, message):
+    require(public_key_identity(public) != public_key_identity(str(controller_key) + '.pub'), message)
+
+
 def public_fingerprint(public):
     result = subprocess.run(['ssh-keygen', '-l', '-E', 'sha256', '-f', str(public)],
                             capture_output=True, text=True, check=True)
@@ -1176,6 +1185,7 @@ def human_access(mode, inventory, automation_key=None):
     key = human_key_path(os.environ.get('HUMAN_KEY'), human['human_access_user_name'])
     require(key.resolve() != managed_key.resolve(), 'Use separate human and automation SSH keys.')
     with add_user_public_key() as public:
+        require_independent_key(public, managed_key, 'Use separate human and automation SSH key identities.')
         print(f"User: {human['human_access_user_name']}\nHUMAN_SUDO: {human['human_access_user_sudo']}\n"
               f'SHA256 fingerprint: {public_fingerprint(public)}')
         if human['human_access_user_approved_groups']:
@@ -1198,6 +1208,11 @@ def human_access_stage(mode, inventory, automation_key=None, supplied_public=Non
     require(key.resolve() != automation_key.resolve(), 'Use separate human and automation SSH keys.')
     imported = supplied_public or os.environ.get('HUMAN_PUBLIC_KEY', '')
     public = public_key_file(imported) if imported else Path(str(key) + '.pub')
+    require_independent_key(public, automation_key, 'Use separate human and automation SSH key identities.')
+    if imported and mode != 'add-user':
+        check_key(key)
+        require(public_key_identity(public) == public_key_identity(str(key) + '.pub'),
+                'HUMAN_KEY must correspond to HUMAN_PUBLIC_KEY for independent verification.')
     prerequisites(mode)
     check_key(automation_key)
     alias, host, port, _, _ = load_host(inventory)
@@ -1211,11 +1226,6 @@ def human_access_stage(mode, inventory, automation_key=None, supplied_public=Non
                             ' -o PreferredAuthentications=publickey -o PasswordAuthentication=no'
                             ' -o KbdInteractiveAuthentication=no',
     }
-    if imported and mode != 'add-user':
-        check_key(key)
-        pair_public = public_key_file(str(key) + '.pub')
-        require(public.read_text().split()[:2] == pair_public.read_text().split()[:2],
-                'HUMAN_KEY must correspond to HUMAN_PUBLIC_KEY for independent verification.')
     # No cached receipt: re-prove automation access and completed Stage 3 on every selected route.
     verify_hardening(inventory, alias, host, port, managed, inputs)
     if mode == 'add-user':
@@ -1304,6 +1314,15 @@ def user_management(mode, inventory, override=None):
         digest = os.environ.get('KEY_FINGERPRINT', '')
         require(re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', digest), 'Set KEY_FINGERPRINT to an exact SHA256 fingerprint.')
         params['fingerprint'] = digest
+    if mode in ('revoke-user-key', 'remove-user'):
+        recovery = os.environ.get('RECOVERY_USER', '')
+        require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', recovery or '') and recovery not in ('root', controller, name),
+                'Set RECOVERY_USER to another managed human admin whose access will be retained.')
+        recovery_key = human_key_path(os.environ.get('RECOVERY_KEY'), recovery)
+        require(recovery_key != key, 'Use a separate recovery administrator key.')
+        check_key(recovery_key)
+        require_independent_key(str(recovery_key) + '.pub', key,
+                                'Recovery and controller must use different SSH key identities.')
     prerequisites(mode)
     check_key(key)
     alias, host, port, _, interpreter = load_host(inventory)
@@ -1325,15 +1344,6 @@ def user_management(mode, inventory, override=None):
         return
     params['token'] = before['token']
     if mode in ('revoke-user-key', 'remove-user'):
-        recovery = os.environ.get('RECOVERY_USER', '')
-        require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', recovery or '') and recovery not in ('root', controller, name),
-                'Set RECOVERY_USER to another managed human admin whose access will be retained.')
-        recovery_key = human_key_path(os.environ.get('RECOVERY_KEY'), recovery)
-        require(recovery_key != key, 'Use a separate recovery administrator key.')
-        check_key(recovery_key)
-        recovery_public = public_key_file(str(recovery_key) + '.pub').read_text().split()[:2]
-        controller_public = public_key_file(str(key) + '.pub').read_text().split()[:2]
-        require(recovery_public != controller_public, 'Recovery and controller must use different SSH key identities.')
         retained = probe({'action': 'show-user', 'name': recovery})
         require(retained.get('sudo') == 'admin', 'Recovery account must be a managed administrator.')
         managed = {'ansible_user': controller, 'ansible_connection': 'ssh',
