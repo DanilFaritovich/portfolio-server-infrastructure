@@ -159,7 +159,7 @@ class ServerTrustTests(unittest.TestCase):
 
     def test_invalid_transfer_mismatch_and_private_material_are_rejected(self):
         cases = ['not JSON', 'PRIVATE KEY', '{}']
-        for change in ({'host': 'different.example.test'}, {'port': 22}, {'port': True}, {'version': 2},
+        for change in ({'host': 'different.example.test'}, {'port': 0}, {'port': 65536}, {'port': True}, {'version': 2},
                        {'keys': []}, {'keys': [self.data['keys'][0]] * 2},
                        {'keys': [{'public_key': PUBLIC, 'fingerprint': 'SHA256:wrong'}]},
                        {'keys': [{'public_key': 'ssh-ed25519 AAAA', 'fingerprint': self.fingerprint}]},

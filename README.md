@@ -168,7 +168,7 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make copy-public-key` | Copy the complete public key; offer missing clipboard package installation | **LOCAL / clipboard, optional APT install** |
 | `make copy-server-trust` | Copy verified server trust JSON; offer missing clipboard package installation | **LOCAL / clipboard, optional APT install** |
 | `make show-server-trust` | Export existing OpenSSH server host trust and SHA256 fingerprints | **LOCAL / read-only** |
-| `make trust-server` | Import independently verified host keys after explicit confirmation | **LOCAL / user known_hosts only** |
+| `make trust-server` | Import verified host keys; optionally prove trust on a different inventory port | **LOCAL / known_hosts; optional LIVE host-only handshake** |
 | `make show-controller` | Display inventory access and SSH command | **LOCAL / read-only** |
 | `make connect-controller` | Interactive managed SSH; offer verified trust for a new port | **LIVE / interactive session** |
 | `make connect-user` | Interactive SSH as the selected human user | **LIVE / interactive session** |
@@ -707,8 +707,9 @@ the task 1 rules; conflicting managed-key overrides fail.
 ### Transfer server trust to a second computer
 
 Server host keys identify the VPS; they are separate from your user login keys.
-These three trust transfer commands are entirely local, require no private keys or working login,
-and never contact the VPS or use `ssh-keyscan`.
+Trust import/export requires no private keys or working login and does not use
+`ssh-keyscan`. Export and source import are local; `trust-server` can separately
+offer a LIVE host-only handshake when the inventory port differs from the JSON port.
 
 `copy-server-trust` reuses the same validated export and clipboard backend as
 `copy-public-key`: Wayland (`wl-copy`), X11 (`xclip`/`xsel`) or macOS (`pbcopy`).
@@ -735,17 +736,33 @@ A VM needs a configured shared clipboard or another reviewed transfer channel.
    source and compare fingerprints with PC 1. Export cannot retrospectively prove
    how PC 1 originally established trust; the source computer must already be trusted.
 3. On PC 2, prepare its local ignored inventory with exactly the same server
-   hostname/IP and current port, then import:
+   hostname/IP and the desired SSH port, then import:
 
    ```bash
    make trust-server INVENTORY=inventories/laptop2.yml
    ```
 
    Paste the JSON line at `Host trust data:`. The CLI validates public keys with
-   OpenSSH, recalculates fingerprints and checks host/port against the inventory.
+   OpenSSH, recalculates fingerprints and requires the same hostname/IP as inventory.
+   The JSON port must be an integer from 1 to 65535; it may differ from inventory.
    Review the displayed details; enter `yes` only after independently verifying
    the source. Enter, N, EOF or interruption cancels. Non-interactive import fails
    without reading input or writing trust.
+   For JSON `132.243.166.145:2222` and inventory `132.243.166.145:22`, the CLI displays
+   both endpoints and asks `Import verified trust for port 2222? [y/N]:`.
+   Confirmation saves only the source endpoint `:2222`. It then offers
+   `Verify and trust configured port 22 now? [y/N]:`. Accepting runs the same signed
+   Paramiko handshake used by `connect-controller`, without login, agent access or
+   remote commands. Only a matching, cryptographically proven host key can reach
+   the separate `Trust this server on port 22? [y/N]:` confirmation and be added.
+   Success reports `SUCCESS` for the configured endpoint. Existing matching trust
+   needs no probe or duplicate entry; same-port imports retain their local workflow.
+   Declining the optional probe preserves source trust and leaves port 22 untrusted.
+   A failed handshake, unreachable port, different key or declined final confirmation
+   stops destination setup with a nonzero exit and explains that source trust remains.
+   Check the endpoint with your administrator/provider console, then retry
+   `trust-server` or `connect-controller`. Conflicting records are never replaced;
+   neither inventory nor VPS listeners/firewall change. No manual port switching is needed.
 4. Once the selected local login key is available and its public key is registered
    on the VPS, use the existing commands:
 

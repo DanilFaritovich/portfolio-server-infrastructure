@@ -273,7 +273,7 @@ def known_host(host, port, allow_trust=False):
     print('Host key saved to ~/.ssh/known_hosts. Strict host-key checking remains enabled.', flush=True)
 
 
-TRUST_GUIDANCE = ('Use make show-server-trust on an already trusted computer with the same inventory. '
+TRUST_GUIDANCE = ('Use make show-server-trust on an already trusted computer for the same hostname/IP. '
                   'Without that source, ask your administrator or use the authenticated VPS provider console '
                   'to obtain the public SSH host key and its verified SHA256 fingerprint. '
                   'A network scan alone cannot establish trust.')
@@ -351,14 +351,14 @@ def trusted_host_keys(snapshot, host, port):
     return keys
 
 
-def parse_server_trust(text, host, port):
+def parse_server_trust(text, host):
     require(len(text) <= 65536, 'Host trust data is too large.')
     try:
         data = json.loads(text)
         require(isinstance(data, dict) and set(data) == {'version', 'host', 'port', 'keys'} and
                 type(data['version']) is int and data['version'] == 1 and
-                data['host'] == host and type(data['port']) is int and data['port'] == port,
-                'Host trust hostname/IP or port does not match inventory, or the transfer format is invalid.')
+                data['host'] == host and type(data['port']) is int and 1 <= data['port'] <= 65535,
+                'Host trust hostname/IP does not match inventory, or the transfer format/port is invalid.')
         require(isinstance(data['keys'], list) and 1 <= len(data['keys']) <= 16, 'Expected a non-empty host key list.')
         keys = {}
         for key in data['keys']:
@@ -370,7 +370,7 @@ def parse_server_trust(text, host, port):
             kind = key['public_key'].split()[0]
             require(kind not in keys, 'Duplicate host key algorithm in transfer data.')
             keys[kind] = key
-        return keys
+        return data['port'], keys
     except (json.JSONDecodeError, TypeError, KeyError):
         raise ValueError('Invalid host trust transfer data; paste the single JSON line from make show-server-trust.') from None
 
@@ -419,6 +419,7 @@ def save_server_trust(path, snapshot, host, port, existing, imported):
 def server_trust(mode, inventory):
     require(shutil.which('ssh-keygen'), 'Missing OpenSSH ssh-keygen. Install the OpenSSH client tools.')
     _, host, port, _, _ = load_host(inventory, validate_hardening=False)
+    source_port = port
     path = Path.home() / '.ssh/known_hosts'
     if mode == 'trust-server':
         require(sys.stdin.isatty(), 'Host trust import requires an interactive terminal. ' + TRUST_GUIDANCE)
@@ -433,11 +434,15 @@ def server_trust(mode, inventory):
             text = input('Host trust data: ')
         except (EOFError, KeyboardInterrupt):
             raise ValueError('Host trust import cancelled; no trust was saved.') from None
-        keys = parse_server_trust(text, host, port)
+        source_port, keys = parse_server_trust(text, host)
+        existing = trusted_host_keys(snapshot, host, source_port)
         check_trust_conflicts(existing, keys)
     if mode == 'copy-server-trust':
         copy_clipboard(server_trust_json(host, port, keys), fallback='show-server-trust')
-    print(f'Server: {host}\nSSH port: {port}')
+    print(f'Server: {host}\nSSH port: {source_port}')
+    if source_port != port:
+        print(f'Trusted server: {host}:{source_port}\nConfigured endpoint: {host}:{port}\n\n'
+              'The transferred trust belongs to the same server but uses a different SSH port.')
     for entry in keys.values():
         print('Public host key: ' + entry['public_key'] + '\nSHA256 fingerprint: ' + entry['fingerprint'])
     if mode == 'show-server-trust':
@@ -447,13 +452,39 @@ def server_trust(mode, inventory):
         print('Server trust JSON copied to clipboard.')
     else:
         try:
-            answer = input('Confirm these keys came from an independently verified source. Trust this server? [y/N]: ')
+            answer = input('Confirm these keys came from an independently verified source. '
+                           f'Import verified trust for port {source_port}? [y/N]: ')
         except (EOFError, KeyboardInterrupt):
             raise ValueError('Host trust import cancelled; no trust was saved.') from None
         require(answer.strip().lower() in ('y', 'yes'), 'Host trust declined; no trust was saved.')
-        changed = save_server_trust(path, snapshot, host, port, existing, keys)
+        changed = save_server_trust(path, snapshot, host, source_port, existing, keys)
         print('Host trust saved to ~/.ssh/known_hosts.' if changed else 'Host trust already present; known_hosts unchanged.')
         print('Strict host-key checking remains enabled.')
+        if source_port != port:
+            configure_imported_port(host, port, source_port, keys)
+
+
+def configure_imported_port(host, port, source_port, keys):
+    """Keep the confirmed source import even if optional destination setup fails."""
+    guidance = (f'Trust for {host}:{source_port} remains saved. '
+                f'Check the configured endpoint {host}:{port} with your administrator/provider console; '
+                'then retry make trust-server or make connect-controller. '
+                'No inventory or VPS settings were changed.')
+    try:
+        path = Path.home() / '.ssh/known_hosts'
+        existing = trusted_host_keys(trust_snapshot(path), host, port)
+        check_trust_conflicts(existing, keys)
+        if not existing:
+            answer = input(f'Verify and trust configured port {port} now? [y/N]: ')
+            if answer.strip().lower() not in ('y', 'yes'):
+                print(f'Configured port {port} remains untrusted. ' + guidance)
+                return
+            transfer_port_trust(host, port)
+        print(f'SUCCESS: configured endpoint {host}:{port} is trusted.')
+    except (EOFError, KeyboardInterrupt):
+        raise ValueError('Configured port setup cancelled. ' + guidance) from None
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        raise ValueError(f'Configured port setup failed: {error} ' + guidance) from None
 
 
 def server_trust_json(host, port, keys):

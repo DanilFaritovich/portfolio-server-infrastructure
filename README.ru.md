@@ -166,7 +166,7 @@ password prompts и поддержкой выбранного ключа чер�
 | `make copy-public-key` | Скопировать public key; предложить установку отсутствующей clipboard-утилиты | **LOCAL / clipboard, опционально APT** |
 | `make copy-server-trust` | Скопировать проверенный trust JSON; предложить установку clipboard-утилиты | **LOCAL / clipboard, опционально APT** |
 | `make show-server-trust` | Экспортировать доверенные OpenSSH host keys и SHA256 fingerprints | **LOCAL / read-only** |
-| `make trust-server` | Импортировать независимо проверенные host keys после подтверждения | **LOCAL / только пользовательский known_hosts** |
+| `make trust-server` | Импортировать проверенные host keys; опционально доказать trust другого порта inventory | **LOCAL / known_hosts; опционально LIVE host-only handshake** |
 | `make show-controller` | Показать доступ из inventory и SSH-команду | **LOCAL / read-only** |
 | `make connect-controller` | Рабочий SSH; предложить проверенное доверие для нового порта | **LIVE / интерактивная сессия** |
 | `make connect-user` | Интерактивный SSH под указанным пользователем | **LIVE / интерактивная сессия** |
@@ -708,8 +708,9 @@ characters и OpenSSH expansion tokens запрещены. Разблокиро�
 ### Перенос доверия к серверу на второй компьютер
 
 SSH host keys определяют сервер и отличаются от пользовательских ключей входа.
-Все три команды переноса работают локально, не требуют private keys или рабочего входа,
-не обращаются к VPS и не используют `ssh-keyscan`.
+Импорт/экспорт не требует private keys или рабочего входа и не использует
+`ssh-keyscan`. Экспорт и импорт исходного trust локальны; `trust-server` отдельно
+предлагает LIVE host-only handshake, если порт inventory отличается от порта JSON.
 
 `copy-server-trust` использует тот же проверенный экспорт и clipboard backend,
 что `copy-public-key`: Wayland (`wl-copy`), X11 (`xclip`/`xsel`) или macOS (`pbcopy`).
@@ -736,17 +737,33 @@ SSH host keys определяют сервер и отличаются от п�
    источник и сравните fingerprints с ПК 1. Экспорт не доказывает задним числом,
    как trust появился на ПК 1: исходный компьютер уже должен быть доверенным.
 3. На ПК 2 подготовьте локальный ignored inventory с точно таким же hostname/IP
-   сервера и текущим портом, затем выполните импорт:
+   сервера и желаемым SSH-портом, затем выполните импорт:
 
    ```bash
    make trust-server INVENTORY=inventories/laptop2.yml
    ```
 
    Вставьте JSON-строку в `Host trust data:`. CLI проверит public keys через OpenSSH,
-   пересчитает fingerprints и сравнит host/port с inventory. Проверьте показанные
+   пересчитает fingerprints и потребует совпадения hostname/IP с inventory.
+   Порт JSON должен быть целым числом от 1 до 65535 и может отличаться от inventory. Проверьте показанные
    данные и введите `yes` только после независимой проверки источника.
    Enter, N, EOF или прерывание отменяют импорт. В non-interactive режиме команда
    завершается без чтения ввода и записи trust.
+   Для JSON `132.243.166.145:2222` и inventory `132.243.166.145:22` CLI покажет
+   оба endpoint и спросит `Import verified trust for port 2222? [y/N]:`.
+   Подтверждение сохраняет только исходный endpoint `:2222`. Затем появится
+   `Verify and trust configured port 22 now? [y/N]:`. Согласие запускает тот же
+   подписанный Paramiko handshake, что и `connect-controller`, без входа, доступа
+   к agent и удалённых команд. Только совпавший и криптографически доказанный host key
+   допускает отдельное подтверждение `Trust this server on port 22? [y/N]:` и добавление.
+   Успех сообщает `SUCCESS` для endpoint inventory. Уже совпадающий trust не требует
+   probe или дубликатов; импорт при одинаковых портах сохраняет локальный сценарий.
+   Отказ от опционального probe сохраняет исходный trust, оставляя порт 22 недоверенным.
+   Ошибка handshake, недоступный порт, другой ключ или отказ от финального подтверждения
+   останавливают настройку целевого порта с ненулевым кодом и пояснением о сохранении исходного trust.
+   Проверьте endpoint с администратором/через консоль провайдера, затем повторите
+   `trust-server` или `connect-controller`. Конфликтующие записи не заменяются;
+   inventory и listeners/firewall VPS не меняются. Переключать порт вручную не требуется.
 4. Когда выбранный локальный ключ входа доступен, а его public key зарегистрирован
    на VPS, используйте существующие команды:
 

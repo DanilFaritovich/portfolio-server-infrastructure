@@ -70,6 +70,115 @@ class PortTrustTests(unittest.TestCase):
             access.transfer_port_trust(self.host, self.port)
         return prompt
 
+    def import_port_trust(self, answers=('yes', 'yes', 'yes')):
+        data = access.server_trust_json(self.host, self.old_port, self.keys)
+        with patch('builtins.input', side_effect=[data, *answers]) as prompt:
+            access.server_trust('trust-server', self.inventory)
+        return prompt
+
+    def test_initial_import_regression_132_243_166_145_2222_to_22(self):
+        self.host = '132.243.166.145'
+        values = yaml.safe_load(self.inventory.read_text())
+        values['all']['children']['bootstrap']['hosts']['portfolio']['ansible_host'] = self.host
+        self.inventory.write_text(yaml.safe_dump(values))
+        self.write('# preserve\nother.test ' + PUBLIC + '\n')
+        before = self.path.read_bytes()
+        self.import_port_trust()
+        self.assertEqual(self.path.read_bytes(), before +
+                         f'[{self.host}]:2222 {PUBLIC}\n{self.host} {PUBLIC}\n'.encode())
+        access.socket.create_connection.assert_called_once_with((self.host, 22), timeout=15)
+        self.transport.auth_publickey.assert_not_called()
+        self.transport.open_session.assert_not_called()
+        self.assertIn('Trusted server: 132.243.166.145:2222', self.output.getvalue())
+        self.assertIn('Configured endpoint: 132.243.166.145:22', self.output.getvalue())
+        self.assertIn('SUCCESS', self.output.getvalue())
+        before = access.trust_snapshot(self.path)
+        access.socket.create_connection.reset_mock()
+        self.import_port_trust(('yes',))
+        self.assertEqual(access.trust_snapshot(self.path), before)
+        access.socket.create_connection.assert_not_called()
+        access.cli_connection('show-controller', self.inventory)
+        access.known_host(self.host, self.port)
+
+    def test_initial_import_failure_keeps_source_trust(self):
+        for failure in (ConnectionRefusedError(), socket.timeout(), paramiko.SSHException('bad signature'), EOFError()):
+            self.write('# preserve\n')
+            target = access.socket.create_connection if isinstance(failure, OSError) else self.transport.start_client
+            target.side_effect = failure
+            with self.subTest(failure=failure), self.assertRaisesRegex(ValueError, '2222 remains saved'):
+                self.import_port_trust(('yes', 'yes'))
+            self.assertEqual(self.path.read_text(), f'# preserve\n[{self.host}]:2222 {PUBLIC}\n')
+            target.side_effect = None
+
+    def test_initial_import_substituted_key_keeps_source(self):
+        self.path.unlink()
+        self.transport.get_remote_server_key.return_value.get_base64.return_value = 'AAAA'
+        with self.assertRaisesRegex(ValueError, 'differs.*2222 remains saved'):
+            self.import_port_trust(('yes', 'yes'))
+        self.assertEqual(self.path.read_text(), f'[{self.host}]:2222 {PUBLIC}\n')
+
+    def test_initial_import_declines_and_cancellations(self):
+        for stage in range(3):
+            for answer in ('', 'n', EOFError(), KeyboardInterrupt()):
+                self.write('# preserve\n')
+                access.socket.create_connection.reset_mock()
+                answers = ['yes'] * stage + [answer]
+                with self.subTest(stage=stage, answer=answer):
+                    if stage == 1 and isinstance(answer, str):
+                        self.import_port_trust(answers)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'declined|cancelled'):
+                            self.import_port_trust(answers)
+                expected = '# preserve\n' + (f'[{self.host}]:2222 {PUBLIC}\n' if stage else '')
+                self.assertEqual(self.path.read_text(), expected)
+                if stage < 2:
+                    access.socket.create_connection.assert_not_called()
+
+    def test_initial_import_hashed_source_repeat_preserves_records(self):
+        endpoint = f'[{self.host}]:2222'
+        salt = b'01234567890123456789'
+        hashed = '|1|' + base64.b64encode(salt).decode() + '|' + base64.b64encode(hmac.digest(salt, endpoint.encode(), 'sha1')).decode()
+        self.write(f'# preserve\n{hashed} {PUBLIC}\nother.test {PUBLIC}\n')
+        before = self.path.read_bytes()
+        self.import_port_trust()
+        self.assertEqual(self.path.read_bytes(), before + f'{self.host} {PUBLIC}\n'.encode())
+
+    def test_initial_import_target_conflict_preserves_both_records(self):
+        blob = base64.b64decode(PUBLIC.split()[1])
+        other = 'ssh-ed25519 ' + base64.b64encode(blob[:-1] + b'\x01').decode()
+        self.write(f'{self.host} {other}\n')
+        with self.assertRaisesRegex(ValueError, 'conflicts.*2222 remains saved'):
+            self.import_port_trust(('yes',))
+        self.assertEqual(self.path.read_text(), f'{self.host} {other}\n[{self.host}]:2222 {PUBLIC}\n')
+        access.socket.create_connection.assert_not_called()
+
+    def test_initial_import_noninteractive_never_reads_writes_or_probes(self):
+        before = access.trust_snapshot(self.path)
+        with patch.object(access.sys.stdin, 'isatty', return_value=False), patch('builtins.input') as prompt, \
+                self.assertRaisesRegex(ValueError, 'interactive terminal'):
+            access.server_trust('trust-server', self.inventory)
+        prompt.assert_not_called()
+        access.socket.create_connection.assert_not_called()
+        self.assertEqual(access.trust_snapshot(self.path), before)
+
+    def test_same_port_import_never_probes(self):
+        self.old_port = self.port
+        self.path.unlink()
+        self.import_port_trust(('yes',))
+        self.assertEqual(self.path.read_text(), f'{self.host} {PUBLIC}\n')
+        access.socket.create_connection.assert_not_called()
+
+    def test_initial_import_concurrent_destination_write_blocks_addition(self):
+        self.path.unlink()
+        answers = iter([access.server_trust_json(self.host, self.old_port, self.keys), 'yes', 'yes', 'yes'])
+        def answer(prompt):
+            if prompt.startswith('Trust this server on port'):
+                self.write(self.path.read_text() + '# concurrent\n')
+            return next(answers)
+        with patch('builtins.input', side_effect=answer), self.assertRaisesRegex(ValueError, 'changed since review.*2222 remains saved'):
+            access.server_trust('trust-server', self.inventory)
+        self.assertEqual(self.path.read_text(), f'[{self.host}]:2222 {PUBLIC}\n# concurrent\n')
+
     def test_verified_transfer_preserves_original_and_repeat_is_noop(self):
         before = self.path.read_bytes()
         self.transfer()

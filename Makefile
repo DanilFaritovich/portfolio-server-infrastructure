@@ -29,7 +29,8 @@ generate-user-key load-user-key show-public-key copy-public-key:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py $@
 
-# LOCAL trust transfer; copying may offer clipboard package installation.
+# LOCAL trust import/export; trust-server may offer a LIVE host-only cross-port handshake.
+# Copying may offer clipboard package installation.
 show-server-trust copy-server-trust trust-server:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY"
