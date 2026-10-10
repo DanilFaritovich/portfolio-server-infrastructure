@@ -10,7 +10,7 @@ export ANSIBLE_HOME := $(CURDIR)/.ansible
 # Subprocesses must find the same pinned Ansible tools as the invoking interpreter.
 export PATH := $(abspath $(VENV))/bin:$(PATH)
 
-.PHONY: list-users show-user list-user-keys add-user-key revoke-user-key remove-user generate-user-key load-user-key show-public-key show-controller connect-controller connect-user deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
+.PHONY: list-users show-user list-user-keys add-user-key revoke-user-key remove-user generate-user-key load-user-key show-public-key copy-public-key show-controller connect-controller connect-user deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
 
 # Human account inputs are supplied by the caller; USER is intentionally untouched.
 export AGENT_LOAD KEY_FINGERPRINT RECOVERY_USER RECOVERY_KEY KEY_NAME HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
@@ -24,7 +24,7 @@ setup:
 	@sh scripts/setup.sh setup
 
 # LOCAL only: generate/load the selected key or display its public member/fingerprint.
-generate-user-key load-user-key show-public-key:
+generate-user-key load-user-key show-public-key copy-public-key:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py $@
 

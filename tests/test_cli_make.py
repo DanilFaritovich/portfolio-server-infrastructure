@@ -102,6 +102,16 @@ exit 0
                          [PUBLIC, 'SHA256 fingerprint: SHA256:synthetic'])
         self.assertNotIn('unexpected ssh invocation', self.calls.read_text())
 
+    def test_copy_public_key_wrapper_uses_mock_clipboard_without_ssh(self):
+        self.executable('wl-copy', '#!/bin/sh\ncat > "$FAKE_CLIPBOARD"\n')
+        clipboard = self.home / 'clipboard'
+        result = self.make('copy-public-key', HUMAN_KEY=self.key, WAYLAND_DISPLAY='fixture',
+                           FAKE_CLIPBOARD=clipboard)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(clipboard.read_text(), Path(str(self.key) + '.pub').read_text())
+        self.assertIn('SHA256:synthetic', result.stdout)
+        self.assertNotIn('unexpected ssh invocation', self.calls.read_text())
+
     def test_show_controller_uses_selected_inventory_without_ssh(self):
         result = self.make('show-controller')
         self.assertEqual(result.returncode, 0, result.stderr)

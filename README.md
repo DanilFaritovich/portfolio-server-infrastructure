@@ -163,6 +163,7 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make generate-user-key` | Generate a local human Ed25519 keypair and offer agent loading | **LOCAL / key files and optional local agent** |
 | `make load-user-key` | Load the selected existing key into the local SSH agent | **LOCAL / agent only** |
 | `make show-public-key` | Display public key and SHA256 fingerprint | **LOCAL / read-only** |
+| `make copy-public-key` | Copy the complete public key to the desktop clipboard | **LOCAL / clipboard only** |
 | `make show-controller` | Display inventory access and SSH command | **LOCAL / read-only** |
 | `make connect-controller` | Interactive SSH as the inventory managed user | **LIVE / interactive session** |
 | `make connect-user` | Interactive SSH as the selected human user | **LIVE / interactive session** |
@@ -732,18 +733,51 @@ prerequisites. Keep a separate recovery administrator and the first controller:
 ```bash
 make setup INVENTORY=inventories/laptop2.yml
 make generate-user-key HUMAN_USER=portfolio_laptop2
-make show-public-key HUMAN_USER=portfolio_laptop2
+make load-user-key HUMAN_USER=portfolio_laptop2
+make copy-public-key HUMAN_USER=portfolio_laptop2
 ```
 
 Choose a passphrase and accept agent loading. If no agent was available, start it in
-the parent shell and run `load-user-key`. Transfer only the `.pub` file to PC 1 and
-compare its SHA256 fingerprint. After separate LIVE authorization, PC 1 registers
+the parent shell and run `load-user-key`. Copy only the public key to PC 1 through
+a reviewed transfer channel or explicitly configured VM shared clipboard; the CLI
+does not synchronize clipboards between computers. Compare its SHA256 fingerprint.
+After separate LIVE authorization, PC 1 registers
 the new administrator through its existing `ansible` controller:
 
 ```bash
 make add-user INVENTORY=inventories/production.yml HUMAN_USER=portfolio_laptop2 \
-  HUMAN_SUDO=admin HUMAN_PUBLIC_KEY=/path/portfolio_laptop2_ed25519.pub
+  HUMAN_SUDO=admin
+# Paste the public key at >, compare user/rights/fingerprint, then explicitly confirm.
 ```
+
+`copy-public-key` selects the same key as `show-public-key`, including `HUMAN_KEY`
+and `KEY_NAME`, and copies the complete `.pub` contents, including the comment.
+It needs only the public file and never inspects the private member, contacts a host,
+or loads an agent. In a Wayland session it uses `wl-copy` (package `wl-clipboard`);
+in X11 it uses `xclip` or `xsel` (matching packages). Install the appropriate small
+package yourself if missing; nothing is installed automatically. A desktop session
+is required. A clipboard error fails the command without reporting success.
+`show-public-key` remains available for text transfer without clipboard utilities.
+
+Without `HUMAN_PUBLIC_KEY`, `add-user` asks for one plain OpenSSH public-key line
+in a terminal. Both pasted keys and files use the same format and OpenSSH validation;
+private-key blocks, key options, multiple keys and invalid key data are refused.
+Before host contact, the CLI displays the user, `HUMAN_SUDO` and SHA256 fingerprint,
+then asks for explicit confirmation with default deny. Temporary public-key snapshots
+use a private directory and a `0600` file, removed on completion or failure.
+File import remains supported:
+
+```bash
+make add-user HUMAN_USER=portfolio_laptop2 HUMAN_SUDO=admin \
+  HUMAN_PUBLIC_KEY=/path/portfolio_laptop2_ed25519.pub
+```
+
+In a noninteractive run, `HUMAN_PUBLIC_KEY` is required and retains the existing
+explicit-file automation behavior without a prompt. In a terminal, file imports
+also require confirmation. Registration is additive and reports access as
+**UNVERIFIED**; the owner must independently verify SSH and Ansible from PC 2.
+`add-user` no longer generates a local key when public input is absent; use
+`generate-user-key` before registration.
 
 On PC 2, edit only its ignored candidate inventory: preserve the verified host,
 current port, Python interpreter and hardening port lists; set `bootstrap_login_user`
@@ -834,7 +868,9 @@ root passwords or change host trust. Keep the same local inventory and
 `sudo -n`, and completed Stage 3 on every `ssh_verify_ports` route.
 
 ```bash
-# Dedicated Ed25519 key generated locally; root-equivalent NOPASSWD administrator.
+# Create/load the key locally; paste its public member during registration.
+make generate-user-key HUMAN_USER=portfolio_admin
+make show-public-key HUMAN_USER=portfolio_admin
 make add-user HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
 make verify-user HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
 # Keep an operator session open; confirm tested provider-console recovery interactively.
@@ -871,8 +907,8 @@ Root/system and common runtime privilege groups are refused; `sudo`/`admin` grou
 require the admin policy. Review custom group privileges separately. `none` adds
 no sudo fragment and verification requires no non-interactive sudo grant.
 
-Keys generated automatically by `add-user` have no passphrase; the separate
-`generate-user-key` command prompts for one. Directories are private (`0700`), and private
+`add-user` accepts a pasted public key or `HUMAN_PUBLIC_KEY`; it never generates
+a private key. `generate-user-key` prompts for a passphrase. Directories are private (`0700`), and private
 keys are `0600` or stricter. Existing pairs are preserved; partial pairs, symlinks,
 unsafe permissions and reuse of the automation-key path fail. The wrapper never
 reads private-key bytes or uploads them. Existing encrypted human keys can use

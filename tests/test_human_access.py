@@ -46,6 +46,7 @@ class HumanWrapperTests(unittest.TestCase):
             ('load_host', {'return_value': ('portfolio', 'fixture.example.test', 2222, 'root', '/usr/bin/python3')}),
             ('hardening_inputs', {'return_value': self.inputs}),
             ('public_key_file', {'side_effect': lambda value: Path(value)}),
+            ('public_fingerprint', {'return_value': 'SHA256:synthetic'}),
             ('prepare_key', {'side_effect': lambda *a, **kw: self.events.append('generate')}),
             ('prepare_human_key', {'side_effect': self.prepare_human_key}),
             ('user_probe', {'side_effect': self.user_probe}),
@@ -58,6 +59,7 @@ class HumanWrapperTests(unittest.TestCase):
             setattr(self, name, mocked.start())
             self.addCleanup(mocked.stop)
         for mocked in (patch.dict(os.environ, self.env, clear=True), patch('builtins.print'),
+                       patch('builtins.input', return_value='yes'),
                        patch.object(access.sys.stdin, 'isatty', return_value=True)):
             mocked.start()
             self.addCleanup(mocked.stop)
@@ -94,11 +96,12 @@ class HumanWrapperTests(unittest.TestCase):
         self.run_playbook.assert_not_called()
 
     def test_add_user_preflight_creation_and_fresh_verification(self):
-        access.human_access('add-user', self.inventory, self.automation)
-        self.assertEqual(self.events, ['automation', 'generate', 'user_probe:preflight-add-user', 'add-user.yml',
-                                       'user_probe:show-user', 'user_probe:add-user-key', 'human'])
+        with patch('builtins.input', side_effect=[self.public_key.strip(), 'yes']):
+            access.human_access('add-user', self.inventory, self.automation)
+        self.assertEqual(self.events, ['automation', 'user_probe:preflight-add-user', 'add-user.yml',
+                                       'user_probe:show-user', 'user_probe:add-user-key'])
         variables = self.run_playbook.call_args.args[2]
-        self.assertEqual(variables['human_access_user_public_key_path'], str(self.key) + '.pub')
+        self.assertFalse(Path(variables['human_access_user_public_key_path']).exists())
         self.assertNotIn('ansible_become', variables)
         self.assertEqual(variables['ansible_user'], 'ansible')
 

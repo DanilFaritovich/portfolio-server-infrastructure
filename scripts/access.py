@@ -2,6 +2,7 @@
 """Controller-only setup and explicit live access entry points; never store passwords."""
 
 import argparse
+import contextlib
 import fcntl
 import importlib.util
 import json
@@ -470,15 +471,16 @@ def human_inputs(environment=None, managed_user='ansible'):
             'human_access_user_sudo_commands': ['ALL'] if policy == 'admin' else commands}
 
 
-def human_key_path(value, name, key_name=None):
+def human_key_path(value, name, key_name=None, public_only=False):
     if key_name:
         require(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}', key_name) and not key_name.endswith('.pub'),
                 'KEY_NAME must be a simple private-key filename, without directories or a .pub suffix.')
     path = Path(value or Path.home() / '.ssh/portfolio-infra' / (key_name or name + '_ed25519')).expanduser().absolute()
     validate_cli_path(path)
-    require(not any(p.is_symlink() for p in [path, *path.parents]), 'Human key paths must not use symlinks.')
-    require(not path.resolve().is_relative_to(ROOT) or
-            path.resolve().is_relative_to(ROOT / 'secrets/portfolio-infra'),
+    inspected = Path(str(path) + '.pub') if public_only else path
+    require(not any(p.is_symlink() for p in [inspected, *inspected.parents]), 'Human key paths must not use symlinks.')
+    require(not inspected.resolve().is_relative_to(ROOT) or
+            inspected.resolve().is_relative_to(ROOT / 'secrets/portfolio-infra'),
             'Repository human keys are allowed only under secrets/portfolio-infra/.')
     return path
 
@@ -491,13 +493,61 @@ def public_key_file(value):
     require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_size <= 16384,
             'Public key must be a small regular file owned by you.')
     require(info.st_mode & 0o022 == 0, 'Public key must not be writable by group or others.')
-    content = path.read_text().strip()
-    require(len(content.splitlines()) == 1 and re.fullmatch(
-        r'(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,3}( [^\r\n]*)?', content),
-        'Import exactly one plain OpenSSH public key without authorized_keys options.')
+    content = read_public_key(path)
+    validate_public_key_text(content)
     result = subprocess.run(['ssh-keygen', '-l', '-f', str(path)], capture_output=True, check=False)
     require(result.returncode == 0, 'Public key is invalid.')
     return path
+
+
+def validate_public_key_text(content):
+    require(len(content.encode('utf-8')) <= 16384, 'Public key must be small plain text.')
+    content = content.strip()
+    require(len(content.splitlines()) == 1 and re.fullmatch(
+        r'(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,3}( [^\r\n]*)?', content),
+        'Import exactly one plain OpenSSH public key without authorized_keys options.')
+
+
+def read_public_key(path):
+    try:
+        with path.open(encoding='utf-8', newline='') as source:
+            return source.read()
+    except UnicodeError:
+        raise ValueError('Public key must be UTF-8 plain text.') from None
+
+
+def public_fingerprint(public):
+    result = subprocess.run(['ssh-keygen', '-l', '-E', 'sha256', '-f', str(public)],
+                            capture_output=True, text=True, check=True)
+    fields = result.stdout.split()
+    require(len(fields) >= 2 and re.fullmatch(r'SHA256:[A-Za-z0-9+/]+', fields[1]),
+            'Cannot determine the public-key SHA256 fingerprint.')
+    return fields[1]
+
+
+def copy_public_key(public):
+    content = read_public_key(public)
+    with public_key_snapshot(content) as snapshot:
+        selected = public_fingerprint(snapshot)
+    candidates = []
+    if os.environ.get('WAYLAND_DISPLAY'):
+        candidates.append(('wl-copy', ['wl-copy']))
+    if os.environ.get('DISPLAY'):
+        candidates.extend([('xclip', ['xclip', '-selection', 'clipboard']),
+                           ('xsel', ['xsel', '--clipboard', '--input'])])
+    command = next((argv for tool, argv in candidates if shutil.which(tool)), None)
+    require(command, 'No clipboard utility for the current graphical session. '
+            'Install wl-clipboard for Wayland or xclip/xsel for X11; '
+            'run in a desktop session, or use make show-public-key.')
+    try:
+        # Clipboard owners may outlive their launcher; do not leave output pipes
+        # open in a background owner while communicate waits for EOF.
+        result = subprocess.run(command, input=content.encode('utf-8'), stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ValueError('Clipboard copy failed; check the desktop session and clipboard utility.') from None
+    require(result.returncode == 0, 'Clipboard copy failed; check the desktop session and clipboard utility.')
+    print('Public SSH key copied to clipboard.\nSHA256 fingerprint: ' + selected)
 
 
 def prepare_human_key(key, name, interactive_passphrase=False):
@@ -520,12 +570,12 @@ def validate_cli_path(path):
             'SSH paths must not contain control characters or OpenSSH expansion tokens.')
 
 
-def cli_human_key():
+def cli_human_key(public_only=False):
     """Local key selection does not imply account creation or a sudo policy."""
     name = os.environ.get('HUMAN_USER', '')
     require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,30}', name) and name != 'root',
             'Set HUMAN_USER to a non-root Ubuntu username.')
-    key = human_key_path(os.environ.get('HUMAN_KEY'), name, os.environ.get('KEY_NAME'))
+    key = human_key_path(os.environ.get('HUMAN_KEY'), name, os.environ.get('KEY_NAME'), public_only=public_only)
     validate_cli_path(key)
     return name, key
 
@@ -571,16 +621,19 @@ def load_agent_key(key, public):
 
 def local_key(mode):
     require(shutil.which('ssh-keygen'), 'Missing ssh-keygen. Install OpenSSH client tools.')
-    name, key = cli_human_key()
+    name, key = cli_human_key(public_only=mode == 'copy-public-key')
     policy = os.environ.get('AGENT_LOAD', 'ask')
     require(policy in ('ask', 'yes', 'no'), 'AGENT_LOAD must be ask, yes or no.')
     created = False
     if mode == 'generate-user-key':
         created = prepare_human_key(key, name, interactive_passphrase=True)
     # Inspect only private metadata; validate and read public material separately.
-    check_key(key)
+    if mode != 'copy-public-key':
+        check_key(key)
     public = public_key_file(str(key) + '.pub')
-    if mode == 'load-user-key':
+    if mode == 'copy-public-key':
+        copy_public_key(public)
+    elif mode == 'load-user-key':
         load_agent_key(key, public)
     elif mode == 'generate-user-key':
         if created:
@@ -708,13 +761,59 @@ def verify_auth_methods(host, port, user, trust_name):
             transport.close()
 
 
+@contextlib.contextmanager
+def public_key_snapshot(content):
+    validate_public_key_text(content)
+    with tempfile.TemporaryDirectory(prefix='portfolio-public-') as directory:
+        public = Path(directory) / 'key.pub'
+        with open(public, 'x', opener=lambda path, flags: os.open(path, flags, 0o600)) as output:
+            output.write(content)
+        yield public_key_file(str(public))
+
+
+@contextlib.contextmanager
+def add_user_public_key():
+    imported = os.environ.get('HUMAN_PUBLIC_KEY', '')
+    if imported:
+        content = read_public_key(public_key_file(imported))
+    else:
+        require(sys.stdin.isatty(), 'Set HUMAN_PUBLIC_KEY to a .pub file in noninteractive mode.')
+        print('Public SSH key was not provided.\n\nPaste the public SSH key (ssh-ed25519 ...):')
+        try:
+            content = input('> ')
+        except (EOFError, KeyboardInterrupt):
+            raise ValueError('Public key input cancelled; no VPS changes requested.') from None
+    # Snapshot either input in a private, automatically removed file for Ansible.
+    with public_key_snapshot(content) as public:
+        yield public
+
+
 def human_access(mode, inventory, automation_key=None):
+    if mode != 'add-user':
+        return human_access_stage(mode, inventory, automation_key)
+    managed_user, managed_key = managed_access(inventory, automation_key)
+    human = human_inputs(managed_user=managed_user)
+    key = human_key_path(os.environ.get('HUMAN_KEY'), human['human_access_user_name'])
+    require(key.resolve() != managed_key.resolve(), 'Use separate human and automation SSH keys.')
+    with add_user_public_key() as public:
+        print(f"User: {human['human_access_user_name']}\nHUMAN_SUDO: {human['human_access_user_sudo']}\n"
+              f'SHA256 fingerprint: {public_fingerprint(public)}')
+        if sys.stdin.isatty():
+            try:
+                answer = input('LIVE: register this user and public key on the VPS? [y/N] ')
+            except (EOFError, KeyboardInterrupt):
+                answer = ''
+            require(answer.strip().lower() in ('y', 'yes'), 'Registration declined; no VPS changes requested.')
+        return human_access_stage(mode, inventory, automation_key, public)
+
+
+def human_access_stage(mode, inventory, automation_key=None, supplied_public=None):
     managed_user, automation_key = managed_access(inventory, automation_key)
     human = human_inputs(managed_user=managed_user)
     name = human['human_access_user_name']
     key = human_key_path(os.environ.get('HUMAN_KEY'), name)
     require(key.resolve() != automation_key.resolve(), 'Use separate human and automation SSH keys.')
-    imported = os.environ.get('HUMAN_PUBLIC_KEY', '')
+    imported = supplied_public or os.environ.get('HUMAN_PUBLIC_KEY', '')
     public = public_key_file(imported) if imported else Path(str(key) + '.pub')
     prerequisites(mode)
     check_key(automation_key)
@@ -737,9 +836,6 @@ def human_access(mode, inventory, automation_key=None):
     # No cached receipt: re-prove automation access and completed Stage 3 on every selected route.
     verify_hardening(inventory, alias, host, port, managed, inputs)
     if mode == 'add-user':
-        if not imported:
-            prepare_human_key(key, name)
-            public = public_key_file(str(key) + '.pub')
         _, _, _, _, interpreter = load_host(inventory)
         before = user_probe(host, port, interpreter, automation_key, managed_user, {
             'action': 'preflight-add-user', 'name': name, 'sudo': human['human_access_user_sudo'],
@@ -981,7 +1077,7 @@ def operations(mode, inventory, key=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'generate-user-key', 'load-user-key', 'show-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
+    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=None, help='Legacy key override; explicit inventories own the key path.')
     args = parser.parse_args()
@@ -990,7 +1086,7 @@ def main():
     try:
         if args.mode == 'setup':
             setup_inventory(inventory)
-        elif args.mode in ('generate-user-key', 'load-user-key', 'show-public-key'):
+        elif args.mode in ('generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key'):
             local_key(args.mode)
         elif args.mode in ('show-controller', 'connect-controller', 'connect-user'):
             cli_connection(args.mode, inventory, args.key or None)

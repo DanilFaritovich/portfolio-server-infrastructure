@@ -106,6 +106,8 @@ class ConfigurableAccessTests(unittest.TestCase):
         env = {'HUMAN_USER': 'person', 'HUMAN_SUDO': 'admin', 'HUMAN_KEY': str(self.directory / 'person'),
                'HUMAN_PUBLIC_KEY': str(public_key)}
         with patch.dict(access.os.environ, env, clear=True), patch.object(access, 'check_key'), \
+                patch.object(access.sys.stdin, 'isatty', return_value=False), \
+                patch.object(access, 'public_fingerprint', return_value='SHA256:synthetic'), \
                 patch.object(access, 'public_key_file', side_effect=lambda value: Path(value)), \
                 patch.object(access, 'verify_hardening'), patch.object(access, 'user_probe', side_effect=user_probe), \
                 patch.object(access, 'verify_human') as verify, patch.object(access, 'run_playbook') as run, \

@@ -161,6 +161,7 @@ password prompts и agent. Paramiko используется только для
 | `make generate-user-key` | Создать локальную пару Ed25519 и предложить загрузку в agent | **LOCAL / ключ и локальный agent** |
 | `make load-user-key` | Загрузить выбранный существующий ключ в локальный agent | **LOCAL / только agent** |
 | `make show-public-key` | Показать public key и SHA256 fingerprint | **LOCAL / read-only** |
+| `make copy-public-key` | Скопировать полный public key в системный буфер обмена | **LOCAL / только clipboard** |
 | `make show-controller` | Показать доступ из inventory и SSH-команду | **LOCAL / read-only** |
 | `make connect-controller` | Интерактивный SSH под рабочим пользователем inventory | **LIVE / интерактивная сессия** |
 | `make connect-user` | Интерактивный SSH под указанным пользователем | **LIVE / интерактивная сессия** |
@@ -734,18 +735,49 @@ make load-user-key HUMAN_USER=portfolio_laptop2
 ```bash
 make setup INVENTORY=inventories/laptop2.yml
 make generate-user-key HUMAN_USER=portfolio_laptop2
-make show-public-key HUMAN_USER=portfolio_laptop2
+make load-user-key HUMAN_USER=portfolio_laptop2
+make copy-public-key HUMAN_USER=portfolio_laptop2
 ```
 
 Задайте passphrase и согласитесь на загрузку в agent. Если agent отсутствовал, запустите
-его в родительском shell и выполните `load-user-key`. Передайте на ПК 1 только `.pub`
-и сверяйте SHA256 fingerprint. После отдельного LIVE-разрешения ПК 1 регистрирует
+его в родительском shell и выполните `load-user-key`. Передайте на ПК 1 только public key
+через проверенный канал или явно настроенный общий буфер VM; CLI не синхронизирует
+буферы между компьютерами. Сверьте SHA256 fingerprint. После отдельного LIVE-разрешения ПК 1 регистрирует
 нового администратора через существующий controller `ansible`:
 
 ```bash
 make add-user INVENTORY=inventories/production.yml HUMAN_USER=portfolio_laptop2 \
-  HUMAN_SUDO=admin HUMAN_PUBLIC_KEY=/path/portfolio_laptop2_ed25519.pub
+  HUMAN_SUDO=admin
+# Вставьте public key после >, сверьте пользователя/права/fingerprint и подтвердите.
 ```
+
+`copy-public-key` выбирает тот же ключ, что `show-public-key`, включая `HUMAN_KEY`
+и `KEY_NAME`, и копирует полное содержимое `.pub` вместе с комментарием.
+Нужен только публичный файл: команда не проверяет private member, не подключается
+к серверу и не загружает agent. В Wayland используется `wl-copy` (пакет `wl-clipboard`),
+в X11 — `xclip` или `xsel` (одноимённые пакеты). При необходимости установите небольшой
+пакет самостоятельно; автоматической установки нет. Требуется графическая сессия.
+Ошибка clipboard завершает команду без сообщения об успешном копировании.
+`show-public-key` остаётся доступной для текстовой передачи без clipboard utilities.
+
+Без `HUMAN_PUBLIC_KEY` команда `add-user` предлагает вставить одну строку plain
+OpenSSH public key в терминале. Для вставки и файла используется одинаковая проверка
+формата и OpenSSH: private-key blocks, key options, несколько ключей и повреждённые
+данные отклоняются. До обращения к серверу CLI показывает пользователя, `HUMAN_SUDO`
+и SHA256 fingerprint, затем запрашивает явное подтверждение с default deny.
+Временный снимок public key хранится в закрытом каталоге, файл имеет `0600`;
+после завершения или ошибки он удаляется. Импорт файла сохранён:
+
+```bash
+make add-user HUMAN_USER=portfolio_laptop2 HUMAN_SUDO=admin \
+  HUMAN_PUBLIC_KEY=/path/portfolio_laptop2_ed25519.pub
+```
+
+Без TTY требуется `HUMAN_PUBLIC_KEY`: существующая автоматизация с явным файлом
+работает без запроса ввода. В терминале импорт файла также требует подтверждения.
+Регистрация добавляет ключ, сохраняя остальные, и сообщает **UNVERIFIED**;
+владелец самостоятельно проверяет SSH и Ansible с ПК 2. При отсутствии public input
+`add-user` больше не создаёт локальный ключ; используйте `generate-user-key` заранее.
 
 На ПК 2 измените только локальный ignored candidate inventory: сохраните проверенные
 host, текущий порт, Python interpreter и hardening port lists; укажите `bootstrap_login_user`
@@ -841,7 +873,9 @@ SSH-сессии и выполняет read-only проверки аккаунт
 `sudo -n` и завершение Stage 3 на каждом маршруте `ssh_verify_ports`.
 
 ```bash
-# Отдельный локальный Ed25519-ключ; администратор с root-equivalent NOPASSWD.
+# Создайте/загрузите ключ локально; вставьте public member при регистрации.
+make generate-user-key HUMAN_USER=portfolio_admin
+make show-public-key HUMAN_USER=portfolio_admin
 make add-user HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
 make verify-user HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
 # Оставьте сессию operator открытой; интерактивно подтвердите доступность console recovery.
@@ -878,8 +912,8 @@ Root/system и распространённые runtime privilege groups зап�
 требуют admin policy. Права custom groups проверяйте отдельно. `none` не добавляет
 sudo fragment; verification требует отсутствия non-interactive sudo grant.
 
-Ключи, автоматически создаваемые `add-user`, остаются без passphrase; отдельная
-команда `generate-user-key` запрашивает её. Каталоги имеют `0700`, private keys — `0600`
+`add-user` принимает вставленный public key или `HUMAN_PUBLIC_KEY` и не создаёт
+private key. `generate-user-key` запрашивает passphrase. Каталоги имеют `0700`, private keys — `0600`
 или строже. Существующие пары сохраняются; неполные пары, symlinks, небезопасные
 permissions и совпадение пути с automation key блокируют операцию. Wrapper не
 читает private-key bytes и не отправляет их на сервер. Существующие зашифрованные

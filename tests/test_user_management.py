@@ -355,6 +355,8 @@ class WrapperTests(unittest.TestCase):
             public = Path(directory) / 'other-pc.pub'
             public.write_text(key(2))
             with patch.dict(os.environ, HUMAN_PUBLIC_KEY=str(public), HUMAN_SUDO='admin'), \
+                    patch('builtins.input', return_value='yes'), \
+                    patch.object(access, 'public_fingerprint', return_value='SHA256:synthetic'), \
                     patch.object(access, 'public_key_file', return_value=public), \
                     patch.object(access, 'verify_hardening'), \
                     patch.object(access, 'user_probe', return_value={'existing': True, 'token': 'fresh'}) as probe, \
