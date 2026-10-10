@@ -29,13 +29,23 @@ class AgentTests(unittest.TestCase):
         self.public.chmod(0o644)
         self.env = {'HUMAN_USER': 'person', 'HUMAN_KEY': str(self.key), 'KEY_NAME': '',
                     'AGENT_LOAD': 'ask', 'SSH_AUTH_SOCK': '/fixture/agent.sock'}
+        # No test may inherit the developer's agent, terminal or tool discovery.
+        for mock in (patch.dict(os.environ, self.env, clear=True),
+                     patch.object(access.Path, 'home', return_value=self.home),
+                     patch.object(access.shutil, 'which', return_value='/fixture/tool'),
+                     patch.object(access.sys.stdin, 'isatty', return_value=False),
+                     patch('builtins.input', side_effect=AssertionError('Unexpected terminal prompt')),
+                     patch.object(access.subprocess, 'run', side_effect=self.fingerprint)):
+            mock.start()
+            self.addCleanup(mock.stop)
 
     def fingerprint(self, command, **kwargs):
         self.assertEqual(command[:2], ['ssh-keygen', '-l'])
         self.assertEqual(command[command.index('-f') + 1], str(self.public))
         return subprocess.CompletedProcess(command, 0, '256 ' + FINGERPRINT + ' (ED25519)\n', '')
 
-    def run_local_key(self, answer, policy='ask', tty=True, add_result=0, existing=False):
+    def run_local_key(self, answer, policy='ask', tty=True, add_result=0, existing=False,
+                      socket='/fixture/agent.sock', available=True):
         calls = []
         loaded = existing
 
@@ -47,23 +57,87 @@ class AgentTests(unittest.TestCase):
                     return self.fingerprint(command, **kwargs)
                 return subprocess.CompletedProcess(command, 0, '256 ' + FINGERPRINT + ' (ED25519)\n', '')
             if command[:2] == ['ssh-add', '-l']:
+                self.assertEqual(os.environ.get('SSH_AUTH_SOCK'), socket)
+                if not available:
+                    return subprocess.CompletedProcess(command, 2, '', 'agent unavailable')
                 return subprocess.CompletedProcess(command, 0 if loaded else 1,
                                                    ('256 ' + FINGERPRINT + ' (ED25519)\n') if loaded else '', '')
             if command[0] == 'ssh-add':
+                self.assertEqual(command, ['ssh-add', '-q', str(self.key)])
+                self.assertEqual(kwargs['env']['SSH_AUTH_SOCK'], socket)
+                self.assertEqual(kwargs['env']['SSH_ASKPASS_REQUIRE'], 'never')
+                self.assertNotIn('input', kwargs)
                 loaded = add_result == 0
                 return subprocess.CompletedProcess(command, add_result, '', '')
             self.fail('Unexpected command: ' + command[0])
 
+        environment = {**self.env, 'AGENT_LOAD': policy}
+        if socket is None:
+            environment.pop('SSH_AUTH_SOCK')
+        else:
+            environment['SSH_AUTH_SOCK'] = socket
         with patch.object(access.Path, 'home', return_value=self.home), \
                 patch.object(access.shutil, 'which', return_value='/fixture/tool'), \
-                patch.dict(os.environ, {**self.env, 'AGENT_LOAD': policy}, clear=True), \
+                patch.dict(os.environ, environment, clear=True), \
                 patch.object(access.sys.stdin, 'isatty', return_value=tty), \
                 patch.object(access.subprocess, 'run', side_effect=run), \
                 patch('builtins.input', side_effect=answer if isinstance(answer, list) else [answer]) as prompt, \
                 contextlib.redirect_stdout(io.StringIO()) as output, \
-                contextlib.redirect_stderr(io.StringIO()):
+                contextlib.redirect_stderr(io.StringIO()) as errors:
             access.local_key('generate-user-key')
-        return calls, prompt, output.getvalue()
+        return calls, prompt, output.getvalue() + errors.getvalue()
+
+    def test_generation_policy_agent_and_terminal_matrix(self):
+        before = (self.key.stat().st_mtime_ns, self.public.read_text())
+        for policy in ('ask', 'yes', 'no'):
+            for tty in (True, False):
+                for created in (True, False):
+                    for state in ('unavailable', 'empty', 'loaded', 'add-error'):
+                        with self.subTest(policy=policy, tty=tty, created=created, state=state), \
+                                patch.object(access, 'prepare_human_key', return_value=created):
+                            calls, prompt, output = self.run_local_key(
+                                'yes', policy=policy, tty=tty, existing=state == 'loaded',
+                                available=state != 'unavailable', add_result=1 if state == 'add-error' else 0)
+                            requested = policy == 'yes' or (policy == 'ask' and created and tty)
+                            added = requested and tty and state in ('empty', 'add-error')
+                            self.assertEqual(prompt.call_count, int(policy == 'ask' and created and tty))
+                            self.assertEqual(any(cmd[:2] == ['ssh-add', '-l'] for cmd, _ in calls), requested)
+                            self.assertEqual(any(cmd[:2] == ['ssh-add', '-q'] for cmd, _ in calls), added)
+                            failed = requested and (state == 'unavailable' or
+                                                    (state != 'loaded' and (not tty or state == 'add-error')))
+                            self.assertEqual('agent loading failed' in output, failed)
+                            self.assertEqual((self.key.stat().st_mtime_ns, self.public.read_text()), before)
+
+    def test_generation_without_agent_socket_preserves_key(self):
+        for socket in (None, '', str(self.home / 'nonexistent.sock')):
+            with self.subTest(socket=socket), patch.object(access, 'prepare_human_key', return_value=True):
+                calls, prompt, output = self.run_local_key('yes', socket=socket, available=False)
+                prompt.assert_called_once()
+                self.assertIn('SSH agent unavailable', output)
+                self.assertIn('Key preserved', output)
+                self.assertFalse(any(cmd[:2] == ['ssh-add', '-q'] for cmd, _ in calls))
+                self.assertEqual(self.key.stat().st_mode & 0o777, 0o600)
+
+    def test_load_command_propagates_unavailable_agent_for_every_policy(self):
+        for policy in ('ask', 'yes', 'no'):
+            for socket in (None, '', str(self.home / 'nonexistent.sock')):
+                environment = {**self.env, 'AGENT_LOAD': policy}
+                if socket is None:
+                    environment.pop('SSH_AUTH_SOCK')
+                else:
+                    environment['SSH_AUTH_SOCK'] = socket
+                def run(command, **kwargs):
+                    if command[0] == 'ssh-keygen':
+                        return self.fingerprint(command, **kwargs)
+                    self.assertEqual(command, ['ssh-add', '-l', '-E', 'sha256'])
+                    self.assertEqual(os.environ.get('SSH_AUTH_SOCK'), socket)
+                    self.assertEqual(kwargs['timeout'], 10)
+                    return subprocess.CompletedProcess(command, 2, '', 'agent unavailable')
+                with self.subTest(policy=policy, socket=socket), \
+                        patch.dict(os.environ, environment, clear=True), \
+                        patch.object(access.subprocess, 'run', side_effect=run), \
+                        self.assertRaisesRegex(ValueError, 'SSH agent unavailable'):
+                    access.local_key('load-user-key')
 
     def test_new_pair_yes_enter_and_no_prompt_choices(self):
         for answer, wants_add in [('Y', True), ('', True), ('N', False)]:
@@ -127,6 +201,7 @@ class AgentTests(unittest.TestCase):
                 patch.object(access.subprocess, 'run', side_effect=[self.fingerprint(
                     ['ssh-keygen', '-l', '-E', 'sha256', '-f', str(self.public)]),
                     subprocess.CompletedProcess(['ssh-add'], 1, '', '')]) as run, \
+                patch.object(access.sys.stdin, 'isatty', return_value=False), \
                 patch.dict(os.environ, self.env, clear=True), self.assertRaisesRegex(ValueError, 'terminal'):
             access.load_agent_key(self.key, self.public)
         self.assertEqual(len(run.call_args_list), 2)

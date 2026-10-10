@@ -34,6 +34,8 @@ class CLIConnectionTests(unittest.TestCase):
         self.write_inventory()
         for mock in (patch.object(access.Path, 'home', return_value=self.home),
                      patch.object(access.shutil, 'which', side_effect=lambda name: '/fixture/' + name),
+                     patch.object(access.sys.stdin, 'isatty', return_value=False),
+                     patch('builtins.input', side_effect=AssertionError('Unexpected terminal prompt')),
                      patch.dict(os.environ, {'HUMAN_USER': 'person'}, clear=True)):
             mock.start()
             self.addCleanup(mock.stop)
@@ -73,12 +75,14 @@ class CLIConnectionTests(unittest.TestCase):
                 self.pair()
             return self.local_run(command, **kwargs)
         with patch.object(access.sys.stdin, 'isatty', return_value=True), \
+                patch('builtins.input', return_value='n') as prompt, \
                 patch.object(access.subprocess, 'run', side_effect=generate), \
                 patch.object(access, 'load_host', side_effect=AssertionError('Inventory is not needed')), \
                 patch.object(access, 'prerequisites', side_effect=AssertionError('Ansible is not needed')), \
                 patch.object(access.Path, 'read_bytes', side_effect=AssertionError('Private bytes must not be read')), \
                 contextlib.redirect_stdout(io.StringIO()):
             access.local_key('generate-user-key')
+        prompt.assert_called_once_with('Add private key to ssh-agent? [Y/n]: ')
         self.assertEqual(self.key.parent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.key.stat().st_mode & 0o777, 0o600)
 
