@@ -1,5 +1,5 @@
 ---
-bootstrap_user_name: ansible
+bootstrap_user_name: "{{ ansible_user }}"
 bootstrap_user_home: "/home/{{ bootstrap_user_name }}"
 bootstrap_user_shell: /bin/bash
 bootstrap_user_public_key_path: ""

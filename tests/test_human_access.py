@@ -39,12 +39,22 @@ class HumanWrapperTests(unittest.TestCase):
                        'firewall_allowed_tcp_ports': [80, 443]}
         self.env = {'HUMAN_USER': 'operator', 'HUMAN_SUDO': 'admin', 'HUMAN_KEY': str(self.key)}
         self.events = []
+        self.public_key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA human\n'
+        self.controller_public = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB controller\n'
+        Path(str(self.key) + '.pub').write_text(self.public_key)
+        Path(str(self.automation) + '.pub').write_text(self.controller_public)
+        for public in (Path(str(self.key) + '.pub'), Path(str(self.automation) + '.pub')):
+            public.chmod(0o600)
         for name, options in (
             ('prerequisites', {}), ('check_key', {}), ('known_host', {}),
+            ('managed_access', {'return_value': ('ansible', self.automation)}),
             ('load_host', {'return_value': ('portfolio', 'fixture.example.test', 2222, 'root', '/usr/bin/python3')}),
             ('hardening_inputs', {'return_value': self.inputs}),
             ('public_key_file', {'side_effect': lambda value: Path(value)}),
+            ('public_fingerprint', {'return_value': 'SHA256:synthetic'}),
             ('prepare_key', {'side_effect': lambda *a, **kw: self.events.append('generate')}),
+            ('prepare_human_key', {'side_effect': self.prepare_human_key}),
+            ('user_probe', {'side_effect': self.user_probe}),
             ('verify_hardening', {'side_effect': lambda *a: self.events.append('automation')}),
             ('verify_human', {'side_effect': lambda *a: self.events.append('human')}),
             ('verify_auth_methods', {}),
@@ -54,9 +64,18 @@ class HumanWrapperTests(unittest.TestCase):
             setattr(self, name, mocked.start())
             self.addCleanup(mocked.stop)
         for mocked in (patch.dict(os.environ, self.env, clear=True), patch('builtins.print'),
+                       patch('builtins.input', return_value='yes'),
                        patch.object(access.sys.stdin, 'isatty', return_value=True)):
             mocked.start()
             self.addCleanup(mocked.stop)
+
+    def prepare_human_key(self, key, name):
+        self.events.append('generate')
+        Path(str(key) + '.pub').write_text(self.public_key)
+
+    def user_probe(self, host, port, interpreter, key, controller, params):
+        self.events.append('user_probe:' + params['action'])
+        return {'token': 'synthetic-token'}
 
     def test_privilege_inputs_reject_sudo_injection_and_system_groups(self):
         for bad in ({'HUMAN_USER': 'root'}, {'HUMAN_USER': 'ansible'}, {'HUMAN_GROUPS': 'docker'},
@@ -67,8 +86,63 @@ class HumanWrapperTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 access.human_inputs(self.env | bad)
         valid = access.human_inputs({'HUMAN_USER': 'reader', 'HUMAN_SUDO': 'restricted',
-                                    'HUMAN_SUDO_COMMANDS': '/usr/bin/id', 'HUMAN_GROUPS': 'readers'})
+                                    'HUMAN_SUDO_COMMANDS': '/usr/bin/id', 'HUMAN_GROUPS': 'readers',
+                                    'HUMAN_GROUPS_APPROVED': 'readers'})
         self.assertEqual(valid['human_access_user_sudo_commands'], ['/usr/bin/id'])
+
+    def test_group_policy_matches_ansible_assertions_for_all_sudo_modes(self):
+        from ansible.parsing.dataloader import DataLoader
+        from ansible.playbook.conditional import Conditional
+        from ansible.template import Templar
+
+        tasks = yaml.safe_load((ROOT / 'roles/human_access/tasks/main.yml').read_text())
+        defaults = yaml.safe_load((ROOT / 'roles/human_access/defaults/main.yml').read_text())
+        # Evaluate the actual role's pre-mutation assertions offline, with no playbook execution.
+        cases = [('', '', True), ('readers', '', False), ('readers', 'readers', True),
+                 ('nonexistent', '', False), ('nonexistent', 'nonexistent', True),
+                 ('custom_device_access', '', False), ('custom_device_access', 'custom_device_access', True),
+                 ('readers', 'other', False), ('readers', 'readers,readers', False)]
+        for group in ('root', 'ansible', 'docker', 'lxd', 'disk', 'shadow', 'libvirt', 'libvirt-qemu',
+                      'incus', 'incus-admin', 'adm', 'systemd-journal', 'kvm', 'sudoers', 'wheel',
+                      'storage', 'input', 'video', 'render'):
+            cases.append((group, group, False))
+        for policy in ('none', 'restricted', 'admin'):
+            for groups, approved, accepted in cases + [('sudo', '', policy == 'admin'),
+                                                     ('admin', '', policy == 'admin')]:
+                with self.subTest(policy=policy, groups=groups, approved=approved):
+                    env = {'HUMAN_USER': 'reader', 'HUMAN_SUDO': policy, 'HUMAN_GROUPS': groups,
+                           'HUMAN_GROUPS_APPROVED': approved}
+                    if policy == 'restricted':
+                        env['HUMAN_SUDO_COMMANDS'] = '/usr/bin/id'
+                    if accepted:
+                        values = access.human_inputs(env)
+                        self.assertEqual(values['human_access_user_groups'], groups.split(',') if groups else [])
+                    else:
+                        with self.assertRaises(ValueError):
+                            access.human_inputs(env)
+                    variables = defaults | {'ansible_user': 'ansible', 'ansible_connection': 'ssh',
+                                            'human_access_user_name': 'reader',
+                                            'human_access_user_groups': groups.split(',') if groups else [],
+                                            'human_access_user_approved_groups': approved.split(',') if approved else [],
+                                            'human_access_user_sudo': policy,
+                                            'human_access_user_sudo_commands': ['ALL'] if policy == 'admin' else
+                                            ['/usr/bin/id'] if policy == 'restricted' else []}
+                    loader = DataLoader()
+                    templar = Templar(loader=loader, variables=variables)
+                    results = []
+                    for task in tasks[:2]:
+                        condition = Conditional(loader=loader)
+                        condition.when = task['ansible.builtin.assert']['that']
+                        results.append(condition.evaluate_conditional(templar, variables))
+                    self.assertEqual(all(results), accepted)
+
+    def test_unapproved_group_blocks_before_host_contact_even_without_tty(self):
+        with patch.dict(os.environ, {'HUMAN_GROUPS': 'unreviewed'}), \
+                patch.object(access.sys.stdin, 'isatty', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'HUMAN_GROUPS_APPROVED'):
+                access.human_access('add-user', self.inventory, self.automation)
+        self.assertEqual(self.events, [])
+        self.run_playbook.assert_not_called()
 
     def test_key_storage_boundary_and_separate_automation_key(self):
         with patch.object(access.Path, 'home', return_value=self.directory):
@@ -82,19 +156,85 @@ class HumanWrapperTests(unittest.TestCase):
         self.run_playbook.assert_not_called()
 
     def test_add_user_preflight_creation_and_fresh_verification(self):
-        access.human_access('add-user', self.inventory, self.automation)
-        self.assertEqual(self.events, ['automation', 'generate', 'add-user.yml', 'human'])
+        with patch('builtins.input', side_effect=[self.public_key.strip(), 'yes']):
+            access.human_access('add-user', self.inventory, self.automation)
+        self.assertEqual(self.events, ['automation', 'user_probe:preflight-add-user', 'add-user.yml',
+                                       'user_probe:show-user', 'user_probe:add-user-key'])
         variables = self.run_playbook.call_args.args[2]
-        self.assertEqual(variables['human_access_user_public_key_path'], str(self.key) + '.pub')
+        self.assertFalse(Path(variables['human_access_user_public_key_path']).exists())
         self.assertNotIn('ansible_become', variables)
         self.assertEqual(variables['ansible_user'], 'ansible')
 
     def test_public_only_import_never_generates_or_claims_verified_access(self):
-        with patch.dict(os.environ, {'HUMAN_PUBLIC_KEY': str(self.directory / 'import.pub')}):
+        imported_key = self.directory / 'import.pub'
+        imported_key.write_text(self.public_key)
+        with patch.dict(os.environ, {'HUMAN_PUBLIC_KEY': str(imported_key)}):
             access.human_access('add-user', self.inventory, self.automation)
-        self.assertEqual(self.events, ['automation', 'add-user.yml'])
+        self.assertEqual(self.events, ['automation', 'user_probe:preflight-add-user', 'add-user.yml',
+                                       'user_probe:show-user', 'user_probe:add-user-key'])
         self.prepare_key.assert_not_called()
         self.verify_human.assert_not_called()
+        self.assertFalse(self.key.exists())
+
+    def assert_no_live_calls(self):
+        self.assertEqual(self.events, [])
+        for boundary in (self.known_host, self.verify_hardening, self.verify_human,
+                         self.run_playbook, self.user_probe, self.verify_auth_methods):
+            boundary.assert_not_called()
+
+    def test_copied_identity_with_different_comments_blocks_all_human_stages(self):
+        public = Path(str(self.key) + '.pub')
+        copied = ' '.join(self.controller_public.split()[:2]) + ' another-pc\n'
+        public.write_text(copied)
+        for mode in ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'):
+            for imported in (False, True):
+                with self.subTest(mode=mode, imported=imported), \
+                        patch.dict(os.environ, {'HUMAN_PUBLIC_KEY': str(public)} if imported else {}), \
+                        patch('builtins.input', return_value=copied.strip()):
+                    with self.assertRaisesRegex(ValueError, 'SSH key identities'):
+                        access.human_access(mode, self.inventory, self.automation)
+                self.assert_no_live_calls()
+
+    def test_import_cannot_hide_controller_identity_in_selected_human_pair(self):
+        imported = self.directory / 'import.pub'
+        imported.write_text(self.public_key)
+        Path(str(self.key) + '.pub').write_text(self.controller_public)
+        for mode in ('verify-user', 'secure-ssh'):
+            with self.subTest(mode=mode), patch.dict(os.environ, HUMAN_PUBLIC_KEY=str(imported)), \
+                    self.assertRaisesRegex(ValueError, 'must correspond'):
+                access.human_access(mode, self.inventory, self.automation)
+            self.assert_no_live_calls()
+
+    def test_invalid_or_missing_public_material_blocks_before_live_calls(self):
+        original = load('identity_validation_access', 'scripts/access.py')
+        for selected in (self.key, self.automation):
+            public = Path(str(selected) + '.pub')
+            saved = public.read_text()
+            for invalid in (None, 'invalid', 'ssh-ed25519 AAAA invalid-blob',
+                            'from="host" ' + self.public_key, self.public_key * 2):
+                with self.subTest(selected=selected.name, invalid=invalid):
+                    if invalid is None:
+                        public.unlink()
+                    else:
+                        public.write_text(invalid)
+                    for mode in ('add-user', 'verify-user', 'secure-ssh'):
+                        with patch.object(access, 'public_key_file', original.public_key_file), \
+                                patch.dict(os.environ, HUMAN_PUBLIC_KEY=str(self.key) + '.pub'), \
+                                self.assertRaises((ValueError, OSError)):
+                            access.human_access(mode, self.inventory, self.automation)
+                        self.assert_no_live_calls()
+                    public.write_text(saved)
+                    public.chmod(0o600)
+
+    def test_public_identity_validates_without_reading_private_material(self):
+        original = load('public_identity_access', 'scripts/access.py')
+        public = Path(str(self.key) + '.pub')
+        controller = Path(str(self.automation) + '.pub')
+        self.assertNotEqual(original.public_key_identity(public), original.public_key_identity(controller))
+        public.write_text(' '.join(self.controller_public.split()[:2]) + ' changed-comment\n')
+        self.assertEqual(original.public_key_identity(public), original.public_key_identity(controller))
+        self.assertFalse(self.key.exists())
+        self.assertFalse(self.automation.exists())
 
     def test_access_failure_blocks_any_ssh_mutation(self):
         self.verify_human.side_effect = subprocess.CalledProcessError(1, ['fixture'])
@@ -130,7 +270,7 @@ class HumanWrapperTests(unittest.TestCase):
         with patch.object(original, 'check_key'), patch.object(original, 'public_key_file'), \
                 patch.object(original, 'run_playbook') as run:
             original.verify_human(self.inventory, 'portfolio', 'fixture.example.test', 2222,
-                                  {'ansible_ssh_args': access.SSH_BASE + ' -o IdentityAgent=none'},
+                                  {'ansible_user': 'ansible', 'ansible_ssh_args': access.SSH_BASE},
                                   self.inputs, human, self.key)
         self.assertEqual([call.args[2]['ansible_port'] for call in run.call_args_list], [2222, 2200])
         for call in run.call_args_list:
@@ -325,6 +465,32 @@ class HumanAccountPreflightTests(unittest.TestCase):
             human_info.inspect(self.module)
         record.write_text(json.dumps(self.module.params | {'groups': ['readers']}))
         with self.assertRaisesRegex(ValueError, 'Group removal'):
+            human_info.inspect(self.module)
+
+    def test_removed_receipt_blocks_direct_ansible_creation(self):
+        (human_info.STATE_ROOT / 'operator.removed').write_text('{}')
+        with self.assertRaisesRegex(human_info.PreflightError, 'cannot be recreated'):
+            human_info.inspect(self.module)
+        self.module.run_command.assert_not_called()
+
+    def test_direct_ansible_cannot_mutate_existing_accounts_or_add_controller_key(self):
+        from test_user_management import key
+        self.module.params.update(controller='controller', public_key=key(2))
+        with patch.object(human_info, 'controller_state', return_value={'fingerprints': [human_info.fingerprint(key(1))]}), patch.object(human_info, 'ssh_sources', return_value=[]):
+            self.assertFalse(human_info.inspect(self.module))
+            (human_info.STATE_ROOT / 'operator.json').write_text('{}')
+            with self.assertRaisesRegex(human_info.PreflightError, 'locked add-user-key'):
+                human_info.inspect(self.module)
+            self.module.params['identity_only'] = True
+            self.assertFalse(human_info.inspect(self.module))
+            self.module.params['public_key'] = key(1) + ' another-comment'
+            with self.assertRaisesRegex(human_info.PreflightError, 'independent'):
+                human_info.inspect(self.module)
+
+    def test_existing_group_addition_is_not_implicitly_approved(self):
+        (human_info.STATE_ROOT / 'operator.json').write_text(json.dumps(self.module.params))
+        self.module.params['groups'] = ['readers']
+        with self.assertRaisesRegex(human_info.PreflightError, 'separately reviewed migration'):
             human_info.inspect(self.module)
 
     def test_untrusted_metadata_is_rejected(self):

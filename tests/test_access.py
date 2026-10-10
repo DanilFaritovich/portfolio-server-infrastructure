@@ -408,7 +408,7 @@ class AccessTests(unittest.TestCase):
         variables = {
             'ansible_connection': access.PASSWORD_CONNECTION, 'ansible_user': 'root',
             'ansible_paramiko_host_key_checking': True,
-            'bootstrap_user_name': 'ansible', 'bootstrap_user_public_key_path': str(public),
+            'bootstrap_user_name': 'automation', 'bootstrap_user_public_key_path': str(public),
             'bootstrap_user_allow_passwordless_sudo': True,
         }
         for state in ('regular', 'missing', 'symlink'):
@@ -532,6 +532,7 @@ class HostTrustTests(unittest.TestCase):
         for answer in ('no', '', 'maybe', EOFError()):
             with self.subTest(answer=answer), patch.object(access, 'prerequisites'), \
                     patch.object(access, 'load_host', return_value=('portfolio', self.host, 22, 'root', '/usr/bin/python3')), \
+                    patch.object(access, 'managed_access', return_value=('ansible', self.home / 'automation')), \
                     patch.object(access, 'prepare_key') as key, patch.object(access, 'run_playbook') as playbook:
                 self.prompt.side_effect = answer if isinstance(answer, Exception) else None
                 self.prompt.return_value = answer
@@ -548,6 +549,7 @@ class HostTrustTests(unittest.TestCase):
 
         with patch.object(access, 'prerequisites'), \
                 patch.object(access, 'load_host', return_value=('portfolio', self.host, 22, 'root', '/usr/bin/python3')), \
+                    patch.object(access, 'managed_access', return_value=('ansible', self.home / 'automation')), \
                 patch.object(access, 'prepare_key', side_effect=prepare) as key, \
                 patch.object(access, 'run_playbook') as playbook:
             access.live('bootstrap-user', self.home / 'fixture.yml', self.home / 'automation')

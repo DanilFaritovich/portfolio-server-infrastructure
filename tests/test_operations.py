@@ -568,6 +568,7 @@ class OperationsWrapperTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         for name in ('prerequisites', 'check_key', 'known_host'):
             self.stack.enter_context(patch.object(access, name))
+        self.stack.enter_context(patch.object(access, 'managed_access', return_value=('ansible', Path('/opaque-key'))))
         self.stack.enter_context(patch.object(access, 'load_host', return_value=('fixture', 'fixture.example.test', 2222, 'root', '/usr/bin/python3')))
         self.stack.enter_context(patch.object(access, 'hardening_inputs', return_value={'ssh_listen_ports': [2222], 'firewall_allowed_tcp_ports': [80, 443]}))
         self.real_probe = access.operations_probe
@@ -607,7 +608,7 @@ class OperationsWrapperTests(unittest.TestCase):
     def test_stream_payload_and_transport_are_read_only(self):
         result = {'ready': True, 'report': 'PASS'}
         with patch.object(access.subprocess, 'run', side_effect=[SimpleNamespace(returncode=0, stdout='ansible'), SimpleNamespace(returncode=0, stdout=json.dumps(result))]) as run:
-            self.real_probe('fixture.example.test', 2222, '/usr/bin/python3', Path('/opaque-key'), 'portfolio_operations_info.py', {'verify': True})
+            self.real_probe('fixture.example.test', 2222, '/usr/bin/python3', Path('/opaque-key'), 'portfolio_operations_info.py', {'verify': True}, 'ansible')
         self.assertEqual(run.call_count, 2)
         call = run.call_args
         self.assertIn('sudo -n /usr/bin/python3 -I -B -', call.args[0])

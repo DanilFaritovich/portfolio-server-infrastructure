@@ -1,0 +1,23 @@
+---
+- name: Preview or repair only the managed one-line APT policy drift
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Require strict managed non-interactive access and explicit apply confirmation
+      ansible.builtin.assert:
+        that:
+          - ansible_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+          - ansible_user != 'root'
+          - ansible_connection == 'ssh'
+          - ansible_private_key_file is defined
+          - ansible_host_key_checking | bool
+          - ansible_become_flags == '-n'
+          - ansible_check_mode or portfolio_apt_confirmed | default(false) | bool
+        quiet: true
+
+    - name: Guard and apply only the existing APT template
+      portfolio_apt_policy:
+        candidate: "{{ lookup('ansible.builtin.template', '../roles/server_operations/templates/apt-security.j2') }}"
+        confirmed: "{{ portfolio_apt_confirmed | default(false) | bool }}"
+      become: true

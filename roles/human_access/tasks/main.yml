@@ -2,19 +2,34 @@
 - name: Validate human account and explicit privilege policy
   ansible.builtin.assert:
     that:
-      - ansible_user == 'ansible'
+      - ansible_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+      - ansible_user != 'root'
       - ansible_connection == 'ssh'
       - human_access_user_name is match('^[a-z_][a-z0-9_-]{0,30}$')
-      - human_access_user_name not in ['root', 'ansible']
+      - human_access_user_name not in ['root', ansible_user]
       - human_access_user_groups is sequence and human_access_user_groups is not string
       - human_access_user_groups | unique | length == human_access_user_groups | length
-      - human_access_user_groups | intersect(['root', 'ansible', 'docker', 'lxd', 'disk', 'shadow']) | length == 0
+      - >-
+        human_access_user_groups | intersect(['root', ansible_user, 'docker', 'lxd', 'disk', 'shadow',
+        'libvirt', 'libvirt-qemu', 'incus', 'incus-admin', 'adm', 'systemd-journal', 'kvm', 'sudoers',
+        'wheel', 'storage', 'input', 'video', 'render']) | length == 0
       - human_access_user_sudo in ['none', 'admin', 'restricted']
       - human_access_user_sudo == 'admin' or human_access_user_groups | intersect(['sudo', 'admin']) | length == 0
       - human_access_user_sudo != 'admin' or human_access_user_sudo_commands == ['ALL']
       - human_access_user_sudo != 'none' or human_access_user_sudo_commands | length == 0
       - human_access_user_sudo != 'restricted' or human_access_user_sudo_commands | length > 0
     fail_msg: Use a separate human account and an explicit supported group/sudo policy.
+    quiet: true
+
+- name: Require explicit acceptance of reviewed group rights independently of sudo
+  ansible.builtin.assert:
+    that:
+      - human_access_user_approved_groups is sequence and human_access_user_approved_groups is not string
+      - human_access_user_approved_groups | unique | length == human_access_user_approved_groups | length
+      - human_access_user_approved_groups | sort == human_access_user_groups | difference(['sudo', 'admin']) | sort
+    fail_msg: >-
+      Set human_access_user_approved_groups to the exact non-sudo groups only after reviewing their server-side rights.
+      Membership may grant sensitive file/log/device access or administrative operations, regardless of sudo policy.
     quiet: true
 
 - name: Validate each supplementary group name
@@ -46,6 +61,8 @@
 
 - name: Inspect account ownership and privilege state before mutation
   portfolio_human_info:
+    controller: "{{ ansible_user }}"
+    public_key: "{{ bootstrap_user_public_key }}"
     name: "{{ human_access_user_name }}"
     groups: "{{ human_access_user_groups }}"
     sudo: "{{ human_access_user_sudo }}"

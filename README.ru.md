@@ -5,7 +5,7 @@
 Provisioning VPS на Ubuntu через Ansible. Pipeline:
 
 ```text
-local setup -> bootstrap managed ansible user -> verify access
+local setup -> bootstrap managed automation user -> verify access
 -> provision Docker host -> verify Docker
 -> firewall + validated SSH host ports -> verify hardening
 -> human access -> verify users -> final SSH policy -> verify SSH security
@@ -56,7 +56,8 @@ Python и `.venv`; он не уничтожает их и не переуста�
 Установка пакетов согласует pinned requirements, существующие collections и
 совместимый actionlint переиспользуются. Setup требует сеть для dependency
 sources, но никогда не подключается к VPS. В стандартном сценарии измените только hostname/address
-и текущий SSH-порт; `ansible_user` по умолчанию — `root`. Сохраните структуру
+и текущий SSH-порт. `bootstrap_login_user` по умолчанию — `root`;
+`ansible_user` выбирает рабочего пользователя, а `ansible_private_key_file` — путь к его ключу. Сохраните структуру
 `bootstrap` с одним хостом; не записывайте пароли или содержимое ключей в inventory.
 
 Версии collections закреплены в `collections.yml`; setup/deps устанавливают их явно.
@@ -87,14 +88,14 @@ recovery console и рабочую административную сессию
 См. [OpenSSH ssh-keyscan](https://man.openbsd.org/ssh-keyscan)
 и [ssh-keygen](https://man.openbsd.org/ssh-keygen).
 Заранее подтвердите VPS prerequisites и включение sudoers.d. Не выбирайте чужую
-существующую учётную запись как управляемого пользователя `ansible`.
+существующую учётную запись как управляемого пользователя `ansible_user`.
 
 ## Доступ и безопасность
 
-Стандартный путь: **root + интерактивный SSH password → ansible + dedicated
-SSH key + NOPASSWD sudo**. Root используется только для initial bootstrap.
-Дальнейшее provisioning должно использовать `ansible`; `make verify-access` явно
-переопределяет начальный login из inventory на `ansible` и не использует root password.
+Стандартный путь: **bootstrap_login_user + интерактивный SSH password →
+ansible_user + dedicated SSH key + NOPASSWD sudo**. Начальный login используется
+только для bootstrap. Все операции и проверки Stage 1–5 используют рабочего
+пользователя и ключ из inventory через независимый key-only SSH и `sudo -n`.
 
 `make bootstrap-user` локально создаёт Ed25519 key, если оба файла пары отсутствуют,
 непосредственно перед bootstrap. `make setup` не генерирует SSH keys:
@@ -110,7 +111,7 @@ SSH key + NOPASSWD sudo**. Root используется только для ini
 Wrapper проверяет только metadata private key; private key остаётся на
 контроллере и используется только его SSH-клиентом. Bootstrap role получает
 только путь public key, читает публичный ключ локально и добавляет его в
-`/home/ansible/.ssh/authorized_keys`, сохраняя посторонние authorized keys.
+`/home/<ansible_user>/.ssh/authorized_keys`, сохраняя посторонние authorized keys.
 Не добавляйте SSH keys, реальные inventories, credentials и логи в Git.
 
 Проверка и чтение public key выполняются в явно локальном controller block
@@ -120,12 +121,12 @@ inventory overlay (0600, удаляется после завершения Ansi
 connection extra-vars; delegated localhost сохраняет локальный context.
 В `-e` остаются только role inputs. Overlay не содержит паролей или содержимого ключей.
 
-Generated keys создаются **без passphrase** для unattended provisioning.
+Ключи, автоматически создаваемые `bootstrap-user`, остаются **без passphrase** для unattended provisioning. Существующий зашифрованный ключ можно использовать после загрузки в локальный SSH agent.
 Обладание этим private automation key вместе с неограниченным `NOPASSWD: ALL`
 фактически даёт **root-equivalent access к VPS**. Защитите контроллер и резервные
 копии ключа. Запуск `make bootstrap-user` явно разрешает эту policy; default consent
-роли остаётся `false`. Отдельный `/etc/sudoers.d/ansible` принадлежит root,
-имеет `0440` и проверяется через `visudo -cf`. Login password для `ansible` не задаётся.
+роли остаётся `false`. Отдельный `/etc/sudoers.d/<ansible_user>` принадлежит root,
+имеет `0440` и проверяется через `visudo -cf`. Login password для `ansible_user` не задаётся.
 
 Initial root connection использует локальный адаптер `portfolio_password` поверх
 `ansible.builtin.paramiko_ssh` из pinned
@@ -146,7 +147,9 @@ Initial bootstrap отключает SSH agent authentication и поиск priv
 проверяет подтверждённую запись `known_hosts`; автоматическое добавление host keys
 отключено. Автоматическая handoff verification и `make verify-access` используют
 **OpenSSH + dedicated private key + public-key-only authentication**, с отключёнными
-password prompts и agent. Paramiko используется только для initial password bootstrap.
+password prompts и поддержкой выбранного ключа через `ssh-agent`. Paramiko используется
+для initial password bootstrap и криптографической проверки SSH host key
+при переносе доверия между портами.
 См. [документацию pinned Ansible Paramiko transport](https://docs.ansible.com/projects/ansible-core/2.18/collections/ansible/builtin/paramiko_ssh_connection.html).
 В новых версиях Ansible plugin deprecated и запланирован к удалению в 2.21;
 перед обновлением Ansible до этой версии нужно пересмотреть initial password transport.
@@ -157,8 +160,18 @@ password prompts и agent. Paramiko используется только для
 | --- | --- | --- |
 | `make setup` | Установить local dependencies; создать отсутствующий inventory | Только dependency registries |
 | `make deps` | Установить pinned local tooling/collections | Только dependency registries |
+| `make generate-user-key` | Создать локальную пару Ed25519 и предложить загрузку в agent | **LOCAL / ключ и локальный agent** |
+| `make load-user-key` | Загрузить выбранный существующий ключ в локальный agent | **LOCAL / только agent** |
+| `make show-public-key` | Показать public key и SHA256 fingerprint | **LOCAL / read-only** |
+| `make copy-public-key` | Скопировать public key; предложить установку отсутствующей clipboard-утилиты | **LOCAL / clipboard, опционально APT** |
+| `make copy-server-trust` | Скопировать проверенный trust JSON; предложить установку clipboard-утилиты | **LOCAL / clipboard, опционально APT** |
+| `make show-server-trust` | Экспортировать доверенные OpenSSH host keys и SHA256 fingerprints | **LOCAL / read-only** |
+| `make trust-server` | Импортировать проверенные host keys; опционально доказать trust другого порта inventory | **LOCAL / known_hosts; опционально LIVE host-only handshake** |
+| `make show-controller` | Показать доступ из inventory и SSH-команду | **LOCAL / read-only** |
+| `make connect-controller` | Рабочий SSH; предложить проверенное доверие для нового порта | **LIVE / интерактивная сессия** |
+| `make connect-user` | Интерактивный SSH под указанным пользователем | **LIVE / интерактивная сессия** |
 | `make bootstrap-user` | Создать/использовать dedicated key, bootstrap account, проверить доступ | **LIVE / MUTATING** |
-| `make verify-access` | Проверить существующий key-only доступ ansible | **LIVE / verification**, без изменений managed configuration |
+| `make verify-access` | Проверить key-only доступ managed user из inventory | **LIVE / verification**, без изменений managed configuration |
 | `make docker-host` | Установить Docker, logging policy и настроить services | **LIVE / MUTATING**, managed key-only access |
 | `make verify-docker` | Проверить Docker/services и disposable container | **LIVE / verification**, временные container/image-cache changes |
 | `make inspect-hardening` | Собрать все Stage 3 safety findings перед harden | **LIVE / read-only**, exit 0 для PASS/WARN, non-zero для FAIL |
@@ -171,7 +184,7 @@ password prompts и agent. Paramiko используется только для
 Bootstrap проверяет prerequisites, local inventory, host/port и запись known_hosts
 с явным подтверждением first-use trust до генерации ключа и запроса начального пароля. Затем запускает существующую роль
 с explicit sudo consent и открывает независимые key-only SSH connections как
-`ansible`. Verification проверяет Ansible ping, `id -un == ansible` и
+`ansible_user`. Verification проверяет Ansible ping, `id -un == ansible_user` и
 `sudo -n id -u == 0`; ошибка любой стадии завершает workflow с ошибкой.
 Повторное использование начального SSH-соединения отключено. Docker provisioning запускается отдельным явным target; access verification его не выполняет.
 
@@ -215,11 +228,11 @@ Controller-key regression test запускает реальный локаль�
 `make docker-host` использует существующий access wrapper, dedicated key и
 строгий trust из `known_hosts`. Он не генерирует ключи и не принимает новый host
 trust. До любых Docker mutation выполняется `playbooks/verify.yml`: login должен
-быть `ansible`, а `sudo -n` — возвращать UID 0. Если ключа нет, сообщение предлагает
+быть `ansible_user`, а `sudo -n` — возвращать UID 0. Если ключа нет, сообщение предлагает
 `make bootstrap-user`; ошибка login/sudo останавливает stage. Docker tasks
 используют privilege escalation только там, где требуется, с non-interactive
-sudo. Пользователь `ansible` не добавляется в группу `docker`. Initial administrator
-из inventory переопределяется только для managed host; controller-local context
+sudo. Рабочий пользователь не добавляется в группу `docker`. Bootstrap login
+используется только для bootstrap; managed access действует для VPS, а controller-local context
 сохраняется.
 
 `playbooks/docker-host.yml` вызывает `roles/docker_host`. Для non-mutating package
@@ -453,7 +466,7 @@ pre-transition drift generated/loaded/live даёт WARN в `make inspect-harden
 [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
 и [OpenSSH configuration](https://man.openbsd.org/sshd_config).
 
-Оба public targets сначала проверяют независимый `ansible` key-only access и
+Оба public targets сначала проверяют независимый `ansible_user` key-only access и
 `sudo -n`. После provisioning wrapper открывает новое соединение на **каждом**
 порту из `ssh_verify_ports` и повторяет access/sudo и hardening checks. Уже доверенная
 host identity закрепляется через
@@ -542,7 +555,7 @@ reboot прервёт текущие SSH sessions. Используйте те �
 make reboot-host INVENTORY=/path/to/local-inventory.yml AUTOMATION_KEY=/path/to/automation-key
 ```
 
-Wrapper сначала проверяет key-only SSH как `ansible` и `sudo -n` на текущем inventory
+Wrapper сначала проверяет key-only SSH как `ansible_user` и `sudo -n` на текущем inventory
 порту. Затем в интерактивном терминале спрашивает `Reboot this host now? [y/N]`.
 Только `y`/`yes` разрешают reboot; пустой ответ, отказ, EOF или Ctrl-C останавливают
 команду. Без TTY запуск отклоняется до обращения к хосту; unattended/force режима нет.
@@ -563,10 +576,387 @@ Docker smoke test может изменить image cache; firewall/SSH provisio
 Offline-тесты подменяют все remote/reboot вызовы; `make check`/CI выполняют только
 syntax-check этого playbook и локальные проверки. Агент не выполнял реальный reboot.
 
+## Настройка рабочего пользователя и миграция
+
+Три поля доступа задаются вместе у хоста в существующей структуре inventory:
+
+```yaml
+bootstrap_login_user: root
+ansible_user: automation
+ansible_private_key_file: ~/.ssh/portfolio-server-infrastructure/automation_ed25519
+```
+
+Путь к ключу должен быть абсолютным или начинаться с `~/`, вне репозитория.
+Bootstrap создаёт выбранного пользователя, добавляет публичный ключ без удаления
+других ключей и устанавливает проверенный через `visudo` фрагмент `NOPASSWD: ALL`.
+Затем независимо проверяет новый key-only login, ping и `sudo -n`. Ошибка проверки
+останавливает выполнение; inventory, старые аккаунты и SSH policy автоматически
+не переключаются и не удаляются.
+
+Старый inventory без обоих новых полей сохраняет прежний смысл: `ansible_user`
+обозначает начальный login (обычно root), а следующие стадии используют старый
+аккаунт `ansible` и прежний ключ либо `AUTOMATION_KEY`. Setup сохраняет существующий
+inventory. Для явной записи прежнего доступа задайте `bootstrap_login_user` равным
+старому initial login, `ansible_user: ansible` и путь к существующему ключу;
+проверьте доступ перед дальнейшей работой. Для нового формата `AUTOMATION_KEY`
+допустим только при совпадении с ключом из inventory; конфликт блокирует команду.
+
+Если первоначальный password bootstrap login ещё работает, можно выбрать новый
+аккаунт/ключ в candidate inventory и выполнить
+`make bootstrap-user INVENTORY=inventories/migration.yml`. Независимая проверка
+должна успешно завершиться до замены старого inventory; старый аккаунт и SSH policy
+сохраняются.
+
+На VPS с завершёнными Stage 4/5 сохраните старый inventory, открытую admin-сессию
+и доступ к консоли провайдера. Не открывайте root/password SSH и не повторяйте
+password bootstrap. Через старый рабочий inventory создайте отдельный ранее
+неиспользованный аккаунт существующим путём `add-user`:
+
+```bash
+make add-user HUMAN_USER=automation HUMAN_SUDO=admin HUMAN_KEY="$HOME/.ssh/portfolio-infra/automation_ed25519"
+make verify-user HUMAN_USER=automation HUMAN_SUDO=admin HUMAN_KEY="$HOME/.ssh/portfolio-infra/automation_ed25519"
+```
+
+Нужна завершённая Stage 3; новый admin проверяется по SSH и sudo. Public-only import
+сам по себе недостаточен: владелец должен независимо доказать доступ. Храните ключ устройства вне репозитория;
+зашифрованный ключ может использовать локальный agent. Сохраните независимый human recovery access. Создайте отдельный ignored candidate
+inventory с `ansible_user: automation`, точным путём к новому ключу и прежними портами.
+До замены рабочего inventory выполните:
+
+```bash
+make verify-access INVENTORY=inventories/migration.yml
+make verify-docker INVENTORY=inventories/migration.yml
+make verify-hardening INVENTORY=inventories/migration.yml
+make verify-ssh-security INVENTORY=inventories/migration.yml HUMAN_USER=operator HUMAN_SUDO=admin HUMAN_KEY="$HOME/.ssh/portfolio-infra/operator_ed25519"
+make verify-operations INVENTORY=inventories/migration.yml
+```
+
+Для SSH security укажите существующего отдельно проверенного human admin.
+Это ручные LIVE-проверки; Docker verification может заполнить image cache.
+При любой ошибке продолжайте использовать старый inventory и recovery access.
+Только после успешных проверок осознанно замените рабочий inventory. Автоматического
+переключения, удаления старого `ansible` или изменения SSH policy при миграции нет.
+Повторное provisioning и проверка идемпотентности остаются отдельно разрешаемыми
+операторскими действиями.
+
+## Локальные ключи и интерактивный SSH
+
+После `make setup` или `make deps` локальным командам ключей нужны OpenSSH client tools,
+но не нужны inventory, Ansible playbook, аккаунт на VPS или подключение к серверу:
+
+```bash
+make generate-user-key HUMAN_USER=operator
+make show-public-key HUMAN_USER=operator
+```
+
+Путь по умолчанию: `~/.ssh/portfolio-infra/operator_ed25519` и соседний `.pub`.
+`KEY_NAME` выбирает другое имя private-key файла в том же каталоге, например
+`KEY_NAME=operator_laptop_ed25519`; каталоги и суффикс `.pub` запрещены.
+`HUMAN_KEY=/absolute/path/to/key` имеет приоритет над `KEY_NAME`. Используйте одинаковые
+параметры для генерации, показа public key и `connect-user`. Существующие пары сохраняются;
+неполные пары, symlinks, небезопасные права/владелец и некорректные public keys блокируют
+операцию. Новые каталоги имеют `0700`, private files — `0600` или строже. Существующие
+права проверяются без автоматического исправления. В репозитории допустим только
+ignored каталог `secrets/portfolio-infra/`; предпочтительны ключи вне репозитория.
+
+Для новой пары нужен терминал: `ssh-keygen` напрямую запрашивает passphrase, не передавая
+её в аргументах и не сохраняя в проекте. Нажатие Enter осознанно создаёт незашифрованный
+ключ. Повторная проверка существующей пары не требует терминала. `show-public-key`
+выводит только публичные algorithm/key без комментария и SHA256 fingerprint;
+нужна полная локальная пара, private file проверяется только по metadata.
+Передавайте администратору только public key. Генерация и показ не создают аккаунт
+и не устанавливают ключ на VPS; это отдельная операция `add-user`. Для нестандартного
+имени передавайте точный путь через `HUMAN_KEY` существующим Stage 4 командам,
+которые сохраняют прежние defaults.
+
+Перед подключением загрузите зашифрованный ключ в существующий локальный `ssh-agent`:
+
+```bash
+make load-user-key HUMAN_USER=operator
+make show-controller
+make connect-controller
+make connect-user HUMAN_USER=operator
+```
+
+Если agent не запущен, сначала запустите локальный `ssh-agent`. `show-controller`
+работает только локально: показывает рабочего пользователя, сервер, текущий порт
+inventory, полный путь к ключу и готовую SSH-команду с shell quoting. Проверяются
+локальная пара и существующее доверие к серверу; отсутствие ключа или trust блокирует
+команду. `connect-controller` использует ту же команду; `connect-user` — сервер/порт
+того же inventory и выбранные human key/login. Обе команды подключения требуют
+терминал и уже установленный соответствующий public key. Они открывают обычный
+интерактивный shell без provisioning или verification playbooks. Действия внутри
+этой сессии могут изменять VPS.
+
+SSH требует доверенную запись в `~/.ssh/known_hosts` для `host` (порт 22) либо
+`[host]:port`. `show-controller` и `connect-user` блокируют отсутствие trust;
+изменившийся host key вызывает отказ при подключении. `connect-controller` может
+предложить проверенный перенос с другого доверенного порта, как описано ниже.
+Для настройки доверия на втором ПК используйте `show-server-trust` и `trust-server`. Trust file и каталог должны принадлежать вам, не быть writable для group/others
+и не быть symlinks. SSH использует strict host checking, выбранный identity и key-only
+authentication; password/keyboard-interactive fallback, agent forwarding, другие
+forwarding и connection sharing отключены. SSH client config не используется, чтобы
+user, host, port и trust source определялись входными параметрами. Пути с control
+characters и OpenSSH expansion tokens запрещены. Разблокированный agent может
+аутентифицировать выбранный зашифрованный ключ; без него будет отказ, а не запрос
+пароля. Agent поддерживается в `connect-controller`, `verify-access`, Ansible Stage 1–5
+и streaming inspectors. Все выбирают явный ключ с `IdentitiesOnly=yes`. Зашифрованный
+ключ требует разблокированного agent в окружении вызывающего shell. Незашифрованные
+ключи продолжают работать без agent. `INVENTORY` и legacy `AUTOMATION_KEY`
+следуют правилам задачи 1; конфликт managed-key override блокирует команду.
+
+### Перенос доверия к серверу на второй компьютер
+
+SSH host keys определяют сервер и отличаются от пользовательских ключей входа.
+Импорт/экспорт не требует private keys или рабочего входа и не использует
+`ssh-keyscan`. Экспорт и импорт исходного trust локальны; `trust-server` отдельно
+предлагает LIVE host-only handshake, если порт inventory отличается от порта JSON.
+
+`copy-server-trust` использует тот же проверенный экспорт и clipboard backend,
+что `copy-public-key`: Wayland (`wl-copy`), X11 (`xclip`/`xsel`) или macOS (`pbcopy`).
+В буфер попадает только JSON; адрес, порт, fingerprints и подтверждение успеха
+остаются в терминале. На Ubuntu/Debian при отсутствии утилиты предлагается APT:
+`Install now? [Y/n]:` (Enter/Y принимает; N отменяет установку и копирование).
+В headless-сессии команда рекомендует `show-server-trust`; неинтерактивный запуск
+не устанавливает пакеты. Ошибки установки или clipboard не сообщают об успехе.
+Для VM нужен настроенный общий буфер либо другой проверенный канал передачи.
+
+1. На уже доверенном ПК экспортируйте существующий trust:
+
+   ```bash
+   make show-server-trust INVENTORY=inventories/production.yml
+   # Или скопируйте только совместимый JSON в desktop clipboard:
+   make copy-server-trust INVENTORY=inventories/production.yml
+   ```
+
+   `show-server-trust` читает используемый проектом источник OpenSSH trust, `~/.ssh/known_hosts`,
+   через OpenSSH lookup, включая hashed-записи и нестандартные порты. Она показывает
+   host, port, каждый публичный host key и SHA256 fingerprint, затем одну JSON-строку
+   для переноса. Другие trust files из client config или системного SSH не используются.
+2. Передайте JSON-строку на ПК 2 через канал с проверенным отправителем. Проверьте
+   источник и сравните fingerprints с ПК 1. Экспорт не доказывает задним числом,
+   как trust появился на ПК 1: исходный компьютер уже должен быть доверенным.
+3. На ПК 2 подготовьте локальный ignored inventory с точно таким же hostname/IP
+   сервера и желаемым SSH-портом, затем выполните импорт:
+
+   ```bash
+   make trust-server INVENTORY=inventories/laptop2.yml
+   ```
+
+   Вставьте JSON-строку в `Host trust data:`. CLI проверит public keys через OpenSSH,
+   пересчитает fingerprints и потребует совпадения hostname/IP с inventory.
+   Порт JSON должен быть целым числом от 1 до 65535 и может отличаться от inventory. Проверьте показанные
+   данные и введите `yes` только после независимой проверки источника.
+   Enter, N, EOF или прерывание отменяют импорт. В non-interactive режиме команда
+   завершается без чтения ввода и записи trust.
+   Для JSON `132.243.166.145:2222` и inventory `132.243.166.145:22` CLI покажет
+   оба endpoint и спросит `Import verified trust for port 2222? [y/N]:`.
+   Подтверждение сохраняет только исходный endpoint `:2222`. Затем появится
+   `Verify and trust configured port 22 now? [y/N]:`. Согласие запускает тот же
+   подписанный Paramiko handshake, что и `connect-controller`, без входа, доступа
+   к agent и удалённых команд. Только совпавший и криптографически доказанный host key
+   допускает отдельное подтверждение `Trust this server on port 22? [y/N]:` и добавление.
+   Успех сообщает `SUCCESS` для endpoint inventory. Уже совпадающий trust не требует
+   probe или дубликатов; импорт при одинаковых портах сохраняет локальный сценарий.
+   Отказ от опционального probe сохраняет исходный trust, оставляя порт 22 недоверенным.
+   Ошибка handshake, недоступный порт, другой ключ или отказ от финального подтверждения
+   останавливают настройку целевого порта с ненулевым кодом и пояснением о сохранении исходного trust.
+   Проверьте endpoint с администратором/через консоль провайдера, затем повторите
+   `trust-server` или `connect-controller`. Конфликтующие записи не заменяются;
+   inventory и listeners/firewall VPS не меняются. Переключать порт вручную не требуется.
+4. Когда выбранный локальный ключ входа доступен, а его public key зарегистрирован
+   на VPS, используйте существующие команды:
+
+   ```bash
+   make show-controller INVENTORY=inventories/laptop2.yml  # локальная проверка
+   make connect-controller INVENTORY=inventories/laptop2.yml  # LIVE SSH
+   make verify-access INVENTORY=inventories/laptop2.yml  # LIVE проверка SSH/sudo
+   ```
+
+Импорт сохраняет посторонние записи и комментарии, распознаёт конфликты и повторные
+ключи (включая hashed-записи) и атомарно заменяет пользовательский trust file только
+при добавлении ключей. Новый каталог `.ssh` получает 0700, записанный `known_hosts` —
+0600. Закрытый локальный lock сериализует импорты; обнаруженное изменение файла после
+проверки блокирует запись. Не редактируйте файл одновременно другими SSH tools.
+Небезопасный владелец/права, symlinks/hardlinks, revoked keys и certificate-authority
+записи блокируют импорт. Конфликт требует диагностики identity/rotation администратором:
+команда не заменяет конфликтующие ключи. Strict checking сохраняется для интерактивного
+SSH и существующего Ansible. Сам импорт trust не даёт права входа или sudo.
+
+Если доверенного ПК нет, получите public SSH host key и его SHA256 fingerprint
+у администратора или через аутентифицированную консоль VPS-провайдера. Попросите
+данные в том же формате, с заполненными проверенными значениями:
+
+```json
+{"version":1,"host":"SERVER_HOST_FROM_INVENTORY","port":2244,"keys":[{"public_key":"ssh-ed25519 VERIFIED_PUBLIC_HOST_KEY","fingerprint":"SHA256:VERIFIED_FINGERPRINT"}]}
+```
+
+Одного fingerprint недостаточно для записи public key. Совпадение fingerprint,
+полученного вместе с непроверенным сетевым ключом, не доказывает identity сервера.
+Не повторяйте password bootstrap на защищённом сервере ради отсутствующего локального trust.
+
+### Переключение SSH-порта с существующим доверием к серверу
+
+После независимой настройки listener/firewall VPS оператором измените только
+`ansible_port` в локальном inventory и выполните:
+
+```bash
+make connect-controller INVENTORY=inventories/laptop2.yml
+```
+
+Если новый endpoint ещё не доверен, интерактивный CLI ищет тот же hostname/IP
+на ранее доверенных портах в локальном `known_hosts`, включая hashed-записи.
+Он показывает прежние endpoints и выполняет SSH handshake на новом порту
+с ограниченными таймаутами через уже закреплённую зависимость Paramiko.
+Negotiation разрешает только алгоритмы host key с существующим доверием,
+включая RSA SHA2. Paramiko проверяет подпись key exchange; предъявленный public
+key также должен совпасть с доверенным. Probe не выполняет пользовательскую
+аутентификацию, не обращается к private keys/agent и не запускает удалённых команд.
+Сетевой scan или совпадение IP сами по себе не разрешают перенос.
+
+Только после доказательства появляется `Trust this server on port …? [y/N]:`.
+Enter/N отменяет подключение без изменения trust. Y добавляет только проверенный
+ключ через существующую атомарную запись с lock и проверкой неизменности snapshot;
+старые endpoints, ключи и комментарии сохраняются. Затем запускается исходная
+OpenSSH-сессия со strict checking и отключённым forwarding. При нескольких
+доверенных алгоритмах добавляется только identity, доказанная этим handshake.
+Повторный запуск использует существующее доверие без probe и дубликатов.
+Закрытый порт, неверная подпись, другой ключ, конфликт identity между портами,
+небезопасные metadata или конкурентное изменение trust останавливают операцию.
+
+Поиск использует точный hostname/IP inventory без DNS aliases, поиска источника
+только по wildcard и сканирования портов. Для hashed-записей имена портов перебираются
+локально; более 32 различных hashed-записей или неподдерживаемый формат приводят
+к безопасному отказу. Используйте явный перенос `show-server-trust`/`trust-server`
+для нужного endpoint. CLI не меняет VPS, inventory или host keys.
+`show-controller` остаётся read-only без probe/import. Неинтерактивные Ansible paths,
+включая `verify-access`, по-прежнему блокируют отсутствие trust без запросов и
+получения ключей из сети. LIVE доступ и clipboard VM проверяет оператор вручную;
+офлайн-тесты не доказывают production access.
+
+### Загрузка в agent и новый компьютер с одним зашифрованным ключом
+
+После создания новой пары `generate-user-key` спрашивает `Add private key to ssh-agent? [Y/n]:`.
+Enter/Y загружает выбранный ключ через штатный OpenSSH `ssh-add`; N пропускает загрузку.
+Passphrase вводится средствами OpenSSH: Python её не читает. Успех выводит только
+fingerprint выбранного публичного ключа. Ошибка agent не отменяет успешную генерацию;
+ключ сохраняется. Отдельная команда `load-user-key` возвращает ненулевой код при ошибке.
+Существующая пара сохраняется без повторного запроса по умолчанию. Для неё используйте
+`load-user-key` с теми же `HUMAN_USER`, `HUMAN_KEY` или `KEY_NAME`.
+Обе команды не требуют inventory и не запускают Ansible playbook.
+
+CLI использует текущий agent, в том числе пустой, и никогда не запускает новый.
+Уже загруженный выбранный fingerprint подтверждается без добавления других identity.
+Отсутствующий/недоступный agent сопровождается инструкцией; зависший запрос agent
+прерывается через 10 секунд. При необходимости запускайте agent в родительском shell:
+
+```bash
+eval "$(ssh-agent -s)"
+make load-user-key HUMAN_USER=portfolio_laptop2
+```
+
+`AGENT_LOAD=ask` (по умолчанию), `yes` или `no` управляет загрузкой при генерации.
+`yes` пропускает подтверждение; `no` исключает обращения к agent. Создание новой пары
+по-прежнему требует TTY для штатного ввода passphrase. Без TTY нет запросов подтверждения
+или passphrase: `load-user-key` подтверждает уже загруженный ключ, но отказывается
+загружать отсутствующий. `AGENT_LOAD=yes` не обходит это правило. Генерация сохраняет
+успешный статус и сообщает об ошибке загрузки; для автоматизации, которой нужен
+ненулевой код ошибки загрузки, используйте `load-user-key`. Askpass при загрузке отключён.
+
+На новом ПК используйте проверенный checkout этой feature и prerequisites OpenSSH client.
+Сохраните отдельного recovery admin и первый controller:
+
+```bash
+make setup INVENTORY=inventories/laptop2.yml
+make generate-user-key HUMAN_USER=portfolio_laptop2
+make load-user-key HUMAN_USER=portfolio_laptop2
+make copy-public-key HUMAN_USER=portfolio_laptop2
+```
+
+Задайте passphrase и согласитесь на загрузку в agent. Если agent отсутствовал, запустите
+его в родительском shell и выполните `load-user-key`. Передайте на ПК 1 только public key
+через проверенный канал или явно настроенный общий буфер VM; CLI не синхронизирует
+буферы между компьютерами. Сверьте SHA256 fingerprint. После отдельного LIVE-разрешения ПК 1 регистрирует
+нового администратора через существующий controller `ansible`:
+
+```bash
+make add-user INVENTORY=inventories/production.yml HUMAN_USER=portfolio_laptop2 \
+  HUMAN_SUDO=admin
+# Вставьте public key после >, сверьте пользователя/права/fingerprint и подтвердите.
+```
+
+`copy-public-key` выбирает тот же ключ, что `show-public-key`, включая `HUMAN_KEY`
+и `KEY_NAME`, и копирует полное содержимое `.pub` вместе с комментарием.
+Нужен только публичный файл: команда не проверяет private member, не подключается
+к серверу и не загружает agent. В Wayland предпочтение отдаётся `wl-copy` (пакет
+`wl-clipboard`), в X11 — `xclip` или `xsel` (одноимённые пакеты).
+В macOS используется встроенный `pbcopy`. В Ubuntu/Debian при отсутствии утилиты
+в терминале появляется `Install now? [Y/n]:`: Enter/Y устанавливает `wl-clipboard`
+или `xclip` через APT (с sudo, если запуск не от root), проверяет наличие утилиты
+и повторяет копирование. N завершает команду без установки и копирования.
+`make setup` не устанавливает clipboard-пакеты. В non-interactive режиме нет запросов
+и установки; в headless Linux предлагается `make show-public-key`. В других Linux
+системах нужна ручная установка. Успех сопровождается SHA256 fingerprint; ошибка
+установки или clipboard завершает команду без сообщения об успешном копировании.
+`show-public-key` остаётся доступной для текстовой передачи без clipboard utilities.
+
+Без `HUMAN_PUBLIC_KEY` команда `add-user` предлагает вставить одну строку plain
+OpenSSH public key в терминале. Для вставки и файла используется одинаковая проверка
+формата и OpenSSH: private-key blocks, key options, несколько ключей и повреждённые
+данные отклоняются. До обращения к серверу CLI показывает пользователя, `HUMAN_SUDO`
+и SHA256 fingerprint, затем запрашивает явное подтверждение с default deny.
+Временный снимок public key хранится в закрытом каталоге, файл имеет `0600`;
+после завершения или ошибки он удаляется. Импорт файла сохранён:
+
+```bash
+make add-user HUMAN_USER=portfolio_laptop2 HUMAN_SUDO=admin \
+  HUMAN_PUBLIC_KEY=/path/portfolio_laptop2_ed25519.pub
+```
+
+Без TTY требуется `HUMAN_PUBLIC_KEY`: существующая автоматизация с явным файлом
+работает без запроса ввода. В терминале импорт файла также требует подтверждения.
+Регистрация добавляет ключ, сохраняя остальные, и сообщает **UNVERIFIED**;
+владелец самостоятельно проверяет SSH и Ansible с ПК 2. При отсутствии public input
+`add-user` больше не создаёт локальный ключ; используйте `generate-user-key` заранее.
+
+На ПК 2 измените только локальный ignored candidate inventory: сохраните проверенные
+host, текущий порт, Python interpreter и hardening port lists; укажите `bootstrap_login_user`
+вместе с `ansible_user: portfolio_laptop2` и
+`ansible_private_key_file: ~/.ssh/portfolio-infra/portfolio_laptop2_ed25519`.
+Используйте `make show-server-trust` на ПК 1 и `make trust-server
+INVENTORY=inventories/laptop2.yml` на ПК 2 по сценарию выше.
+На защищённом сервере не повторяйте bootstrap и не используйте auto-trust.
+После LIVE-разрешения все следующие команды используют один ключ:
+
+```bash
+make show-controller INVENTORY=inventories/laptop2.yml  # только локально
+make connect-controller INVENTORY=inventories/laptop2.yml
+# В новой сессии: id -un -> portfolio_laptop2; sudo -n id -u -> 0; exit
+make connect-user INVENTORY=inventories/laptop2.yml HUMAN_USER=portfolio_laptop2
+make verify-access INVENTORY=inventories/laptop2.yml
+```
+
+`verify-access` проверяет Ansible connectivity, login и noninteractive sudo. Все пути
+OpenSSH/streaming Stage 1–5 наследуют `SSH_AUTH_SOCK` и выбирают явный ключ; второй
+незашифрованный ключ не нужен. Незагруженный зашифрованный ключ получает отказ в batch
+mode без password fallback. Финальная SSH security по-прежнему требует отдельного
+проверенного human admin; `verify-user` не может проверять текущего inventory controller.
+
+В отдельной Ubuntu 24.04 VM сначала выполните offline `make check`. Затем проверьте
+локальную генерацию, Y/Enter/N, `AGENT_LOAD=no`, повторную генерацию, отсутствие agent
+и повторный `load-user-key`. Для проверки отказа завершите только тестовый agent или
+уберите `SSH_AUTH_SOCK`; общий desktop agent не останавливайте. Новые SSH/Ansible-сессии
+с тестовой VM требуют отдельного разрешения, зарегистрированного ключа и проверенного
+host trust. Проверьте, что посторонние загруженные identity не заменяют выбранный ключ.
+Offline mocks не доказывают реальную VM-аутентификацию. Первый controller и recovery
+access сохраняются.
+
 ## Переопределения и troubleshooting
 
-Make поддерживает local inventory path и абсолютный private-key path вне
-репозитория. Используйте одинаковые overrides для всех live targets:
+Make поддерживает local inventory path. Задайте `ansible_private_key_file` в нём.
+`AUTOMATION_KEY` сохранён для legacy inventory; для явного формата он должен
+совпадать с ключом inventory. Override ниже необязателен. Используйте одинаковый
+inventory для всех live targets:
 
 ```bash
 make bootstrap-user INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
@@ -575,18 +965,18 @@ make docker-host INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolut
 make verify-docker INVENTORY=/absolute/path/production.yml AUTOMATION_KEY=/absolute/path/dedicated/key
 ```
 
-Для существующего ключа нужен соседний `.pub`. Используйте dedicated ключ без
-шифрования: encrypted existing keys не смогут аутентифицироваться в
-non-interactive verification этого wrapper. Права существующей key-directory
+Для существующего ключа нужен соседний `.pub`. Зашифрованный ключ работает через
+разблокированный agent в окружении вызывающего shell; сначала выполните
+`make load-user-key HUMAN_USER=… HUMAN_KEY=/absolute/path/to/key`. Права существующей key-directory
 должны быть `0700` или строже; исправляйте небезопасные локальные права осознанно.
 Отсутствующая пара генерируется, но неполная пара автоматически не исправляется
 и не заменяется.
 
-Можно заменить `ansible_user: root` в inventory на существующего администратора
+Можно заменить `bootstrap_login_user: root` в inventory на существующего администратора
 без изменений роли. Нужны SSH password login и sudo; bootstrap тогда также
 запросит sudo password через штатный `--ask-become-pass`. Managed user этих Make
-targets остаётся `ansible`. Inventory поддерживает один хост и только поля host,
-port, initial user, Python interpreter и hardening port lists из example; credentials и дополнительные
+targets выбирается через `ansible_user`. Inventory поддерживает один хост и только поля host,
+port, bootstrap/managed users, local key path, Python interpreter и hardening port lists из example; credentials и дополнительные
 runtime variables отклоняются.
 
 Все generated runtimes/tooling находятся в ignored `.tools`, `.venv`, `.ansible`
@@ -620,11 +1010,13 @@ shell exports и активация environment больше не нужны.
 **LIVE**. `add-user` и `secure-ssh` изменяют сервер; verification создаёт свежие
 SSH-сессии и выполняет read-only проверки аккаунтов/policy. Root-пароли не
 используются, host trust не изменяется. Сохраняйте прежние локальные inventory и
-`AUTOMATION_KEY`: каждая команда сначала проверяет ключевой доступ `ansible`,
+`AUTOMATION_KEY`: каждая команда сначала проверяет ключевой доступ `ansible_user`,
 `sudo -n` и завершение Stage 3 на каждом маршруте `ssh_verify_ports`.
 
 ```bash
-# Отдельный локальный Ed25519-ключ; администратор с root-equivalent NOPASSWD.
+# Создайте/загрузите ключ локально; вставьте public member при регистрации.
+make generate-user-key HUMAN_USER=portfolio_admin
+make show-public-key HUMAN_USER=portfolio_admin
 make add-user HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
 make verify-user HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
 # Оставьте сессию operator открытой; интерактивно подтвердите доступность console recovery.
@@ -637,7 +1029,7 @@ make verify-ssh-security HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
 `./secrets/portfolio-infra/`, например:
 
 ```bash
-make add-user HUMAN_USER=reader HUMAN_GROUPS=readers HUMAN_SUDO=none \
+make add-user HUMAN_USER=reader HUMAN_GROUPS=readers HUMAN_GROUPS_APPROVED=readers HUMAN_SUDO=none \
   HUMAN_KEY="$PWD/secrets/portfolio-infra/reader_ed25519"
 # Импорт одного public key без генерации/копирования private key.
 make add-user HUMAN_USER=operator2 HUMAN_SUDO=admin \
@@ -657,21 +1049,39 @@ make add-user HUMAN_USER=auditor HUMAN_SUDO=restricted \
 Restricted executables должны иметь canonical path, root ownership и execute bit,
 с защищёнными root-owned parents; mutable files и symlinks запрещены.
 `HUMAN_GROUPS` — добавляемые группы через запятую; отсутствующие создаются.
-Root/system и распространённые runtime privilege groups запрещены; `sudo`/`admin`
-требуют admin policy. Права custom groups проверяйте отдельно. `none` не добавляет
-sudo fragment; verification требует отсутствия non-interactive sudo grant.
+Известные привилегированные группы запрещены даже с `HUMAN_SUDO=admin`: root/controller,
+группы Docker/LXD/Incus/libvirt, `disk`, `shadow`, `adm`, `systemd-journal`, `kvm`,
+`sudoers`, `wheel`, `storage`, `input`, `video` и `render`. `sudo`/`admin` требуют
+admin policy. Любая другая группа, включая неизвестную или отсутствующую,
+по умолчанию блокируется: имя и GID не доказывают безопасность. Перед одобрением
+проверьте реальные права на файлы, журналы, устройства, ACL, service sockets
+и административные политики сервера. Укажите в `HUMAN_GROUPS_APPROVED` точный список
+групп через запятую, кроме `sudo`/`admin`, явно принимая их права независимо от
+`HUMAN_SUDO`. Не одобряйте непроверенные группы. Отдельное одобрение обязательно
+в интерактивном и неинтерактивном режиме; prompt и sudo policy не подставляют его
+автоматически. Существующим скриптам с такими `HUMAN_GROUPS` теперь нужно передавать
+одобрение. Пустой список групп и `sudo`/`admin` при admin policy работают как раньше.
+Прямой запуск `add-user.yml` требует эквивалентную list-переменную
+`human_access_user_approved_groups` (по умолчанию `[]`) до любых изменений.
+Одобрение означает принятие прав оператором, а не автоматический анализ Linux permissions;
+после изменений конфигурации сервера проверяйте права заново. Миграции существующих
+пользователей и групп нет. `none` не добавляет sudo fragment; verification требует
+отсутствия non-interactive sudo grant.
 
-Новые ключи создаются без passphrase, каталоги имеют `0700`, private keys — `0600`
+`add-user` принимает вставленный public key или `HUMAN_PUBLIC_KEY` и не создаёт
+private key. `generate-user-key` запрашивает passphrase. Каталоги имеют `0700`, private keys — `0600`
 или строже. Существующие пары сохраняются; неполные пары, symlinks, небезопасные
 permissions и совпадение пути с automation key блокируют операцию. Wrapper не
 читает private-key bytes и не отправляет их на сервер. Существующие зашифрованные
 human keys могут использовать уже разблокированный SSH agent с
-`IdentitiesOnly=yes` и выбранным identity; automation не зависит от agent.
+`IdentitiesOnly=yes` и выбранным identity; automation тоже может использовать выбранный ключ через agent.
 Public-only импорт без доступного локального private key отмечается **UNVERIFIED**
 и не разрешает финальную защиту. Используйте отдельный ключ для каждого человека;
 защищайте резервные копии как пароли. `secrets/` и распространённые имена ключей
 исключены из Git/Docker context; ignore rules не заменяют review staged files.
-Секреты и public keys не должны попадать в inventory, вывод или committed config.
+Секреты и public keys не должны попадать в inventory или committed config.
+Только явная команда `show-public-key` выводит публичный ключ для передачи;
+содержимое private key никогда не выводится.
 
 ### Типичная ошибка preflight
 
@@ -704,7 +1114,7 @@ preflight; передайте диагноз на отдельную прове�
 автоматического adoption. Повторный успешный запуск сохраняет ключи и приводит
 аккаунт к прежнему состоянию без замены доступа.
 
-`secure-ssh` заново проверяет выбранного **admin** и `ansible`: свежий key-only
+`secure-ssh` заново проверяет выбранного **admin** и `ansible_user`: свежий key-only
 SSH и non-interactive root sudo, затем запрашивает подтверждение recovery с
 default deny. Роль также перепроверяет обе учётные записи непосредственно перед
 работой с policy. Устанавливаются `PermitRootLogin no`, `PasswordAuthentication no`
@@ -733,7 +1143,7 @@ console изучите managed block, source files и pending receipt, выпо�
 подтвердите свежий доступ. Удаляйте receipt только после recovery/convergence.
 Возврат нужного fallback policy — отдельное решение через console, без automatic
 rollback. После hardening добавляйте людей теми же `add-user`/`verify-user` через
-`ansible`: root/password fallback не включается. Stage 3 и maintenance сохраняют
+`ansible_user`: root/password fallback не включается. Stage 3 и maintenance сохраняют
 финальный блок. Application deployment остаётся отдельным этапом.
 
 Порядок ручной проверки: offline `make check` (включая новые synthetic/mocked
@@ -762,6 +1172,33 @@ SSH-маршрут inventory; все маршруты и доступ челов
 | `make inspect-operations` | LIVE/read-only preflight: PASS/WARN допускаются, FAIL блокирует |
 | `make setup-operations` | LIVE/изменения: preflight, затем TTY-подтверждение `[y/N]`, по умолчанию отказ |
 | `make verify-operations` | LIVE/read-only: требует применённые настройки, пакеты, таймеры и лимиты |
+| `make preview-apt-policy` | LIVE/check-diff: preview только одной отсутствующей строки APT policy |
+| `make apply-apt-policy` | LIVE/изменения: guarded APT-only replacement после TTY-подтверждения `[y/N]` |
+
+Для выявленной отсутствующей директивы
+`Unattended-Upgrade::Remove-New-Unused-Dependencies "false";` предусмотрен отдельный
+APT-only entry point. Он использует существующие strict SSH/sudo, host trust и
+инспекторы Stage 3/5. Preview и применение требуют отдельных LIVE-разрешений:
+
+```bash
+make preview-apt-policy INVENTORY=inventories/production.yml
+# Только после проверки preview и отдельного разрешения на применение:
+make apply-apt-policy INVENTORY=inventories/production.yml
+make verify-operations INVENTORY=inventories/production.yml
+```
+
+Назначение должно уже быть regular file root:root с mode 0644 и доверенными
+родительскими каталогами. Байты должны точно совпадать с текущим `apt-security.j2`
+либо отличаться только отсутствием одной указанной строки. Более широкий diff,
+небезопасные metadata, конкурентная замена и занятый lock останавливают команду
+без попытки исправления. Preview использует Ansible `--check --diff` и не записывает
+managed APT-файл; Ansible может создавать временные файлы выполнения. Применение
+атомарно заменяет только `/etc/apt/apt.conf.d/99zz-portfolio-security`, затем запускает
+существующую verification Stage 5. Совпадающий файл остаётся unchanged. Этот путь
+не устанавливает пакеты и не настраивает Docker, journald, timers, SSH, sudoers или
+аккаунты. При ошибке применения или последующей verification APT-файл уже мог
+измениться: STOP, read-only диагностика, без слепого повтора. `setup-operations`
+сохраняет широкий объём действий и не подходит для APT-only исправления.
 
 Роль устанавливает `unattended-upgrades` и `logrotate` с `state: present`, без
 немедленного обновления индексов или пакетов. Один маркированный APT-файл очищает
@@ -880,3 +1317,156 @@ apt-daily.timer apt-daily-upgrade.timer logrotate.timer`, `systemctl --failed
 чувствительную информацию. Logrotate без `--debug`, принудительное удаление
 APT/dpkg locks, autoremove, vacuum журналов и запуск upgrade не являются безопасной
 диагностикой.
+
+## Управление пользователями и SSH-ключами (Stage 6, задача 3)
+
+Команды обращаются к VPS через managed user и путь ключа из inventory. Начальный
+password login не используется, имя automation-пользователя не фиксировано.
+Списки читают фактические аккаунты, группы, effective sudo/SSH policy и authorized keys;
+локального кэша пользователей/ключей нет. Root и текущий контроллер защищены.
+
+| Команда | Назначение | Граница |
+| --- | --- | --- |
+| `make list-users` | Управляемые human-пользователи, права, ключи и защищённый inventory controller | LIVE / read-only |
+| `make show-user HUMAN_USER=operator` | Identity, группы, sudo и SSH-ключи | LIVE / read-only |
+| `make list-user-keys HUMAN_USER=operator` | Разрешённые public keys, SHA256 fingerprints и принадлежность | LIVE / read-only |
+| `make add-user-key HUMAN_USER=operator HUMAN_PUBLIC_KEY=/path/other-pc.pub` | Добавить один public key, сохранив остальные записи | LIVE / MUTATING, интерактивное подтверждение |
+| `make revoke-user-key HUMAN_USER=operator KEY_FINGERPRINT=SHA256:...` | Отозвать конкретный управляемый ключ | LIVE / MUTATING, проверка другого admin и подтверждение |
+| `make remove-user HUMAN_USER=operator` | Отозвать ключи/sudo и удалить аккаунт, сохранив файлы | LIVE / MUTATING, проверка другого admin и подтверждение |
+
+Импорт использует существующую проверку `.pub`; private keys не читаются и не загружаются.
+Для public key с другого ПК не нужен его private key на контроллере. После добавления
+владелец независимо проверяет вход этой identity, например
+`make verify-user HUMAN_USER=operator HUMAN_SUDO=admin HUMAN_KEY=/path/operator-key`
+из настроенного checkout на том ПК. Успешный импорт сам по себе не доказывает доступ.
+Для существующего аккаунта `add-user` использует тот же механизм добавления ключа;
+изменения существующих прав/групп требуют отдельно рассмотренной миграции.
+
+Принадлежность аккаунта определяется защищённой записью
+`/var/lib/portfolio-human-access/<user>.json`, сверяемой с identity и privilege policy.
+Точные authorized-key строки, явно установленные этими wrappers, учитываются в соседней
+записи `<user>.keys.json`. Ключи предыдущих этапов отображаются как unmanaged.
+Чтобы явно принять ответственность за такой ключ, добавьте идентичную public строку
+(включая comment) через `add-user-key`. Совпадающий fingerprint при иных options/comments
+или нескольких записях блокирует операцию. Неуправляемые аккаунты не принимаются в
+управление; неуправляемые ключи нельзя отозвать, и они блокируют удаление аккаунта.
+Записи на сервере определяют принадлежность; источником фактов о доступе остаётся VPS.
+
+Регистрация human-ключа отклоняет все identity, сейчас разрешённые для controller,
+включая legacy-ключи и ключи с другими комментариями/options. Локальная проверка
+сравнивает выбранный controller key, серверная — весь поддерживаемый набор его ключей.
+Прямой `add-user.yml` проверяет независимость identity и receipts удаления; он создаёт
+только новые аккаунты. Для существующих используйте `make add-user` / `make add-user-key`:
+регистрация идёт через additive engine с lock, без смены прав, групп и options существующих
+ключей. Прямой `secure-ssh.yml` также проверяет независимость identity на сервере.
+Certificate-authority entries и альтернативные controller authorization sources
+не поддерживаются и блокируют операцию.
+
+Для отзыва/удаления укажите другого managed human-admin и его локальный ключ:
+
+```sh
+make revoke-user-key HUMAN_USER=operator KEY_FINGERPRINT=SHA256:... \
+  RECOVERY_USER=backupadmin RECOVERY_KEY=~/.ssh/portfolio-infra/backupadmin_ed25519
+make remove-user HUMAN_USER=operator \
+  RECOVERY_USER=backupadmin RECOVERY_KEY=~/.ssh/portfolio-infra/backupadmin_ed25519
+```
+
+Сохраняемый admin должен отличаться от цели и текущего контроллера. Свежий key-only SSH
+доказывается отдельной ключевой identity: копия ключа контроллера по другому пути
+не подходит. Полные наборы текущих key fingerprints цели и recovery должны быть
+непересекающимися, включая unmanaged entries и ключи с SSH options. Выбранный recovery
+fingerprint после свежего доказательства доступа должен оставаться разрешённым и
+отличаться от всех серверных controller keys. Проверки OpenSSH игнорируют client config,
+дополнительные identity,
+proxy и forwarding; human ssh-agent может использовать только выбранную identity.
+Пути ключей не допускают подстановок OpenSSH. Automation тоже использует выбранный
+ключ через локальный agent; заранее загрузите зашифрованный controller key. Recovery-keypair
+должна быть локальной, полной и защищённой теми же правами, что остальные human keys;
+заранее разблокируйте зашифрованный recovery-ключ через `ssh-add`.
+Key-only SSH
+и `sudo -n` проверяются на каждом маршруте `ssh_verify_ports`. Без этого доказательства
+последний подтверждённый human-admin доступ нельзя удалить. Сохраняйте provider-console
+recovery. Мутации проверяют Stage 3 и managed access, показывают состояние/запрос,
+требуют default-deny TTY confirmation и отклоняют изменения состояния после preflight.
+Серверные операции сериализуются и сверяют содержимое ключей перед atomic replacement.
+Снимки target/controller и recovery proof повторно проверяются после подготовки файла,
+непосредственно перед rename. После изменения credentials разрушительные операции снова
+проверяют recovery; при drift — STOP без rollback и retry. Management lock сериализует
+мутации этого движка, но не внешние изменения root или владельцем SSH-каталога. Они могут
+попасть в окно после последней проверки: операция не является транзакцией файловой
+системы/аккаунтов. Создание нового аккаунта — отдельная многошаговая Ansible-операция:
+запуски операторов нужно сериализовать, прерванное создание проверять вручную,
+без автоматического adoption или repair.
+SSH daemon, порты, authentication policy и сервисы не меняются. Успешная мутация
+проверяет точный результат на сервере и повторно доказывает managed access.
+
+Удаление блокируется активными процессами пользователя, custom userdel hooks, неизвестным
+состоянием прав/групп, SSH Match, неподдерживаемыми key sources/includes и pending SSH
+activation. Сначала очищаются authorized keys и удаляется managed sudo fragment,
+затем вызывается `userdel` без `--remove` и `--force`. Home, mail и остальные файлы
+сохраняются с числовыми владельцами; защищённая запись об удалении блокирует автоматическое
+пересоздание аккаунта. Не назначайте этот UID другому аккаунту без ревизии сохранённых файлов.
+Повторное добавление/отзыв/удаление не меняет уже подтверждённый результат.
+Отзыв ключа влияет на будущую аутентификацию, но не закрывает существующую SSH-сессию.
+При ошибке мутации credentials уже могли быть отозваны: остановитесь и проверьте состояние
+через сохраняемого admin/provider recovery; не повторяйте вслепую и не ослабляйте SSH policy.
+
+Offline checks покрывают границы принадлежности, сохранение ключей, точный отзыв,
+устаревшие proofs, подтверждение, сохранение файлов, strict transport и Make wrappers.
+Ручные LIVE-проверки остаются необходимыми: импортировать ключи двух ПК, независимо
+проверить обе identity, отозвать один и подтвердить отказ нового входа при успешном входе
+вторым, удалить тестовый managed account и проверить сохранность файлов, затем проверить
+повторные операции и доступ Stage 1–5.
+
+## Stage 6: checklist ручной интеграционной LIVE-проверки
+
+Offline-проверки не доказывают доступ к VPS или LIVE-идемпотентность. Каждый шаг
+выполняется оператором по отдельному разрешению, с проверенной provider console и
+сохранённой admin-сессией. Для отзыва и удаления используйте тестовые аккаунты/ключи.
+
+1. **Исходный доступ и миграция.** Сохраните старый ignored inventory и проверьте доступ.
+   На защищённом VPS следуйте [миграции через candidate inventory](#настройка-рабочего-пользователя-и-миграция):
+   создайте нового admin через `add-user`, проверьте его, затем выполните `verify-access`
+   с candidate inventory. Сохраните порты и SSH policy. Password bootstrap применим
+   только к новому VPS с ещё доступным initial login.
+2. **Локальные ключи и trust.** На каждом ПК выполните `make setup`, создайте отдельный
+   ключ через `generate-user-key`, покажите публичную часть через `show-public-key`.
+   Независимо сверьте host fingerprints перед записью локального trust. Для human/recovery
+   используйте passphrase и `load-user-key`; один ключ устройства подходит для SSH и automation.
+   Передавайте только `.pub`. `show-controller` должен показывать выбранные на этом ПК
+   inventory user/key. Отсутствующий trust и конфликтующий override должны блокировать доступ.
+3. **Второй контроллер и sudo.** С первого контроллера добавьте public key второго ПК
+   отдельному managed admin через `add-user`/`add-user-key`. На ПК 2 проверьте candidate
+   inventory через `verify-access`, а human admin независимо через
+   `verify-user HUMAN_USER=… HUMAN_SUDO=admin HUMAN_KEY=…`. В `connect-controller` и
+   `connect-user` проверьте `id -un` и `sudo -n id -u` (для admin: `0`). Оба ПК должны
+   работать без копирования private keys и зависимости от agent другого ПК.
+4. **Точечный отзыв и отказ recovery.** Добавьте два ключа разных ПК тестовому human account,
+   просмотрите `list-user-keys` и проверьте каждый с ПК владельца. Повторное добавление:
+   `changed: false`. С отдельными доказанными `RECOVERY_USER`/`RECOVERY_KEY` отзовите один
+   fingerprint. Новый вход им должен отказать, второй ключ, controller и recovery admin
+   должны работать. Повторный отзыв — unchanged. Неверный/неразблокированный recovery-ключ,
+   отсутствие sudo, копия controller key, recovery username цели/контроллера и отказ
+   подтверждения должны сохранять состояние цели. Старые сессии переживают отзыв ключа;
+   проверяйте новые подключения.
+5. **Удаление и файлы.** Создайте marker file в home тестового пользователя и закройте
+   его сессии/процессы. Legacy keys предварительно зарегистрируйте идентичной public line.
+   Удалите пользователя с отдельным recovery proof; проверьте отсутствие account/sudo,
+   пустые authorized keys, сохранность marker/home с числовыми владельцами, рабочий
+   recovery/controller доступ и unchanged при повторном удалении. Пересоздание должно
+   блокироваться. Активные процессы и unmanaged keys должны блокировать удаление до отзыва.
+6. **Регрессии Stage 1–5 и STOP.** С обоих candidate inventories последовательно выполните
+   `verify-access`, `verify-docker`, `verify-hardening`, `verify-ssh-security` с сохраняемым
+   human admin и `verify-operations`. Docker verification может пополнить image cache.
+   Только после успеха явно выберите candidate inventory. Повторный provisioning и
+   проверки `changed=0` требуют отдельного разрешения; не перезагружайте VPS и не
+   повторяйте password bootstrap на защищённом сервере ради регрессии.
+
+Оба контроллера используют общие защищённые серверные записи; локального ledger для
+синхронизации нет. Защищены root и текущий inventory controller; сервер не может узнать
+candidate inventories других ПК. Исключите все действующие контроллеры из тестов удаления
+и сохраняйте отдельного проверенного human admin. Unmanaged legacy automation accounts
+этими командами не удаляются. Если ключ установлен, но запись ledger завершилась ошибкой,
+новая запись остаётся unmanaged: проверьте состояние через recovery, затем явно
+зарегистрируйте идентичную public line. Ошибка после отзыва credentials или sudo требует
+ручной проверки через recovery без слепого повторения.
