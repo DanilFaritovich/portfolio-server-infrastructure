@@ -112,6 +112,15 @@ exit 0
         self.assertIn('SHA256:synthetic', result.stdout)
         self.assertNotIn('unexpected ssh invocation', self.calls.read_text())
 
+    def test_copy_public_key_headless_wrapper_suggests_text_transfer(self):
+        result = self.make('copy-public-key', KEY_NAME='person_ed25519',
+                           WAYLAND_DISPLAY='', DISPLAY='')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('make show-public-key', result.stderr)
+        self.assertNotIn('Install now?', result.stdout)
+        self.assertNotIn('copied', result.stdout)
+        self.assertNotIn('unexpected ssh invocation', self.calls.read_text())
+
     def test_show_controller_uses_selected_inventory_without_ssh(self):
         result = self.make('show-controller')
         self.assertEqual(result.returncode, 0, result.stderr)

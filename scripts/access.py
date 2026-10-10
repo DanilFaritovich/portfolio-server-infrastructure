@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import shlex
@@ -525,20 +526,64 @@ def public_fingerprint(public):
     return fields[1]
 
 
+def clipboard_command():
+    """Select a desktop backend; install only after explicit terminal consent."""
+    candidates = []
+    if sys.platform == 'darwin':
+        candidates.append(('pbcopy', ['pbcopy']))
+    elif sys.platform.startswith('linux'):
+        if os.environ.get('WAYLAND_DISPLAY'):
+            candidates.append(('wl-copy', ['wl-copy']))
+        if os.environ.get('DISPLAY'):
+            candidates.extend([('xclip', ['xclip', '-selection', 'clipboard']),
+                               ('xsel', ['xsel', '--clipboard', '--input'])])
+    else:
+        raise ValueError('Clipboard is unsupported on this OS; use make show-public-key.')
+    require(candidates, 'No graphical clipboard session (headless environment); use make show-public-key.')
+    command = next((argv for tool, argv in candidates if shutil.which(tool)), None)
+    if command:
+        return command
+    require(sys.platform != 'darwin', 'Built-in pbcopy not found; use make show-public-key.')
+    package = 'wl-clipboard' if candidates[0][0] == 'wl-copy' else 'xclip'
+    require(sys.stdin.isatty(), 'Clipboard utility not found. Required package: ' + package +
+            '. Non-interactive mode: install it manually or use make show-public-key.')
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        release = {}
+    distributions = {release.get('ID', ''), *release.get('ID_LIKE', '').split()}
+    require(distributions & {'ubuntu', 'debian'} and shutil.which('apt-get'),
+            'Automatic clipboard installation requires Ubuntu/Debian with APT; '
+            'install ' + package + ' manually or use make show-public-key.')
+    installer = ['apt-get', 'install', '-y', package]
+    if os.geteuid() != 0:
+        require(shutil.which('sudo'), 'Clipboard installation requires sudo; '
+                'install ' + package + ' manually or use make show-public-key.')
+        installer.insert(0, 'sudo')
+    print('Clipboard utility not found.\nRequired package: ' + package + '\n')
+    try:
+        answer = input('Install now? [Y/n]: ').strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        raise ValueError('Clipboard installation cancelled; public key was not copied.') from None
+    require(answer in ('', 'y', 'yes'), 'Clipboard installation declined; public key was not copied.')
+    try:
+        result = subprocess.run(installer, check=False, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ValueError('Clipboard installation failed; public key was not copied. '
+                         'Install ' + package + ' manually or use make show-public-key.') from None
+    require(result.returncode == 0, 'Clipboard installation failed; public key was not copied. '
+            'Install ' + package + ' manually or use make show-public-key.')
+    command = next((argv for tool, argv in candidates if shutil.which(tool)), None)
+    require(command, 'Clipboard utility is still unavailable after installation; public key was not copied. '
+            'Use make show-public-key.')
+    return command
+
+
 def copy_public_key(public):
     content = read_public_key(public)
     with public_key_snapshot(content) as snapshot:
         selected = public_fingerprint(snapshot)
-    candidates = []
-    if os.environ.get('WAYLAND_DISPLAY'):
-        candidates.append(('wl-copy', ['wl-copy']))
-    if os.environ.get('DISPLAY'):
-        candidates.extend([('xclip', ['xclip', '-selection', 'clipboard']),
-                           ('xsel', ['xsel', '--clipboard', '--input'])])
-    command = next((argv for tool, argv in candidates if shutil.which(tool)), None)
-    require(command, 'No clipboard utility for the current graphical session. '
-            'Install wl-clipboard for Wayland or xclip/xsel for X11; '
-            'run in a desktop session, or use make show-public-key.')
+    command = clipboard_command()
     try:
         # Clipboard owners may outlive their launcher; do not leave output pipes
         # open in a background owner while communicate waits for EOF.

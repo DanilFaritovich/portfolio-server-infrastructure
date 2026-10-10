@@ -163,7 +163,7 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make generate-user-key` | Generate a local human Ed25519 keypair and offer agent loading | **LOCAL / key files and optional local agent** |
 | `make load-user-key` | Load the selected existing key into the local SSH agent | **LOCAL / agent only** |
 | `make show-public-key` | Display public key and SHA256 fingerprint | **LOCAL / read-only** |
-| `make copy-public-key` | Copy the complete public key to the desktop clipboard | **LOCAL / clipboard only** |
+| `make copy-public-key` | Copy the complete public key; offer missing clipboard package installation | **LOCAL / clipboard, optional APT install** |
 | `make show-controller` | Display inventory access and SSH command | **LOCAL / read-only** |
 | `make connect-controller` | Interactive SSH as the inventory managed user | **LIVE / interactive session** |
 | `make connect-user` | Interactive SSH as the selected human user | **LIVE / interactive session** |
@@ -753,10 +753,15 @@ make add-user INVENTORY=inventories/production.yml HUMAN_USER=portfolio_laptop2 
 `copy-public-key` selects the same key as `show-public-key`, including `HUMAN_KEY`
 and `KEY_NAME`, and copies the complete `.pub` contents, including the comment.
 It needs only the public file and never inspects the private member, contacts a host,
-or loads an agent. In a Wayland session it uses `wl-copy` (package `wl-clipboard`);
-in X11 it uses `xclip` or `xsel` (matching packages). Install the appropriate small
-package yourself if missing; nothing is installed automatically. A desktop session
-is required. A clipboard error fails the command without reporting success.
+or loads an agent. In a Wayland session it prefers `wl-copy` (package `wl-clipboard`);
+in X11 it uses `xclip` or `xsel` (matching packages). macOS uses built-in `pbcopy`.
+On Ubuntu/Debian, a missing utility offers `Install now? [Y/n]:` in a terminal:
+Enter/Y installs `wl-clipboard` or `xclip` through APT (with sudo unless root), checks
+availability and retries copying. N declines without installing or copying.
+`make setup` does not install clipboard packages. Non-interactive calls never prompt
+or install; headless Linux calls suggest `make show-public-key`. Other Linux systems
+require manual installation. Success reports the SHA256 fingerprint; installation
+or clipboard errors fail the command without reporting success.
 `show-public-key` remains available for text transfer without clipboard utilities.
 
 Without `HUMAN_PUBLIC_KEY`, `add-user` asks for one plain OpenSSH public-key line

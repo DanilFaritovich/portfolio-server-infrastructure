@@ -161,7 +161,7 @@ password prompts и agent. Paramiko используется только для
 | `make generate-user-key` | Создать локальную пару Ed25519 и предложить загрузку в agent | **LOCAL / ключ и локальный agent** |
 | `make load-user-key` | Загрузить выбранный существующий ключ в локальный agent | **LOCAL / только agent** |
 | `make show-public-key` | Показать public key и SHA256 fingerprint | **LOCAL / read-only** |
-| `make copy-public-key` | Скопировать полный public key в системный буфер обмена | **LOCAL / только clipboard** |
+| `make copy-public-key` | Скопировать public key; предложить установку отсутствующей clipboard-утилиты | **LOCAL / clipboard, опционально APT** |
 | `make show-controller` | Показать доступ из inventory и SSH-команду | **LOCAL / read-only** |
 | `make connect-controller` | Интерактивный SSH под рабочим пользователем inventory | **LIVE / интерактивная сессия** |
 | `make connect-user` | Интерактивный SSH под указанным пользователем | **LIVE / интерактивная сессия** |
@@ -754,10 +754,16 @@ make add-user INVENTORY=inventories/production.yml HUMAN_USER=portfolio_laptop2 
 `copy-public-key` выбирает тот же ключ, что `show-public-key`, включая `HUMAN_KEY`
 и `KEY_NAME`, и копирует полное содержимое `.pub` вместе с комментарием.
 Нужен только публичный файл: команда не проверяет private member, не подключается
-к серверу и не загружает agent. В Wayland используется `wl-copy` (пакет `wl-clipboard`),
-в X11 — `xclip` или `xsel` (одноимённые пакеты). При необходимости установите небольшой
-пакет самостоятельно; автоматической установки нет. Требуется графическая сессия.
-Ошибка clipboard завершает команду без сообщения об успешном копировании.
+к серверу и не загружает agent. В Wayland предпочтение отдаётся `wl-copy` (пакет
+`wl-clipboard`), в X11 — `xclip` или `xsel` (одноимённые пакеты).
+В macOS используется встроенный `pbcopy`. В Ubuntu/Debian при отсутствии утилиты
+в терминале появляется `Install now? [Y/n]:`: Enter/Y устанавливает `wl-clipboard`
+или `xclip` через APT (с sudo, если запуск не от root), проверяет наличие утилиты
+и повторяет копирование. N завершает команду без установки и копирования.
+`make setup` не устанавливает clipboard-пакеты. В non-interactive режиме нет запросов
+и установки; в headless Linux предлагается `make show-public-key`. В других Linux
+системах нужна ручная установка. Успех сопровождается SHA256 fingerprint; ошибка
+установки или clipboard завершает команду без сообщения об успешном копировании.
 `show-public-key` остаётся доступной для текстовой передачи без clipboard utilities.
 
 Без `HUMAN_PUBLIC_KEY` команда `add-user` предлагает вставить одну строку plain
