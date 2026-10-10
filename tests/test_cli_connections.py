@@ -62,7 +62,9 @@ class CLIConnectionTests(unittest.TestCase):
         self.assertEqual(command[0], 'ssh-keygen', 'Only local public-key operations may execute here')
         if '-F' in command:
             self.assertEqual(command[command.index('-F') + 1], '[fixture.example.test]:2222')
-            return subprocess.CompletedProcess(command, 0, '', '')
+            return subprocess.CompletedProcess(command, 0, '[fixture.example.test]:2222 ' + PUBLIC + '\n', '')
+        if command[-1] == '-':
+            return subprocess.CompletedProcess(command, 0, '256 SHA256:' + 'A' * 43 + ' (ED25519)\n', '')
         return subprocess.CompletedProcess(command, 0, '256 SHA256:synthetic fingerprint (ED25519)\n', '')
 
     def test_generate_default_key_is_local_prompts_without_exposing_passphrase(self):

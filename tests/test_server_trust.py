@@ -271,6 +271,24 @@ class ServerTrustTests(unittest.TestCase):
         self.assertIn('interactive terminal', result.stderr)
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_make_copy_exports_only_json_to_mock_clipboard(self):
+        self.write_trust(f'[{self.host}]:{self.port} {PUBLIC}\n')
+        binary = self.home / 'bin'
+        binary.mkdir()
+        tool = binary / 'wl-copy'
+        tool.write_text('#!/bin/sh\ncat > "$FIXTURE_CLIPBOARD"\n')
+        tool.chmod(0o700)
+        clipboard = self.home / 'clipboard'
+        env = os.environ | {'HOME': str(self.home), 'INVENTORY': str(self.inventory),
+                            'WAYLAND_DISPLAY': 'fixture', 'FIXTURE_CLIPBOARD': str(clipboard),
+                            'PATH': str(binary) + os.pathsep + os.environ['PATH']}
+        result = self.native_run(['make', '--no-print-directory', 'copy-server-trust'], cwd=ROOT,
+                                 env=env, text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(clipboard.read_text()), self.data)
+        self.assertNotIn('\n', clipboard.read_text())
+        self.assertIn('JSON copied', result.stdout)
+
 
 if __name__ == '__main__':
     unittest.main()

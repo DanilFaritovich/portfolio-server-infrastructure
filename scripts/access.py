@@ -2,9 +2,11 @@
 """Controller-only setup and explicit live access entry points; never store passwords."""
 
 import argparse
+import base64
 import contextlib
 import fcntl
 import importlib.util
+import hmac
 import json
 import os
 from pathlib import Path
@@ -422,7 +424,7 @@ def server_trust(mode, inventory):
         require(sys.stdin.isatty(), 'Host trust import requires an interactive terminal. ' + TRUST_GUIDANCE)
     snapshot = trust_snapshot(path)
     existing = trusted_host_keys(snapshot, host, port)
-    if mode == 'show-server-trust':
+    if mode in ('show-server-trust', 'copy-server-trust'):
         require(existing, 'No existing trusted SSH host key for this inventory. ' + TRUST_GUIDANCE)
         keys = existing
     else:
@@ -433,12 +435,16 @@ def server_trust(mode, inventory):
             raise ValueError('Host trust import cancelled; no trust was saved.') from None
         keys = parse_server_trust(text, host, port)
         check_trust_conflicts(existing, keys)
+    if mode == 'copy-server-trust':
+        copy_clipboard(server_trust_json(host, port, keys), fallback='show-server-trust')
     print(f'Server: {host}\nSSH port: {port}')
     for entry in keys.values():
         print('Public host key: ' + entry['public_key'] + '\nSHA256 fingerprint: ' + entry['fingerprint'])
     if mode == 'show-server-trust':
         print('Transfer data (paste this single JSON line on the new computer):')
-        print(json.dumps({'version': 1, 'host': host, 'port': port, 'keys': list(keys.values())}, separators=(',', ':')))
+        print(server_trust_json(host, port, keys))
+    elif mode == 'copy-server-trust':
+        print('Server trust JSON copied to clipboard.')
     else:
         try:
             answer = input('Confirm these keys came from an independently verified source. Trust this server? [y/N]: ')
@@ -448,6 +454,109 @@ def server_trust(mode, inventory):
         changed = save_server_trust(path, snapshot, host, port, existing, keys)
         print('Host trust saved to ~/.ssh/known_hosts.' if changed else 'Host trust already present; known_hosts unchanged.')
         print('Strict host-key checking remains enabled.')
+
+
+def server_trust_json(host, port, keys):
+    return json.dumps({'version': 1, 'host': host, 'port': port, 'keys': list(keys.values())}, separators=(',', ':'))
+
+
+def previous_trust_ports(snapshot, host, port):
+    """Discover exact endpoints locally, including salted OpenSSH hashes; no scans."""
+    if snapshot is None:
+        return []
+    ports, hashes = set(), set()
+    for line in snapshot[1].decode('utf-8').splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith('#'):
+            continue
+        names = fields[1] if fields[0].startswith('@') and len(fields) > 1 else fields[0]
+        for name in names.split(','):
+            if name == host:
+                ports.add(22)
+            match = re.fullmatch(r'\[' + re.escape(host) + r'\]:([0-9]{1,5})', name)
+            if match and 1 <= int(match[1]) <= 65535:
+                ports.add(int(match[1]))
+            if name.startswith('|'):
+                hashes.add(name)
+    # Bound work on foreign/oversized trust stores rather than blocking indefinitely.
+    require(len(hashes) <= 32, 'Too many hashed trust entries for automatic port discovery; use explicit trust transfer.')
+    for name in hashes:
+        try:
+            _, version, salt, digest = name.split('|')
+            salt, digest = base64.b64decode(salt, validate=True), base64.b64decode(digest, validate=True)
+            require(version == '1' and len(salt) == len(digest) == 20, 'Unsupported hashed host trust.')
+        except (ValueError, TypeError):
+            raise ValueError('Unsupported hashed host trust; use explicit trust transfer.') from None
+        for candidate in range(1, 65536):
+            endpoint = host if candidate == 22 else f'[{host}]:{candidate}'
+            if hmac.compare_digest(hmac.digest(salt, endpoint.encode('ascii'), 'sha1'), digest):
+                ports.add(candidate)
+                break
+    return sorted(ports - {port})
+
+
+def verify_port_identity(host, port, keys):
+    """Complete signed SSH key exchange without login, commands or agent access."""
+    import paramiko
+
+    transport = None
+    try:
+        with socket.create_connection((host, port), timeout=15) as connection:
+            transport = paramiko.Transport(connection)
+            options = transport.get_security_options()
+            options.key_types = tuple(kind for kind in options.key_types if kind in keys or
+                                      (kind.startswith('rsa-sha2-') and 'ssh-rsa' in keys))
+            require(options.key_types, 'No supported previously trusted SSH host-key algorithm.')
+            transport.banner_timeout = 15
+            transport.handshake_timeout = 15
+            # Paramiko verifies the exchange signature before initial KEX completes;
+            # get_remote_server_key refuses incomplete/failed exchanges, including timeout.
+            transport.start_client(timeout=15)
+            remote = transport.get_remote_server_key()
+            kind = remote.get_name()
+            public = kind + ' ' + remote.get_base64()
+            require(kind in keys and keys[kind]['public_key'] == public,
+                    'SSH host key differs from existing trust; no trust was saved.')
+            return {kind: keys[kind]}
+    except (paramiko.SSHException, OSError, EOFError):
+        raise ValueError('SSH host identity verification failed (unreachable port or invalid handshake/signature); '
+                         'no trust was saved.') from None
+    finally:
+        if transport is not None:
+            transport.close()
+
+
+def transfer_port_trust(host, port):
+    require(sys.stdin.isatty(), 'Port trust transfer requires an interactive terminal; use make connect-controller.')
+    path = Path.home() / '.ssh/known_hosts'
+    snapshot = trust_snapshot(path)
+    existing = trusted_host_keys(snapshot, host, port)
+    if existing:
+        return
+    ports = previous_trust_ports(snapshot, host, port)
+    keys = {}
+    for previous in ports:
+        entries = trusted_host_keys(snapshot, host, previous)
+        for kind, entry in entries.items():
+            require(kind not in keys or keys[kind] == entry,
+                    'Conflicting host identities across trusted ports; no trust was saved.')
+            keys[kind] = entry
+    require(keys, 'No previously trusted SSH host key for this server. ' + TRUST_GUIDANCE)
+    print(f'SSH trust not found for {host}:{port}.\n\nPreviously trusted:')
+    for previous in ports:
+        print(f'{host}:{previous}')
+    print('\nChecking SSH host identity...')
+    verified = verify_port_identity(host, port, keys)
+    print('Host key verified against existing trust.')
+    for entry in verified.values():
+        print('Fingerprint: ' + entry['fingerprint'])
+    try:
+        answer = input(f'Trust this server on port {port}? [y/N]: ')
+    except (EOFError, KeyboardInterrupt):
+        raise ValueError('Port trust transfer cancelled; no trust was saved.') from None
+    require(answer.strip().lower() in ('y', 'yes'), 'Port trust declined; no trust was saved.')
+    save_server_trust(path, snapshot, host, port, existing, verified)
+    print('Host trust saved to ~/.ssh/known_hosts.')
 
 
 def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=False, check=False, diff=False):
@@ -706,7 +815,7 @@ def public_fingerprint(public):
     return fields[1]
 
 
-def clipboard_command():
+def clipboard_command(fallback='show-public-key'):
     """Select a desktop backend; install only after explicit terminal consent."""
     candidates = []
     if sys.platform == 'darwin':
@@ -718,15 +827,15 @@ def clipboard_command():
             candidates.extend([('xclip', ['xclip', '-selection', 'clipboard']),
                                ('xsel', ['xsel', '--clipboard', '--input'])])
     else:
-        raise ValueError('Clipboard is unsupported on this OS; use make show-public-key.')
-    require(candidates, 'No graphical clipboard session (headless environment); use make show-public-key.')
+        raise ValueError(f'Clipboard is unsupported on this OS; use make {fallback}.')
+    require(candidates, f'No graphical clipboard session (headless environment); use make {fallback}.')
     command = next((argv for tool, argv in candidates if shutil.which(tool)), None)
     if command:
         return command
-    require(sys.platform != 'darwin', 'Built-in pbcopy not found; use make show-public-key.')
+    require(sys.platform != 'darwin', f'Built-in pbcopy not found; use make {fallback}.')
     package = 'wl-clipboard' if candidates[0][0] == 'wl-copy' else 'xclip'
     require(sys.stdin.isatty(), 'Clipboard utility not found. Required package: ' + package +
-            '. Non-interactive mode: install it manually or use make show-public-key.')
+            f'. Non-interactive mode: install it manually or use make {fallback}.')
     try:
         release = platform.freedesktop_os_release()
     except OSError:
@@ -734,36 +843,33 @@ def clipboard_command():
     distributions = {release.get('ID', ''), *release.get('ID_LIKE', '').split()}
     require(distributions & {'ubuntu', 'debian'} and shutil.which('apt-get'),
             'Automatic clipboard installation requires Ubuntu/Debian with APT; '
-            'install ' + package + ' manually or use make show-public-key.')
+            'install ' + package + f' manually or use make {fallback}.')
     installer = ['apt-get', 'install', '-y', package]
     if os.geteuid() != 0:
         require(shutil.which('sudo'), 'Clipboard installation requires sudo; '
-                'install ' + package + ' manually or use make show-public-key.')
+                'install ' + package + f' manually or use make {fallback}.')
         installer.insert(0, 'sudo')
     print('Clipboard utility not found.\nRequired package: ' + package + '\n')
     try:
         answer = input('Install now? [Y/n]: ').strip().lower()
     except (EOFError, KeyboardInterrupt):
-        raise ValueError('Clipboard installation cancelled; public key was not copied.') from None
-    require(answer in ('', 'y', 'yes'), 'Clipboard installation declined; public key was not copied.')
+        raise ValueError('Clipboard installation cancelled; data was not copied.') from None
+    require(answer in ('', 'y', 'yes'), 'Clipboard installation declined; data was not copied.')
     try:
         result = subprocess.run(installer, check=False, timeout=300)
     except (OSError, subprocess.TimeoutExpired):
-        raise ValueError('Clipboard installation failed; public key was not copied. '
-                         'Install ' + package + ' manually or use make show-public-key.') from None
-    require(result.returncode == 0, 'Clipboard installation failed; public key was not copied. '
-            'Install ' + package + ' manually or use make show-public-key.')
+        raise ValueError('Clipboard installation failed; data was not copied. '
+                         'Install ' + package + f' manually or use make {fallback}.') from None
+    require(result.returncode == 0, 'Clipboard installation failed; data was not copied. '
+            'Install ' + package + f' manually or use make {fallback}.')
     command = next((argv for tool, argv in candidates if shutil.which(tool)), None)
-    require(command, 'Clipboard utility is still unavailable after installation; public key was not copied. '
-            'Use make show-public-key.')
+    require(command, 'Clipboard utility is still unavailable after installation; data was not copied. '
+            f'Use make {fallback}.')
     return command
 
 
-def copy_public_key(public):
-    content = read_public_key(public)
-    with public_key_snapshot(content) as snapshot:
-        selected = public_fingerprint(snapshot)
-    command = clipboard_command()
+def copy_clipboard(content, fallback='show-public-key'):
+    command = clipboard_command(fallback)
     try:
         # Clipboard owners may outlive their launcher; do not leave output pipes
         # open in a background owner while communicate waits for EOF.
@@ -772,6 +878,13 @@ def copy_public_key(public):
     except (OSError, subprocess.TimeoutExpired):
         raise ValueError('Clipboard copy failed; check the desktop session and clipboard utility.') from None
     require(result.returncode == 0, 'Clipboard copy failed; check the desktop session and clipboard utility.')
+
+
+def copy_public_key(public):
+    content = read_public_key(public)
+    with public_key_snapshot(content) as snapshot:
+        selected = public_fingerprint(snapshot)
+    copy_clipboard(content)
     print('Public SSH key copied to clipboard.\nSHA256 fingerprint: ' + selected)
 
 
@@ -892,7 +1005,7 @@ def local_key(mode):
         print('SHA256 fingerprint: ' + fields[1])
 
 
-def interactive_ssh_command(host, port, user, key):
+def interactive_ssh_command(host, port, user, key, transfer_trust=False):
     """The selected identity may use an unlocked agent; only existing trust is eligible."""
     require(shutil.which('ssh') and shutil.which('ssh-keygen'), 'Missing OpenSSH client tools.')
     validate_cli_path(key)
@@ -909,6 +1022,8 @@ def interactive_ssh_command(host, port, user, key):
         require(info.st_uid == os.getuid() and info.st_mode & 0o022 == 0 and
                 (stat.S_ISDIR(info.st_mode) if path == trusted.parent else stat.S_ISREG(info.st_mode)),
                 'Known-host trust must be owned by you and not writable by group or others.')
+    if transfer_trust:
+        transfer_port_trust(host, port)
     known_host(host, port)
     # Ignore SSH config commands, proxies and alternate identities. Pin the same
     # local trust file inspected above, including when HOME differs from passwd.
@@ -929,7 +1044,7 @@ def cli_connection(mode, inventory, override=None):
     user, key = cli_human_key() if mode == 'connect-user' else (managed_user, managed_key)
     if mode != 'show-controller':
         require(sys.stdin.isatty(), 'SSH connection requires an interactive terminal.')
-    command = interactive_ssh_command(host, port, user, key)
+    command = interactive_ssh_command(host, port, user, key, transfer_trust=mode == 'connect-controller')
     if mode == 'show-controller':
         print(f'ansible_user: {user}\nserver: {host}\nport: {port}\nkey: {key}')
         print('SSH command: ' + shlex.join(command))
@@ -1303,7 +1418,7 @@ def operations(mode, inventory, key=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'show-server-trust', 'trust-server', 'generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
+    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'show-server-trust', 'copy-server-trust', 'trust-server', 'generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=None, help='Legacy key override; explicit inventories own the key path.')
     args = parser.parse_args()
@@ -1312,7 +1427,7 @@ def main():
     try:
         if args.mode == 'setup':
             setup_inventory(inventory)
-        elif args.mode in ('show-server-trust', 'trust-server'):
+        elif args.mode in ('show-server-trust', 'copy-server-trust', 'trust-server'):
             server_trust(args.mode, inventory)
         elif args.mode in ('generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key'):
             local_key(args.mode)
@@ -1330,7 +1445,7 @@ def main():
         print(f'Error: {error}', file=sys.stderr)
         return 1
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        if args.mode in ('show-server-trust', 'trust-server'):
+        if args.mode in ('show-server-trust', 'copy-server-trust', 'trust-server'):
             print('Local host-trust operation failed; no success was confirmed. '
                   'Check local OpenSSH tools and known_hosts permissions; inspect trust before retrying. '
                   + TRUST_GUIDANCE, file=sys.stderr)

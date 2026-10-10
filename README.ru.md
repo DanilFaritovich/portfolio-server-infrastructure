@@ -147,7 +147,9 @@ Initial bootstrap отключает SSH agent authentication и поиск priv
 проверяет подтверждённую запись `known_hosts`; автоматическое добавление host keys
 отключено. Автоматическая handoff verification и `make verify-access` используют
 **OpenSSH + dedicated private key + public-key-only authentication**, с отключёнными
-password prompts и agent. Paramiko используется только для initial password bootstrap.
+password prompts и поддержкой выбранного ключа через `ssh-agent`. Paramiko используется
+для initial password bootstrap и криптографической проверки SSH host key
+при переносе доверия между портами.
 См. [документацию pinned Ansible Paramiko transport](https://docs.ansible.com/projects/ansible-core/2.18/collections/ansible/builtin/paramiko_ssh_connection.html).
 В новых версиях Ansible plugin deprecated и запланирован к удалению в 2.21;
 перед обновлением Ansible до этой версии нужно пересмотреть initial password transport.
@@ -162,10 +164,11 @@ password prompts и agent. Paramiko используется только для
 | `make load-user-key` | Загрузить выбранный существующий ключ в локальный agent | **LOCAL / только agent** |
 | `make show-public-key` | Показать public key и SHA256 fingerprint | **LOCAL / read-only** |
 | `make copy-public-key` | Скопировать public key; предложить установку отсутствующей clipboard-утилиты | **LOCAL / clipboard, опционально APT** |
+| `make copy-server-trust` | Скопировать проверенный trust JSON; предложить установку clipboard-утилиты | **LOCAL / clipboard, опционально APT** |
 | `make show-server-trust` | Экспортировать доверенные OpenSSH host keys и SHA256 fingerprints | **LOCAL / read-only** |
 | `make trust-server` | Импортировать независимо проверенные host keys после подтверждения | **LOCAL / только пользовательский known_hosts** |
 | `make show-controller` | Показать доступ из inventory и SSH-команду | **LOCAL / read-only** |
-| `make connect-controller` | Интерактивный SSH под рабочим пользователем inventory | **LIVE / интерактивная сессия** |
+| `make connect-controller` | Рабочий SSH; предложить проверенное доверие для нового порта | **LIVE / интерактивная сессия** |
 | `make connect-user` | Интерактивный SSH под указанным пользователем | **LIVE / интерактивная сессия** |
 | `make bootstrap-user` | Создать/использовать dedicated key, bootstrap account, проверить доступ | **LIVE / MUTATING** |
 | `make verify-access` | Проверить key-only доступ managed user из inventory | **LIVE / verification**, без изменений managed configuration |
@@ -685,11 +688,11 @@ inventory, полный путь к ключу и готовую SSH-коман�
 интерактивный shell без provisioning или verification playbooks. Действия внутри
 этой сессии могут изменять VPS.
 
-Все три команды требуют существующую доверенную запись в `~/.ssh/known_hosts` для
-`host` либо `[host]:port`. Отсутствие trust блокирует локальную проверку; изменившийся
-host key вызывает отказ при подключении. Автоматического scan, принятия или замены
-trust нет. Для осознанной настройки отсутствующего trust используйте описанные ниже
-`show-server-trust` и `trust-server`. Trust file и каталог должны принадлежать вам, не быть writable для group/others
+SSH требует доверенную запись в `~/.ssh/known_hosts` для `host` (порт 22) либо
+`[host]:port`. `show-controller` и `connect-user` блокируют отсутствие trust;
+изменившийся host key вызывает отказ при подключении. `connect-controller` может
+предложить проверенный перенос с другого доверенного порта, как описано ниже.
+Для настройки доверия на втором ПК используйте `show-server-trust` и `trust-server`. Trust file и каталог должны принадлежать вам, не быть writable для group/others
 и не быть symlinks. SSH использует strict host checking, выбранный identity и key-only
 authentication; password/keyboard-interactive fallback, agent forwarding, другие
 forwarding и connection sharing отключены. SSH client config не используется, чтобы
@@ -705,16 +708,27 @@ characters и OpenSSH expansion tokens запрещены. Разблокиро�
 ### Перенос доверия к серверу на второй компьютер
 
 SSH host keys определяют сервер и отличаются от пользовательских ключей входа.
-Обе команды работают локально, не требуют private keys или рабочего входа,
+Все три команды переноса работают локально, не требуют private keys или рабочего входа,
 не обращаются к VPS и не используют `ssh-keyscan`.
+
+`copy-server-trust` использует тот же проверенный экспорт и clipboard backend,
+что `copy-public-key`: Wayland (`wl-copy`), X11 (`xclip`/`xsel`) или macOS (`pbcopy`).
+В буфер попадает только JSON; адрес, порт, fingerprints и подтверждение успеха
+остаются в терминале. На Ubuntu/Debian при отсутствии утилиты предлагается APT:
+`Install now? [Y/n]:` (Enter/Y принимает; N отменяет установку и копирование).
+В headless-сессии команда рекомендует `show-server-trust`; неинтерактивный запуск
+не устанавливает пакеты. Ошибки установки или clipboard не сообщают об успехе.
+Для VM нужен настроенный общий буфер либо другой проверенный канал передачи.
 
 1. На уже доверенном ПК экспортируйте существующий trust:
 
    ```bash
    make show-server-trust INVENTORY=inventories/production.yml
+   # Или скопируйте только совместимый JSON в desktop clipboard:
+   make copy-server-trust INVENTORY=inventories/production.yml
    ```
 
-   Команда читает используемый проектом источник OpenSSH trust, `~/.ssh/known_hosts`,
+   `show-server-trust` читает используемый проектом источник OpenSSH trust, `~/.ssh/known_hosts`,
    через OpenSSH lookup, включая hashed-записи и нестандартные порты. Она показывает
    host, port, каждый публичный host key и SHA256 fingerprint, затем одну JSON-строку
    для переноса. Другие trust files из client config или системного SSH не используются.
@@ -763,6 +777,45 @@ SSH и существующего Ansible. Сам импорт trust не даё
 Одного fingerprint недостаточно для записи public key. Совпадение fingerprint,
 полученного вместе с непроверенным сетевым ключом, не доказывает identity сервера.
 Не повторяйте password bootstrap на защищённом сервере ради отсутствующего локального trust.
+
+### Переключение SSH-порта с существующим доверием к серверу
+
+После независимой настройки listener/firewall VPS оператором измените только
+`ansible_port` в локальном inventory и выполните:
+
+```bash
+make connect-controller INVENTORY=inventories/laptop2.yml
+```
+
+Если новый endpoint ещё не доверен, интерактивный CLI ищет тот же hostname/IP
+на ранее доверенных портах в локальном `known_hosts`, включая hashed-записи.
+Он показывает прежние endpoints и выполняет SSH handshake на новом порту
+с ограниченными таймаутами через уже закреплённую зависимость Paramiko.
+Negotiation разрешает только алгоритмы host key с существующим доверием,
+включая RSA SHA2. Paramiko проверяет подпись key exchange; предъявленный public
+key также должен совпасть с доверенным. Probe не выполняет пользовательскую
+аутентификацию, не обращается к private keys/agent и не запускает удалённых команд.
+Сетевой scan или совпадение IP сами по себе не разрешают перенос.
+
+Только после доказательства появляется `Trust this server on port …? [y/N]:`.
+Enter/N отменяет подключение без изменения trust. Y добавляет только проверенный
+ключ через существующую атомарную запись с lock и проверкой неизменности snapshot;
+старые endpoints, ключи и комментарии сохраняются. Затем запускается исходная
+OpenSSH-сессия со strict checking и отключённым forwarding. При нескольких
+доверенных алгоритмах добавляется только identity, доказанная этим handshake.
+Повторный запуск использует существующее доверие без probe и дубликатов.
+Закрытый порт, неверная подпись, другой ключ, конфликт identity между портами,
+небезопасные metadata или конкурентное изменение trust останавливают операцию.
+
+Поиск использует точный hostname/IP inventory без DNS aliases, поиска источника
+только по wildcard и сканирования портов. Для hashed-записей имена портов перебираются
+локально; более 32 различных hashed-записей или неподдерживаемый формат приводят
+к безопасному отказу. Используйте явный перенос `show-server-trust`/`trust-server`
+для нужного endpoint. CLI не меняет VPS, inventory или host keys.
+`show-controller` остаётся read-only без probe/import. Неинтерактивные Ansible paths,
+включая `verify-access`, по-прежнему блокируют отсутствие trust без запросов и
+получения ключей из сети. LIVE доступ и clipboard VM проверяет оператор вручную;
+офлайн-тесты не доказывают production access.
 
 ### Загрузка в agent и новый компьютер с одним зашифрованным ключом
 

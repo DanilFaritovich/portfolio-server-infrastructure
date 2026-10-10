@@ -149,7 +149,9 @@ Initial bootstrap disables SSH agent authentication and private-key lookup and
 checks the verified `known_hosts` entry; automatic host-key addition is disabled.
 Both the automatic handoff verification and `make verify-access` use **OpenSSH + the
 dedicated private key + public-key-only authentication**, with password prompts
-and agent use disabled. Paramiko is limited to initial password-based bootstrap.
+disabled and support for the selected key through `ssh-agent`. Paramiko is used for
+initial password-based bootstrap and cryptographic SSH host-key verification
+when transferring trust between ports.
 See [the pinned Ansible Paramiko transport documentation](https://docs.ansible.com/projects/ansible-core/2.18/collections/ansible/builtin/paramiko_ssh_connection.html).
 The plugin is deprecated in newer Ansible releases and scheduled for removal in
 2.21; re-evaluate initial password transport before upgrading Ansible to that version.
@@ -164,10 +166,11 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | `make load-user-key` | Load the selected existing key into the local SSH agent | **LOCAL / agent only** |
 | `make show-public-key` | Display public key and SHA256 fingerprint | **LOCAL / read-only** |
 | `make copy-public-key` | Copy the complete public key; offer missing clipboard package installation | **LOCAL / clipboard, optional APT install** |
+| `make copy-server-trust` | Copy verified server trust JSON; offer missing clipboard package installation | **LOCAL / clipboard, optional APT install** |
 | `make show-server-trust` | Export existing OpenSSH server host trust and SHA256 fingerprints | **LOCAL / read-only** |
 | `make trust-server` | Import independently verified host keys after explicit confirmation | **LOCAL / user known_hosts only** |
 | `make show-controller` | Display inventory access and SSH command | **LOCAL / read-only** |
-| `make connect-controller` | Interactive SSH as the inventory managed user | **LIVE / interactive session** |
+| `make connect-controller` | Interactive managed SSH; offer verified trust for a new port | **LIVE / interactive session** |
 | `make connect-user` | Interactive SSH as the selected human user | **LIVE / interactive session** |
 | `make bootstrap-user` | Create/reuse dedicated key, bootstrap account, then verify | **LIVE / MUTATING** |
 | `make verify-access` | Verify inventory managed key-only access | **LIVE / verification**, no managed configuration changes |
@@ -683,10 +686,11 @@ Both connect commands require a terminal and an already installed matching publi
 They open a normal interactive shell and do not run provisioning or verification
 playbooks. What you run inside that shell can change the VPS.
 
-All three commands require an existing trusted entry in `~/.ssh/known_hosts` for
-`host` or `[host]:port`. Missing trust blocks local preflight; a changed host key
-fails during connection. These commands never scan, accept or replace trust. Use
-`show-server-trust` and `trust-server` below to configure missing trust deliberately.
+SSH requires a trusted entry in `~/.ssh/known_hosts` for `host` (port 22) or
+`[host]:port`. `show-controller` and `connect-user` block missing trust; a changed
+host key fails during connection. `connect-controller` can offer verified transfer
+from another trusted port, as described below. Use `show-server-trust` and
+`trust-server` to establish trust on a second computer.
 The trust file/directory must be owned by you, not writable by group/others and not
 symlinks. SSH uses strict host checking, the selected identity and key-only authentication;
 password/keyboard-interactive fallback, agent forwarding, other forwarding and connection
@@ -703,16 +707,27 @@ the task 1 rules; conflicting managed-key overrides fail.
 ### Transfer server trust to a second computer
 
 Server host keys identify the VPS; they are separate from your user login keys.
-These two commands are entirely local, require no private keys or working login,
+These three trust transfer commands are entirely local, require no private keys or working login,
 and never contact the VPS or use `ssh-keyscan`.
+
+`copy-server-trust` reuses the same validated export and clipboard backend as
+`copy-public-key`: Wayland (`wl-copy`), X11 (`xclip`/`xsel`) or macOS (`pbcopy`).
+Only the JSON is copied; server, port, fingerprints and success confirmation stay
+in the terminal. On Ubuntu/Debian, a missing utility offers APT installation with
+`Install now? [Y/n]:` (Enter/Y accepts; N cancels installation and copying).
+Headless sessions fail with guidance to use `show-server-trust`; non-interactive
+calls never install packages. Copy or installation errors never report success.
+A VM needs a configured shared clipboard or another reviewed transfer channel.
 
 1. On the already trusted PC, export the server's existing trust:
 
    ```bash
    make show-server-trust INVENTORY=inventories/production.yml
+   # Or copy only the compatible JSON to the desktop clipboard:
+   make copy-server-trust INVENTORY=inventories/production.yml
    ```
 
-   The command reads the project's OpenSSH trust source, `~/.ssh/known_hosts`,
+   `show-server-trust` reads the project's OpenSSH trust source, `~/.ssh/known_hosts`,
    using OpenSSH lookup, including hashed entries and nonstandard ports. It prints
    host, port, each public host key and SHA256 fingerprint, then one JSON transfer
    line. It does not consult alternative client-config or system trust files.
@@ -761,6 +776,44 @@ for the same transfer format, populated with verified values:
 A fingerprint alone does not provide the public key, and matching a fingerprint
 supplied alongside an untrusted network key does not authenticate the server.
 Do not rerun password bootstrap on a secured server to bypass missing local trust.
+
+### Switch to another SSH port with existing server trust
+
+After an operator has independently configured the VPS listener/firewall, change
+only `ansible_port` in your local inventory and run:
+
+```bash
+make connect-controller INVENTORY=inventories/laptop2.yml
+```
+
+If the new endpoint lacks trust, the interactive CLI searches the same hostname/IP
+on previously trusted ports in the local `known_hosts`, including hashed entries.
+It displays the old endpoints and completes a bounded SSH handshake on the new
+port using the already pinned Paramiko dependency. Negotiation permits only host-key
+algorithms backed by existing trust (including RSA SHA2 variants). Paramiko verifies
+the key-exchange signature; the presented public key must also equal the trusted
+key. No user authentication, private-key/agent access or remote commands occur
+in this probe. A network scan or matching IP alone cannot authorize transfer.
+
+Only after this proof does `Trust this server on port …? [y/N]:` offer to save the
+verified identity. Enter/N cancels and stops connection without changing trust.
+Y appends only the verified key through the existing locked, snapshot-checked,
+atomic writer; it preserves other endpoints, keys and comments. Then the original
+OpenSSH session starts with strict checking and forwarding disabled. Multiple
+host-key algorithms may be trusted, but only the identity proven by this handshake
+is added. Repeated execution uses existing endpoint trust without probing or adding
+duplicates. An unavailable port, bad signature, different key, conflicting identities
+across ports, unsafe metadata or concurrent trust-file changes stop the operation.
+
+Discovery uses the exact inventory hostname/IP, without DNS aliases, wildcard-only
+source discovery or port scans. It enumerates port names locally to recognize hashes;
+stores with more than 32 distinct hashed entries or unsupported hash formats fail
+safely and require explicit `show-server-trust`/`trust-server` transfer for the desired
+endpoint. No VPS configuration, inventory editing or host-key rotation is performed.
+`show-controller` remains read-only and never probes or imports. Non-interactive
+Ansible paths, including `verify-access`, still fail on missing trust without prompts
+or network key retrieval. LIVE access and VM clipboard integration remain manual
+operator checks; offline tests do not prove production access.
 
 ### Agent loading and a new computer with one encrypted key
 
