@@ -1,0 +1,477 @@
+"""Offline libvirt ownership and lifecycle contracts; no real VM/SSH probes."""
+
+import contextlib
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+import xml.etree.ElementTree as ET
+
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+from portfolio_cli import e2e
+
+CONFIRM = e2e.confirm
+
+
+class StandTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.stand = e2e.Stand(self.base / '.local/share/portfolio-e2e')
+        self.stand.storage = self.base / 'storage'
+        self.stand.root.mkdir(mode=0o700, parents=True)
+        self.stand.storage.mkdir(mode=0o700)
+        self.state = dict(schema=1, uuid='d52aa4d9-889d-448f-847c-762868428aa6',
+                          network_uuid='aa62ef32-d95b-4bc7-b35f-9e72984b2ec8',
+                          phase='ready', subnet='192.168.231.0/24', mac='52:54:00:11:22:33',
+                          cpus=2, memory=4096, size=25)
+        e2e.write_new(self.stand.root / 'state.json', json.dumps(self.state))
+        self.stand.load()
+        e2e.write_new(self.stand.disk, 'synthetic disk')
+        e2e.write_new(self.stand.seed, 'synthetic seed')
+        self.domain = ET.Element('domain', type='kvm')
+        ET.SubElement(self.domain, 'uuid').text = self.state['uuid']
+        ET.SubElement(self.domain, 'name').text = self.stand.name
+        ET.SubElement(self.domain, 'metadata').append(self.stand.metadata())
+        devices = ET.SubElement(self.domain, 'devices')
+        for path, target, device, fmt in ((self.stand.disk, 'vda', 'disk', 'qcow2'), (self.stand.seed, 'sda', 'cdrom', 'raw')):
+            disk = ET.SubElement(devices, 'disk', type='file', device=device)
+            ET.SubElement(disk, 'source', file=str(path))
+            ET.SubElement(disk, 'target', dev=target)
+            ET.SubElement(disk, 'driver', type=fmt)
+            if device == 'cdrom':
+                ET.SubElement(disk, 'readonly')
+        interface = ET.SubElement(devices, 'interface', type='network')
+        ET.SubElement(interface, 'source', network=self.stand.name)
+        ET.SubElement(interface, 'mac', address=self.state['mac'])
+        self.network = ET.Element('network')
+        ET.SubElement(self.network, 'uuid').text = self.state['network_uuid']
+        ET.SubElement(self.network, 'name').text = self.stand.name
+        ET.SubElement(self.network, 'metadata').append(self.stand.metadata())
+        ET.SubElement(self.network, 'forward', mode='nat')
+        ET.SubElement(self.network, 'bridge', name='virbr-e2e')
+        ip = ET.SubElement(self.network, 'ip', address='192.168.231.1', netmask='255.255.255.0')
+        ET.SubElement(ET.SubElement(ip, 'dhcp'), 'host', mac=self.state['mac'], ip=self.stand.ip)
+        self.snapshot = ET.Element('domainsnapshot')
+        ET.SubElement(self.snapshot, 'name').text = 'baseline'
+        ET.SubElement(self.snapshot, 'state').text = 'shutoff'
+        ET.SubElement(self.snapshot, 'memory', snapshot='no')
+        disks = ET.SubElement(self.snapshot, 'disks')
+        ET.SubElement(disks, 'disk', name='vda', snapshot='internal')
+        ET.SubElement(disks, 'disk', name='sda', snapshot='no')
+        self.snapshot.append(ET.fromstring(e2e.xml_text(self.domain)))
+        self.calls = []
+        self.vm_state = 'running'
+        self.domains = [self.state['uuid']]
+        self.networks = [self.state['network_uuid']]
+        self.snapshots = ['baseline']
+        self.mock = patch.object(e2e, 'virsh', side_effect=self.virsh)
+        self.mock.start()
+        self.addCleanup(self.mock.stop)
+        self.commands = patch.object(e2e, 'command', side_effect=self.command)
+        self.commands.start()
+        self.addCleanup(self.commands.stop)
+        self.confirm = patch.object(e2e, 'confirm')
+        self.confirm.start()
+        self.addCleanup(self.confirm.stop)
+
+    def command(self, args, **kwargs):
+        if args[:2] == ['qemu-img', 'info']:
+            return '{"format":"qcow2"}'
+        return '[{"dev":"virbr-e2e"}]'
+
+    def virsh(self, *args):
+        self.calls.append(args)
+        mode = args[0]
+        if mode == 'list':
+            return '\n'.join(self.domains)
+        if mode == 'net-list':
+            return '\n'.join(self.networks)
+        if mode == 'dumpxml':
+            return e2e.xml_text(self.domain)
+        if mode == 'net-dumpxml':
+            return e2e.xml_text(self.network)
+        if mode == 'domstate':
+            return self.vm_state
+        if mode == 'snapshot-list':
+            return '\n'.join(self.snapshots)
+        if mode == 'snapshot-dumpxml':
+            return e2e.xml_text(self.snapshot)
+        if mode == 'net-dhcp-leases':
+            return '52:54:00:11:22:33 ipv4 192.168.231.10/24'
+        if mode == 'shutdown':
+            self.vm_state = 'shut off'
+        if mode == 'start':
+            self.vm_state = 'running'
+        if mode == 'snapshot-delete':
+            self.snapshots.remove(args[2])
+        if mode == 'undefine':
+            self.domains = []
+        if mode == 'net-undefine':
+            self.networks = []
+        return ''
+
+    def mutations(self):
+        readonly = {'list', 'net-list', 'dumpxml', 'net-dumpxml', 'domstate', 'snapshot-list', 'snapshot-dumpxml', 'net-dhcp-leases'}
+        return [args for args in self.calls if args[0] not in readonly]
+
+    def test_existing_prepare_is_readonly_preserves_disks(self):
+        before = self.stand.disk.stat().st_mtime_ns
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(e2e, 'command') as run:
+            self.stand.prepare()
+        self.assertEqual(self.mutations(), [])
+        self.assertEqual(before, self.stand.disk.stat().st_mtime_ns)
+        run.assert_not_called()
+
+    def test_partial_prepare_stops_without_recreation(self):
+        self.state['phase'] = 'preparing'
+        (self.stand.root / 'state.json').write_text(json.dumps(self.state))
+        with self.assertRaisesRegex(ValueError, 'Partial'), patch.object(e2e, 'command') as run:
+            self.stand.prepare()
+        run.assert_not_called()
+        self.assertFalse(self.mutations())
+
+    def test_unjournaled_directory_and_existing_storage_never_overwritten(self):
+        (self.stand.root / 'state.json').unlink()
+        with self.assertRaisesRegex(ValueError, 'without state'):
+            self.stand.prepare()
+        self.assertFalse(self.calls)
+        self.assertEqual(self.stand.disk.read_text(), 'synthetic disk')
+
+    def test_missing_resource_not_recreated(self):
+        self.domains = []
+        with self.assertRaisesRegex(ValueError, 'missing'):
+            self.stand.prepare()
+        self.assertFalse(self.mutations())
+
+    def test_uuid_metadata_path_and_network_conflicts_stop_mutations(self):
+        cases = [('uuid', self.domain.find('uuid'), None, 'wrong'),
+                 ('metadata', self.domain.find('metadata/{' + e2e.NS + '}owner'), 'uuid', 'wrong'),
+                 ('path', self.domain.find('devices/disk/source'), 'file', '/production/foreign.qcow2'),
+                 ('network', self.network.find('uuid'), None, 'wrong')]
+        for name, node, attribute, value in cases:
+            with self.subTest(name=name):
+                old = node.get(attribute) if attribute else node.text
+                if attribute:
+                    node.set(attribute, value)
+                else:
+                    node.text = value
+                with self.assertRaises(ValueError):
+                    self.stand.delete()
+                self.assertFalse(self.mutations())
+                if attribute:
+                    node.set(attribute, old)
+                else:
+                    node.text = old
+
+    def test_libvirt_query_failure_is_not_absence(self):
+        with patch.object(e2e, 'virsh', side_effect=e2e.E2EError('query failed')):
+            with self.assertRaisesRegex(ValueError, 'query failed'):
+                self.stand.delete()
+        self.assertTrue(self.stand.disk.exists())
+
+    def test_reset_orders_shutdown_revert_start(self):
+        self.stand.reset()
+        self.assertEqual([x[0] for x in self.mutations()], ['shutdown', 'snapshot-revert', 'start'])
+
+    def test_reset_decline_and_failed_shutdown_do_not_revert(self):
+        with patch.object(e2e, 'confirm', side_effect=e2e.E2EError('declined')):
+            with self.assertRaises(ValueError):
+                self.stand.reset()
+        self.assertFalse(self.mutations())
+        self.vm_state = 'paused'
+        with self.assertRaisesRegex(ValueError, 'not stopped'):
+            self.stand.reset()
+        self.assertFalse(self.mutations())
+
+    def test_unsupported_snapshot_backend_blocks_reset_delete(self):
+        self.snapshot.find('disks/disk').set('snapshot', 'external')
+        for method in (self.stand.reset, self.stand.delete):
+            with self.assertRaisesRegex(ValueError, 'External'):
+                method()
+        self.assertFalse(self.mutations())
+
+    def test_delete_owned_resources_only(self):
+        foreign = self.base / 'unrelated.qcow2'
+        foreign.write_text('preserve')
+        self.stand.delete()
+        self.assertEqual([x[0] for x in self.mutations()], ['shutdown', 'snapshot-delete', 'undefine', 'net-destroy', 'net-undefine'])
+        self.assertFalse(self.stand.root.exists())
+        self.assertFalse(self.stand.storage.exists())
+        self.assertEqual(foreign.read_text(), 'preserve')
+
+    def test_delete_partial_without_domain_removes_only_fixture(self):
+        self.domains = []
+        self.stand.delete()
+        self.assertNotIn('undefine', [x[0] for x in self.mutations()])
+
+    def test_delete_symlink_hardlink_unknown_storage_stops_before_shutdown(self):
+        outside = self.base / 'outside'
+        outside.write_text('preserve')
+        for kind in ('symlink', 'hardlink', 'unknown'):
+            with self.subTest(kind=kind):
+                path = self.stand.storage / 'unknown'
+                if kind == 'symlink':
+                    path.symlink_to(outside)
+                elif kind == 'hardlink':
+                    os.link(outside, path)
+                else:
+                    path.write_text('unknown')
+                with self.assertRaises(ValueError):
+                    self.stand.delete()
+                path.unlink()
+                self.assertFalse(self.mutations())
+        self.assertEqual(outside.read_text(), 'preserve')
+
+    def test_production_inventory_and_drift_block_before_cli(self):
+        production = self.base / 'production.yml'
+        production.write_text('never read')
+        with self.assertRaisesRegex(ValueError, 'Production'):
+            self.stand.check_inventory(production)
+        inventory = self.stand.expected_inventory()
+        inventory['all']['children']['bootstrap']['hosts']['e2e']['ansible_host'] = '203.0.113.9'
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(inventory))
+        with patch.object(e2e, 'command') as run:
+            with self.assertRaisesRegex(ValueError, 'drift'):
+                self.stand.cli('init-server')
+        run.assert_not_called()
+
+    def test_child_uses_only_isolated_inputs(self):
+        with patch.dict(os.environ, {'INVENTORY': '/production', 'ANSIBLE_CONFIG': '/foreign', 'HUMAN_KEY': '/production/key'}):
+            env = self.stand.child_env()
+        self.assertEqual(env['INVENTORY'], str(self.stand.inventory))
+        self.assertNotIn('/production', json.dumps(env))
+        self.assertEqual(env['HOME'], str(self.stand.root / 'home'))
+
+    def test_test_failure_stops_without_reset(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        def command(args, **kwargs):
+            if args[:4] == ['ip', '-j', 'route', 'get']:
+                return '[{"dev": "virbr-e2e"}]'
+            return ''
+
+        with patch.object(e2e.sys.stdin, 'isatty', return_value=True), \
+                patch.object(e2e, 'command', side_effect=command), patch.object(self.stand, 'cli', side_effect=e2e.E2EError('failed')) as cli:
+            with self.assertRaises(ValueError):
+                self.stand.test()
+        cli.assert_called_once()
+        self.assertFalse(self.mutations())
+
+    def test_default_deny_no_tty_eof_empty(self):
+        with patch.object(e2e.sys.stdin, 'isatty', return_value=False):
+            with self.assertRaises(ValueError):
+                CONFIRM('reset')
+        for answer in ('', 'no'):
+            with patch.object(e2e.sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value=answer):
+                with self.assertRaises(ValueError):
+                    CONFIRM('delete')
+
+    def test_route_to_foreign_network_blocks_all_ssh(self):
+        with patch.object(e2e, 'command', return_value='[{"dev":"eth0","gateway":"192.168.231.1"}]'):
+            with self.assertRaisesRegex(ValueError, 'owned bridge'):
+                self.stand.ready(running=True)
+        self.assertFalse(self.mutations())
+
+    def test_other_vm_attached_to_stand_blocks_deletion(self):
+        self.domains.append('foreign-vm')
+        with self.assertRaisesRegex(ValueError, 'Another VM'):
+            self.stand.delete()
+        self.assertFalse(self.mutations())
+
+    def test_resources_changed_during_confirmation_block_reset(self):
+        def change(_):
+            self.domain.find('uuid').text = 'wrong'
+        with patch.object(e2e, 'confirm', side_effect=change):
+            with self.assertRaises(ValueError):
+                self.stand.reset()
+        self.assertFalse(self.mutations())
+
+    def test_test_sequence_retains_all_existing_confirmations(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        def run(args, **kwargs):
+            return '[{"dev":"virbr-e2e"}]' if args[:4] == ['ip', '-j', 'route', 'get'] else ''
+        with patch.object(e2e.sys.stdin, 'isatty', return_value=True), \
+                patch.object(e2e, 'command', side_effect=run), \
+                patch.object(self.stand, 'cli') as cli, \
+                patch.object(self.stand, 'independent', side_effect=['initial', 'before', 'after']), \
+                patch.dict(os.environ, E2E_FROM='bootstrap'):
+            self.stand.test()
+        self.assertEqual([(c.args, c.kwargs) for c in cli.call_args_list], [
+            (('init-server', 'bootstrap'), {}), (('init-server', 'verify'), {}),
+            (('init-server', 'docker'), {'unchanged': True}), (('init-server', 'verify'), {}),
+            (('reboot-host',), {}), (('init-server', 'verify'), {})])
+        self.assertFalse(self.mutations())
+
+    def test_failed_revert_keeps_disk_does_not_start_or_reset_again(self):
+        original = self.virsh
+        def fail(*args):
+            if args[0] == 'snapshot-revert':
+                self.calls.append(args)
+                raise e2e.E2EError('unsupported revert backend')
+            return original(*args)
+        with patch.object(e2e, 'virsh', side_effect=fail):
+            with self.assertRaisesRegex(ValueError, 'unsupported'):
+                self.stand.reset()
+        self.assertEqual([x[0] for x in self.mutations()], ['shutdown', 'snapshot-revert'])
+        self.assertTrue(self.stand.disk.exists())
+
+    def test_fresh_prepare_uses_cloud_init_then_stopped_baseline(self):
+        # All host tools, download and hypervisor operations are synthetic.
+        self.stand.delete()
+        self.stand.storage.mkdir(mode=0o700)
+        self.calls.clear()
+        self.vm_state = 'shut off'
+        self.snapshots = []
+        real_exists = Path.exists
+        def exists(path):
+            return True if path == Path('/dev/kvm') else real_exists(path)
+        def download():
+            image = self.stand.root / 'image.img'
+            e2e.write_new(image, 'synthetic image')
+            return image
+        def run(args, **kwargs):
+            if args[:4] == ['ip', '-j', 'route', 'show']:
+                return '[]'
+            if args[:3] == ['openssl', 'passwd', '-6']:
+                return '$6$salt$' + 'A' * 86
+            if args[:2] == ['qemu-img', 'info']:
+                return '{"format":"qcow2"}'
+            if args[:2] == ['qemu-img', 'convert']:
+                e2e.write_new(self.stand.disk, 'new synthetic disk')
+            if args[0] == 'cloud-localds':
+                e2e.write_new(self.stand.seed, 'new synthetic seed')
+            if args[0] == 'virt-install':
+                self.domain.find('uuid').text = self.stand.state['uuid']
+                self.domain.find('devices/interface/mac').set('address', self.stand.state['mac'])
+                self.domain.remove(self.domain.find('metadata'))
+                return e2e.xml_text(self.domain)
+            return ''
+        def hypervisor(*args):
+            if args[0] == 'define':
+                self.domain = ET.parse(args[1]).getroot()
+                self.domains = [self.stand.state['uuid']]
+            if args[0] == 'net-define':
+                self.network = ET.parse(args[1]).getroot()
+                self.networks = [self.stand.state['network_uuid']]
+            if args[0] == 'snapshot-create':
+                self.assertEqual(self.vm_state, 'shut off')
+                self.snapshot = ET.parse(args[2]).getroot()
+                ET.SubElement(self.snapshot, 'state').text = 'shutoff'
+                self.snapshot.append(ET.fromstring(e2e.xml_text(self.domain)))
+                self.snapshots = ['baseline']
+            return self.virsh(*args)
+        def confirmation(message):
+            if 'powered off' in message:
+                self.vm_state = 'shut off'
+        with patch.object(Path, 'exists', exists), patch.object(e2e.shutil, 'which', return_value='/synthetic'), \
+                patch.object(e2e.getpass, 'getpass', return_value='disposable-test-password'), \
+                patch.object(self.stand, 'download', side_effect=download), \
+                patch.object(e2e, 'command', side_effect=run), patch.object(e2e, 'virsh', side_effect=hypervisor), \
+                patch.object(e2e, 'confirm', side_effect=confirmation), \
+                patch.dict(os.environ, E2E_CPUS='', E2E_MEMORY='', E2E_DISK_GB='', E2E_SUBNET=''):
+            self.stand.prepare()
+        self.assertEqual(self.stand.state['phase'], 'ready')
+        self.stand.check_inventory(self.stand.inventory)
+        self.assertEqual([c[0] for c in self.mutations()], ['net-define', 'net-start', 'define', 'start', 'snapshot-create', 'start'])
+        cloud = (self.stand.root / 'user-data').read_text()
+        self.assertNotIn('disposable-test-password', cloud)
+        self.assertIn('hashed_passwd', cloud)
+
+    def test_repeat_recaps_enforce_zero_provisioning_allow_exact_smoke(self):
+        names = [yaml.safe_load((e2e.ROOT / 'playbooks' / n).read_text())[0]['name'] for n in
+                 ('docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml', 'verify-docker.yml')]
+        for drift in (False, True):
+            text = ''.join('PLAY [' + name + '] ***\n' +
+                           'e2e : ok=10 changed=' + str(3 if index == 4 else int(drift)) + ' failed=0\n'
+                           for index, name in enumerate(names))
+            class Process:
+                stdout = io.StringIO(text)
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    pass
+                def wait(self):
+                    return 0
+            with patch.object(e2e.subprocess, 'Popen', return_value=Process()), contextlib.redirect_stdout(io.StringIO()):
+                if drift:
+                    with self.assertRaisesRegex(ValueError, 'changed=0'):
+                        e2e.convergence_command(['synthetic'], {})
+                else:
+                    e2e.convergence_command(['synthetic'], {})
+
+    def test_child_guard_validates_args_environment_and_pins_trust(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        (self.stand.root / 'home/.ssh').mkdir(mode=0o700, parents=True)
+        (self.stand.root / 'home').chmod(0o700)
+        (self.stand.root / 'tmp').mkdir(mode=0o700)
+        env = self.stand.child_env()
+        env['ANSIBLE_SSH_EXECUTABLE'] = '/foreign'
+        argv = ['access.py', 'init-server', '--inventory', str(self.stand.inventory), '--key', '']
+        with patch.object(e2e, 'Stand', return_value=self.stand), \
+                patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.base))), \
+                patch.object(e2e.common, 'SSH_BASE', e2e.common.SSH_BASE), \
+                patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', argv):
+            e2e.configure_child()
+            self.assertIn('UserKnownHostsFile="' + str(self.stand.root / 'home/.ssh/known_hosts'), e2e.common.SSH_BASE)
+            self.assertNotIn('ANSIBLE_SSH_EXECUTABLE', os.environ)
+        argv[3] = '/production/never-read.yml'
+        with patch.object(e2e, 'Stand', return_value=self.stand), \
+                patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.base))), \
+                patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', argv):
+            with self.assertRaisesRegex(ValueError, 'arguments forbidden'):
+                e2e.configure_child()
+
+    def test_access_guard_foreign_root_never_dispatches_cli(self):
+        env = dict(os.environ, PORTFOLIO_E2E_ROOT='/foreign')
+        result = subprocess.run([str(e2e.ROOT / '.venv/bin/python'), 'scripts/access.py', 'init-server'],
+                                cwd=e2e.ROOT, env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('guard failed', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+
+    def test_cloud_image_digest_failure_retains_artifact_without_disk_changes(self):
+        payload = b'synthetic image'
+        digest = hashlib.sha256(payload).hexdigest()
+        class Response(io.BytesIO):
+            def __init__(self, data, url):
+                super().__init__(data)
+                self.url = url
+        def fetch(url, **kwargs):
+            data = (digest + ' *' + e2e.IMAGE + '\n').encode() if url.endswith('SHA256SUMS') else payload + b'corruption'
+            return Response(data, url)
+        with patch.object(e2e.urllib.request, 'urlopen', side_effect=fetch), patch.dict(os.environ, E2E_IMAGE_SHA256=''):
+            with self.assertRaisesRegex(ValueError, 'integrity failed'):
+                self.stand.download()
+        self.assertTrue((self.stand.root / 'image.img').exists())
+        self.assertEqual(self.stand.disk.read_text(), 'synthetic disk')
+        self.assertFalse(self.mutations())
+
+    def test_hidden_disk_backing_dependency_blocks_revert(self):
+        with patch.object(e2e, 'command', return_value='{"format":"qcow2","backing-filename":"/foreign"}'):
+            with self.assertRaisesRegex(ValueError, 'backing/data file'):
+                self.stand.reset()
+        self.assertEqual([x[0] for x in self.mutations()], ['shutdown'])
+
+    def test_make_surface_no_live_tools_for_forbidden_override(self):
+        home = self.base / 'fresh-home'
+        home.mkdir(mode=0o700)
+        env = dict(os.environ, E2E_INVENTORY='/production', HOME=str(home))
+        result = subprocess.run(['make', '--no-print-directory', 'e2e-test'], cwd=e2e.ROOT,
+                                env=env, capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('inventory overrides are forbidden', result.stderr)
+        self.assertFalse((home / '.local/share/portfolio-e2e').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()

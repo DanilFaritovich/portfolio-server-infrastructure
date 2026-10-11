@@ -264,3 +264,34 @@ mocking and CLI invocation outside the repository. The clean setup fixture
 copies the package with its entry point. Offline success does not establish
 LIVE access, remote idempotency or recovery readiness; those remain separately
 authorized operator checks.
+
+## Local VM integration boundary
+
+`scripts/e2e.py` invokes `portfolio_cli.e2e`: a separate controller lifecycle for
+one per-user KVM BIOS guest and dedicated NAT on `qemu:///system`. It uses virsh
+XML queries, virt-install XML generation, checked official Ubuntu cloud image,
+minimal cloud-init bootstrap and stopped internal qcow2 snapshots. The module
+owns fixture state/locking, resource validation and the interactive scenario;
+it does not implement provisioning. See [the operator guide](docs/local-vm-e2e.md).
+
+The fixture lives outside the repository, with a private HOME, inventory,
+identities, trust and temporary records. Fixed per-user disk paths live under
+`/var/lib/libvirt/images/portfolio-e2e-<UID>`. State UUIDs plus namespaced domain
+and network metadata and exact device/path validation establish ownership.
+Successful list queries alone establish absence; query errors and partial state
+never authorize recreation. Prepare journals `preparing` before artifacts and
+marks `ready` only after a console-verified stopped baseline. Destructive actions
+validate paths/snapshots and foreign users before and after default-deny consent,
+use graceful shutdown and never force unsupported restoration.
+
+The scenario launches existing `make init-server` and `make reboot-host` children.
+Before importing CLI transports, `access.py` invokes the E2E guard for these
+children: revalidate resources, bridge route/DHCP, exact inventory and fixed child
+inputs, then pin OpenSSH fixture trust. Paramiko uses isolated HOME. Production
+execution and legacy imports do not activate this guard. No roles, verifiers,
+password prompts or security/recovery confirmations are replaced. Numeric Ansible
+recaps prove repeat provisioning is unchanged (with the verifier's exact three
+Docker smoke changes); independent SSH probes and boot IDs cover persistence.
+Errors preserve state and diagnostic snapshots; continuation remains explicit.
+Offline mocked lifecycle tests join the existing unittest discovery; check/CI
+never depend on VM targets. Real compatibility/idempotency remain operator tests.

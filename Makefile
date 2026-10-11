@@ -15,6 +15,13 @@ export PATH := $(abspath $(VENV))/bin:$(PATH)
 .PHONY: init-server
 export INIT_FROM
 
+# LOCAL VM operations; never prerequisites of check/ci. No production inputs.
+.PHONY: e2e-prepare e2e-status e2e-test e2e-reset e2e-delete
+export E2E_CPUS E2E_MEMORY E2E_DISK_GB E2E_SUBNET E2E_IMAGE_SHA256 E2E_FROM
+e2e-prepare e2e-status e2e-test e2e-reset e2e-delete:
+	@test -x $(VENV)/bin/python || { echo "Run make deps first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/e2e.py $(patsubst e2e-%,%,$@)
+
 # Human account inputs are supplied by the caller; USER is intentionally untouched.
 export AGENT_LOAD KEY_FINGERPRINT RECOVERY_USER RECOVERY_KEY KEY_NAME HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
 

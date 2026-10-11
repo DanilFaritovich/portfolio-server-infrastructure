@@ -1552,3 +1552,19 @@ automation accounts cannot be removed through these commands. If key installatio
 succeeds but ledger writing fails, the new entry remains unmanaged: inspect through
 recovery, then explicitly register its identical public line. A failure after credentials
 or sudo were revoked requires manual recovery inspection, without blind retries.
+
+## Local Ubuntu VM E2E
+
+The optional interactive KVM/libvirt fixture tests the existing `make init-server`
+on a disposable Ubuntu Server 24.04 guest. It uses `qemu:///system`, virt-install,
+cloud-init and a dedicated NAT; virt-manager can open its serial console.
+Defaults are 2 vCPU, 4 GiB RAM and 25 GiB qcow2, configurable for new fixtures.
+Production inventory, keys and host trust are excluded. Real VM commands are
+local operator actions and are never run by `make check` or CI.
+
+Read [host prerequisites, preparation, scenarios and recovery](docs/local-vm-e2e.md)
+before running `make e2e-prepare`, `make e2e-status`, `make e2e-test`,
+`make e2e-reset` or `make e2e-delete`. Preparation and destructive operations
+require explicit consent; tests retain all native stage confirmations. The
+scenario covers installation, final verification, repeat provisioning and reboot
+persistence. Failures preserve the guest for console diagnosis, without auto-reset.
