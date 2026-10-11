@@ -113,8 +113,13 @@ for a new fixture, with separate default-deny TTY confirmations:
    directory snapshot and empty contents after confirmation. No existing fixture,
    VM data, other mode or ownership/group drift receives this exception.
 
-The setgid directory gives generated disk/seed files the QEMU group, with 0640
-file permissions. Custom QEMU identities, unsafe paths, missing parent directories,
+The setgid directory gives generated files the QEMU group. New qcow2 disks use
+0660 for QEMU read/write access; seed ISOs use 0640 for read-only access. Both
+disk sources carry `seclabel model="dac" relabel="no"`, so libvirt does not change
+their controller ownership. AppArmor remains enabled. Group write is accepted
+only for the controller-owned qcow2 with mode 0660 and the protected storage
+directory's group; seed files and other paths retain the stricter checks.
+Existing fixtures are not rewritten or repaired. Custom QEMU identities, unsafe paths, missing parent directories,
 KVM/device permission errors, libvirt authorization/service errors or host security
 policy conflicts require manual administrator diagnosis. The existing libvirt/kvm
 group and stock libvirt-qemu storage conventions still apply; accepting a Linux
@@ -219,7 +224,10 @@ console), log in as root, and:
    `systemctl is-active ssh.service` for the stock listener mode.
 3. Run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`; retain its fingerprint.
    Prove root console login works independently of SSH, then run `poweroff`.
-4. Return to prepare and confirm these checks. The VM must be shut off.
+4. Return to prepare and confirm these checks. The wrapper waits up to 120
+   seconds for the guest to reach `shut off`, without requesting or forcing
+   shutdown. Timeout, an unexpected state or a query error stops preparation
+   with the partial fixture retained.
    The wrapper creates/verifies an internal **baseline** snapshot, marks the
    fixture ready and starts it again. Wait for DHCP before testing.
 
@@ -372,4 +380,8 @@ A failed prepare retains phase `preparing`. Another prepare refuses to resume,
 recreate or overwrite it. Use status/console to diagnose, then explicitly delete
 only after ownership validation. Lost/invalid state, unknown resources or drift
 require administrator diagnosis; matching names are insufficient for adoption.
+Older fixtures may have QEMU-owned files left by libvirt's DAC relabeling,
+including a read-only seed ISO after shutdown. These still block status/deletion;
+the new XML policy applies only to new fixtures and does not repair existing
+file ownership or resume partial preparation.
 No secret cloud-init files or VM exports should be attached to public bug reports.

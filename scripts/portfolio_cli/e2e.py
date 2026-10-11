@@ -122,13 +122,16 @@ def disposable_password():
         return password
 
 
-def safe_path(path, *, directory=False, private=True):
+def safe_path(path, *, directory=False, private=True, group_write_gid=None):
     require(path.is_absolute() and path.resolve() == path and
             not any(p.is_symlink() for p in (path, *path.parents)), 'Unsafe E2E path.')
     info = path.lstat()
+    group_write = (group_write_gid is not None and not directory and not private
+                   and info.st_gid == group_write_gid and stat.S_IMODE(info.st_mode) == 0o660)
     require((stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
             and info.st_uid == os.getuid() and (directory or info.st_nlink == 1)
-            and info.st_mode & (0o077 if private else 0o022) == 0, 'Unsafe E2E ownership/mode.')
+            and info.st_mode & (0o077 if private else 0o002 if group_write else 0o022) == 0,
+            'Unsafe E2E ownership/mode.')
 
 
 def write_new(path, content, mode=0o600):
@@ -215,7 +218,12 @@ class Stand:
         owners = tree.findall('metadata/{' + NS + '}owner')
         require(len(owners) == 1 and owners[0].attrib == self.metadata().attrib, 'E2E metadata mismatch; resource is not owned.')
 
-    def domain_xml(self, tree):
+    def disk_file(self):
+        """Only the owned qcow2 may grant its protected storage group write access."""
+        safe_path(self.storage, directory=True, private=False)
+        safe_path(self.disk, private=False, group_write_gid=self.storage.stat().st_gid)
+
+    def domain_xml(self, tree, *, require_dac=False):
         require(tree is not None and tree.tag == 'domain' and tree.get('type') == 'kvm' and tree.findtext('uuid') == self.state['uuid']
                 and tree.findtext('name') == self.name, 'E2E domain UUID/name/type mismatch.')
         self.check_metadata(tree)
@@ -236,7 +244,15 @@ class Stand:
             path = Path(source.get('file', ''))
             require(path in (self.disk, self.seed), 'Foreign E2E disk path.')
             require(path not in found, 'Duplicate E2E disk.')
-            safe_path(path, private=False)
+            labels = source.findall('seclabel')
+            require((not labels and not require_dac) or
+                    (len(labels) == 1 and labels[0].attrib == {'model': 'dac', 'relabel': 'no'}
+                     and not list(labels[0]) and not (labels[0].text or '').strip()),
+                    'Unsupported E2E disk security label.')
+            if path == self.disk:
+                self.disk_file()
+            else:
+                safe_path(path, private=False)
             if path == self.disk:
                 require(disk.get('device') == 'disk' and disk.find('driver').get('type') == 'qcow2'
                         and target.get('dev') == 'vda', 'Unsupported E2E snapshot backend.')
@@ -433,7 +449,7 @@ class Stand:
         require(not self.disk.exists() and not self.disk.is_symlink(), 'Disk appeared during preparation; no overwrite.')
         command(['qemu-img', 'convert', '-f', 'qcow2', '-O', 'qcow2', str(image), str(self.disk)], timeout=300)
         command(['qemu-img', 'resize', str(self.disk), str(config['size']) + 'G'])
-        self.disk.chmod(0o640)
+        self.disk.chmod(0o660)
         # Storage has the operator-selected QEMU group and setgid bit; no chown/sudo here.
         cloud = {'hostname': 'portfolio-e2e', 'disable_root': False, 'ssh_pwauth': True,
                  'users': [{'name': 'root', 'lock_passwd': False, 'hashed_passwd': hashed}],
@@ -469,7 +485,13 @@ class Stand:
         if metadata is None:
             metadata = ET.SubElement(tree, 'metadata')
         metadata.append(self.metadata())
-        self.domain_xml(tree)
+        # QEMU already has group access through the dedicated setgid storage.
+        # Keep controller ownership, including read-only seeds which libvirt
+        # may otherwise leave QEMU-owned after shutdown. Preserve AppArmor.
+        for source in tree.findall('devices/disk/source'):
+            require(not source.findall('seclabel'), 'Unexpected generated disk security label.')
+            ET.SubElement(source, 'seclabel', model='dac', relabel='no')
+        self.domain_xml(tree, require_dac=True)
         write_new(self.root / 'domain.xml', xml_text(tree))
         virsh('define', str(self.root / 'domain.xml'))
         virsh('start', self.state['uuid'])
@@ -479,7 +501,7 @@ class Stand:
               'Retain the fingerprint for first-use trust. Test console recovery, then run poweroff. '
               'Leave console with Ctrl+]. No SSH trust is accepted automatically.', flush=True)
         confirm('Have cloud-init/SSH and console recovery been verified and the guest powered off?')
-        require(virsh('domstate', self.state['uuid']) == 'shut off', 'Guest must be shut off before baseline creation.')
+        self.wait_stopped('Guest must be shut off before baseline creation; shutdown wait timed out.')
         self.resources()
         snapshot = ET.Element('domainsnapshot')
         ET.SubElement(snapshot, 'name').text = 'baseline'
@@ -501,15 +523,22 @@ class Stand:
         virsh('start', self.state['uuid'])
         self.status()
 
+    def wait_stopped(self, message):
+        """Observe operator/graceful shutdown only; never force guest termination."""
+        deadline = time.monotonic() + 120
+        while True:
+            state = virsh('domstate', self.state['uuid'])
+            if state == 'shut off':
+                return
+            require(state in ('running', 'in shutdown'), 'Unexpected guest state while waiting for shutdown; STOP.')
+            require(time.monotonic() < deadline, message)
+            time.sleep(2)
+
     def stop(self):
         state = virsh('domstate', self.state['uuid'])
         if state == 'running':
             virsh('shutdown', self.state['uuid'])
-            deadline = time.monotonic() + 120
-            while time.monotonic() < deadline:
-                if virsh('domstate', self.state['uuid']) == 'shut off':
-                    break
-                time.sleep(2)
+            self.wait_stopped('VM not stopped; use console to shut down. No forced stop/revert.')
         require(virsh('domstate', self.state['uuid']) == 'shut off', 'VM not stopped; use console to shut down. No forced stop/revert.')
 
     def reset(self):
@@ -591,7 +620,7 @@ class Stand:
     def stopped_disk(self):
         """Reject hidden qcow2 backing/data-file dependencies before destructive work."""
         require(virsh('domstate', self.state['uuid']) == 'shut off', 'Disk inspection requires a stopped guest.')
-        safe_path(self.disk, private=False)
+        self.disk_file()
         info = json.loads(command(['qemu-img', 'info', '--output=json', str(self.disk)]))
         require(info.get('format') == 'qcow2' and not info.get('backing-filename')
                 and not info.get('full-backing-filename')
@@ -634,7 +663,10 @@ class Stand:
                     directories.append(path)
                 for name in names:
                     path = Path(parent) / name
-                    safe_path(path, private=root == self.root)
+                    if root == self.storage and path == self.disk:
+                        self.disk_file()
+                    else:
+                        safe_path(path, private=root == self.root)
                     if root == self.storage:
                         require(path in (self.disk, self.seed), 'Unrecognized storage file; no deletion allowed.')
                     files.append(path)

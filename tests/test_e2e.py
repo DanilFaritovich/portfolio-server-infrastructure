@@ -395,7 +395,60 @@ class StandTests(unittest.TestCase):
     def test_jammy_prepare_uses_compatible_cloud_init_and_inventory(self):
         self.fresh_prepare('ubuntu-22.04')
 
-    def fresh_prepare(self, distro):
+    def test_prepare_shutdown_timeout_retains_partial_fixture_without_baseline(self):
+        self.fresh_prepare('ubuntu-24.04', shutdown_timeout=True)
+
+    def test_wait_stopped_rejects_ambiguous_state_without_mutation(self):
+        self.vm_state = 'paused'
+        with self.assertRaisesRegex(ValueError, 'Unexpected guest state'), patch.object(e2e.time, 'sleep') as sleep:
+            self.stand.wait_stopped('timeout')
+        sleep.assert_not_called()
+        self.assertFalse(self.mutations())
+
+    def test_disk_labels_block_drift_preserve_legacy_and_controller_ownership(self):
+        self.stand.domain_xml(self.domain)  # Legacy fixtures need no XML rewrite.
+        for source in self.domain.findall('devices/disk/source'):
+            ET.SubElement(source, 'seclabel', model='dac', relabel='no')
+        self.stand.domain_xml(self.domain, require_dac=True)
+        label = self.domain.find('devices/disk/source/seclabel')
+        for attrs in ({'model': 'dac', 'relabel': 'yes'}, {'model': 'selinux', 'relabel': 'no'}):
+            label.attrib = attrs
+            with self.assertRaisesRegex(ValueError, 'security label'):
+                self.stand.domain_xml(self.domain)
+        label.attrib = {'model': 'dac', 'relabel': 'no'}
+        real_lstat = Path.lstat
+        def foreign_owner(path):
+            info = real_lstat(path)
+            if path == self.stand.seed:
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=os.getuid() + 1, st_nlink=info.st_nlink)
+            return info
+        with patch.object(Path, 'lstat', foreign_owner), self.assertRaisesRegex(ValueError, 'ownership/mode'):
+            self.stand.domain_xml(self.domain)
+
+    def test_group_write_is_limited_to_owned_disk_and_storage_group(self):
+        self.stand.disk.chmod(0o660)
+        self.stand.domain_xml(self.domain)
+        self.vm_state = 'shut off'
+        self.stand.stopped_disk()
+        self.stand.deletion_paths()
+        with self.assertRaisesRegex(ValueError, 'ownership/mode'):
+            e2e.safe_path(self.stand.disk, private=False)
+        self.stand.seed.chmod(0o660)
+        with self.assertRaisesRegex(ValueError, 'ownership/mode'):
+            self.stand.domain_xml(self.domain)
+        self.stand.seed.chmod(0o640)
+        real_stat = Path.stat
+        def wrong_group(path, **kwargs):
+            info = real_stat(path, **kwargs)
+            if path == self.stand.storage:
+                fields = list(info)
+                fields[5] += 1
+                return os.stat_result(fields)
+            return info
+        with patch.object(Path, 'stat', wrong_group), self.assertRaisesRegex(ValueError, 'ownership/mode'):
+            self.stand.disk_file()
+
+    def fresh_prepare(self, distro, *, shutdown_timeout=False):
         # All host tools, download and hypervisor operations are synthetic.
         self.stand.delete()
         self.stand.storage.mkdir(mode=0o700)
@@ -426,7 +479,10 @@ class StandTests(unittest.TestCase):
                 self.domain.remove(self.domain.find('metadata'))
                 return e2e.xml_text(self.domain)
             return ''
+        shutdown = []
         def hypervisor(*args):
+            if args[0] == 'domstate' and shutdown:
+                self.vm_state = shutdown.pop(0)
             if args[0] == 'define':
                 self.domain = ET.parse(args[1]).getroot()
                 self.domains = [self.stand.state['uuid']]
@@ -442,20 +498,37 @@ class StandTests(unittest.TestCase):
             return self.virsh(*args)
         def confirmation(message):
             if 'powered off' in message:
-                self.vm_state = 'shut off'
+                shutdown.extend(['running', 'in shutdown', 'shut off'] if not shutdown_timeout else ['running'])
         with patch.object(Path, 'exists', exists), patch.object(e2e.e2e_host, 'prepare'), \
                 patch.object(e2e.getpass, 'getpass', return_value='disposable-test-password'), \
                 patch.object(self.stand, 'download', side_effect=download), \
                 patch.object(e2e, 'command', side_effect=run), patch.object(e2e, 'virsh', side_effect=hypervisor), \
                 patch.object(e2e, 'confirm', side_effect=confirmation), \
+                patch.object(e2e.time, 'sleep') as sleep, \
+                patch.object(e2e.time, 'monotonic', side_effect=[0, 121] if shutdown_timeout else [0, 1, 2]), \
                 patch.dict(os.environ, E2E_DISTRO=distro, E2E_CPUS='', E2E_MEMORY='', E2E_DISK_GB='', E2E_SUBNET=''):
+            if shutdown_timeout:
+                with self.assertRaisesRegex(ValueError, 'shutdown wait timed out'):
+                    self.stand.prepare()
+                self.assertEqual(self.stand.load()['phase'], 'preparing')
+                self.assertEqual([c[0] for c in self.mutations()], ['net-define', 'net-start', 'define', 'start'])
+                self.assertFalse(self.stand.inventory.exists())
+                self.assertFalse(self.snapshots)
+                sleep.assert_not_called()
+                return
             self.stand.prepare()
+            self.assertEqual(sleep.call_count, 2)
         self.assertEqual(self.stand.state['phase'], 'ready')
         self.assertEqual(self.stand.state['schema'], 2)
         self.assertEqual(self.stand.state['distro'], distro)
         self.assertEqual(self.stand.load()['distro'], distro)
         self.stand.check_inventory(self.stand.inventory)
         self.assertEqual([c[0] for c in self.mutations()], ['net-define', 'net-start', 'define', 'start', 'snapshot-create', 'start'])
+        for source in self.domain.findall('devices/disk/source'):
+            self.assertEqual(source.find('seclabel').attrib, {'model': 'dac', 'relabel': 'no'})
+        self.assertIsNone(self.domain.find('seclabel'))
+        self.assertEqual(self.stand.disk.stat().st_mode & 0o777, 0o660)
+        self.assertEqual(self.stand.seed.stat().st_mode & 0o777, 0o640)
         cloud = (self.stand.root / 'user-data').read_text()
         self.assertNotIn('disposable-test-password', cloud)
         self.assertIn('hashed_passwd', cloud)

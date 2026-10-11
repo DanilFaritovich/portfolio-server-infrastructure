@@ -302,10 +302,15 @@ The fixture lives outside the repository, with a private HOME, inventory,
 identities, trust and temporary records. Fixed per-user disk paths live under
 `/var/lib/libvirt/images/portfolio-e2e-<UID>`. State UUIDs plus namespaced domain
 and network metadata and exact device/path validation establish ownership.
+New disk sources disable only DAC relabeling to preserve controller ownership:
+the qcow2 grants its protected storage group read/write access (0660), while
+the read-only seed uses 0640. Only the exact owned qcow2 may pass the group-write
+exception; legacy fixtures are not rewritten or repaired.
 Successful list queries alone establish absence; query errors and partial state
 never authorize recreation. Prepare journals `preparing` before artifacts and
-marks `ready` only after a console-verified stopped baseline. Destructive actions
-validate paths/snapshots and foreign users before and after default-deny consent,
+marks `ready` only after a console-verified stopped baseline. Baseline creation
+waits up to 120 seconds for operator shutdown. Destructive actions validate
+paths/snapshots and foreign users before and after default-deny consent,
 use graceful shutdown and never force unsupported restoration.
 
 The scenario launches existing `make init-server` and `make reboot-host` children.
