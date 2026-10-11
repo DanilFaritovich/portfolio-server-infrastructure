@@ -13,7 +13,7 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
-from .e2e_images import require
+from .e2e_images import E2EError, require
 
 TOOLS = {'virsh': 'libvirt-clients', 'virt-install': 'virtinst', 'qemu-img': 'qemu-utils',
          'cloud-localds': 'cloud-image-utils', 'openssl': 'openssl', 'ssh-keygen': 'openssh-client',
@@ -197,7 +197,12 @@ def qemu_group():
     require(config.is_file() and not config.is_symlink(), 'Inspect missing/unsafe libvirt qemu.conf manually.')
     info = config.stat()
     require(info.st_uid == 0 and info.st_mode & 0o022 == 0, 'Unsafe libvirt qemu.conf; inspect manually.')
-    text = config.read_text()
+    try:
+        text = config.read_text()
+    except PermissionError:
+        raise E2EError('QEMU configuration is not readable by the controller user. '
+                       'Ask the host administrator to review /etc/libvirt/qemu.conf and provide safe read access; '
+                       'no sudo, permission changes or default identity assumption attempted.') from None
     for field in ('user', 'group'):
         values = re.findall(r'^\s*' + field + r'\s*=\s*(.*?)\s*(?:#.*)?$', text, re.M)
         require(not values or values == ['"libvirt-qemu"'],

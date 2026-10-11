@@ -112,6 +112,17 @@ change libvirt configuration, start services, relax AppArmor/ACLs or grant sudo.
 A declined confirmation leaves later steps unexecuted; already approved package
 or group changes are retained. No automatic rollback or cleanup is attempted.
 
+The controller must be able to read `/etc/libvirt/qemu.conf` to reject custom
+QEMU identities before disk creation. A root-only `0600` file blocks preparation
+even when KVM and libvirt access work. Ask the host administrator to review its
+configuration and arrange safe read access; preparation never reads it through
+sudo, changes its permissions or assumes stock settings when reading fails.
+CLI failures report the operation and safe OS error categories (for example,
+`E2E STOP (fixture lock)` with `EROFS` indicates a read-only filesystem or
+controller sandbox). Arbitrary exception text, paths and subprocess output are
+excluded. Diagnose controller restrictions before requesting a new run; they
+do not establish a VM or libvirt failure.
+
 Optional graphical inspection remains a manual operator action (`virt-manager`).
 A ready existing fixture is freshly validated and displayed without host changes,
 downloads or guest recreation. Partial fixtures stop without resuming preparation.

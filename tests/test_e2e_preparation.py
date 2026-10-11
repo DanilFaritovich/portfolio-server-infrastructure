@@ -1,6 +1,7 @@
 """Host/image preparation tests: every privileged/network/hypervisor probe mocked."""
 
 import contextlib
+import errno
 import io
 import hashlib
 import json
@@ -347,6 +348,39 @@ class PackageTests(unittest.TestCase):
                 patch.object(Path, 'read_text', return_value='user = "libvirt-qemu" # stock\ngroup = "libvirt-qemu"'), \
                 patch.object(host.grp, 'getgrnam', return_value=SimpleNamespace(gr_gid=42)):
             self.assertEqual(host.qemu_group(), 42)
+
+    def test_unreadable_qemu_configuration_blocks_without_exposing_exception(self):
+        with patch.object(Path, 'is_file', return_value=True), patch.object(Path, 'is_symlink', return_value=False), \
+                patch.object(Path, 'stat', return_value=SimpleNamespace(st_uid=0, st_mode=0o600)), \
+                patch.object(Path, 'read_text', side_effect=PermissionError('SECRET\x1b[31m')), \
+                patch.object(host.grp, 'getgrnam') as group:
+            with self.assertRaisesRegex(images.E2EError, 'QEMU configuration is not readable') as caught:
+                host.qemu_group()
+            self.assertNotIn('SECRET', str(caught.exception))
+            group.assert_not_called()
+
+    def test_cli_lock_failure_reports_safe_os_cause_and_never_prepares(self):
+        for code, label in ((errno.EROFS, 'EROFS'), (errno.EACCES, 'EACCES'), (errno.EPERM, 'EPERM'),
+                            (errno.ENOENT, 'ENOENT'), (errno.EIO, 'EIO')):
+            with self.subTest(code=code), patch.object(e2e, 'Stand') as stand, \
+                    patch.object(e2e, 'stand_lock', side_effect=OSError(code, 'SECRET\x1b[31m', '/private/path')), \
+                    patch.object(sys, 'argv', ['e2e.py', 'prepare']), \
+                    contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(e2e.main(), 1)
+                self.assertIn('E2E STOP (fixture lock)', errors.getvalue())
+                self.assertIn(label, errors.getvalue())
+                self.assertNotIn('SECRET', errors.getvalue())
+                self.assertNotIn('/private/path', errors.getvalue())
+                stand.return_value.prepare.assert_not_called()
+
+    def test_error_categories_hide_process_payloads(self):
+        for error, expected in ((subprocess.TimeoutExpired(['SECRET'], 1, output='SECRET'), 'timed out'),
+                                (ValueError('SECRET'), 'Prerequisite'), (EOFError('SECRET'), 'cancelled'),
+                                (KeyboardInterrupt('SECRET'), 'cancelled')):
+            with self.subTest(error=type(error).__name__):
+                reason = e2e.error_reason(error)
+                self.assertIn(expected, reason)
+                self.assertNotIn('SECRET', reason)
 
     def test_host_support_uses_platform_not_distro_or_release(self):
         with patch.object(host.platform, 'system', return_value='Linux'), \

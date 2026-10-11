@@ -5,6 +5,7 @@ A partial preparation is evidence to inspect/delete, never a resumable transacti
 """
 
 import contextlib
+import errno
 import fcntl
 import getpass
 import hashlib
@@ -711,20 +712,41 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     stand = Stand()
+    phase = 'local prerequisites'
     try:
         require(os.getuid() != 0, 'Run E2E as the controller user, never with sudo.')
         require(not os.environ.get('E2E_INVENTORY'), 'E2E inventory overrides are forbidden.')
         if args.mode == 'list-distros':
             e2e_images.list_distros()
             return 0
+        phase = 'fixture lock'
         with stand_lock(stand.root):
+            phase = args.mode
             result = getattr(stand, args.mode)()
         if result is e2e_host.PreparationResult.REBOOT_REQUIRED:
             e2e_host.offer_reboot()
         return 0
     except (ValueError, OSError, subprocess.SubprocessError, KeyboardInterrupt, EOFError, AttributeError, TypeError) as error:
-        reason = str(error) if isinstance(error, E2EError) else 'Prerequisite or execution failed.'
-        print('E2E STOP: ' + reason + ' '
+        reason = error_reason(error)
+        print('E2E STOP (' + phase + '): ' + reason + ' '
               'State retained; inspect local VM console and fixture metadata. '
               'No automatic reset/retry. See docs/local-vm-e2e.md.', file=sys.stderr)
         return 1
+
+
+def error_reason(error):
+    """Expose only static reasons and OS categories, never exception payloads."""
+    if isinstance(error, E2EError):
+        return str(error)
+    if isinstance(error, subprocess.TimeoutExpired):
+        return 'Command timed out; completion is unconfirmed.'
+    if isinstance(error, OSError):
+        code = errno.errorcode.get(error.errno) if type(error.errno) is int else None
+        reasons = {errno.EROFS: 'Filesystem is read-only; check controller sandbox/mount restrictions.',
+                   errno.EACCES: 'Permission denied; check controller access restrictions with the administrator.',
+                   errno.EPERM: 'Operation not permitted; check controller sandbox/access restrictions.',
+                   errno.ENOENT: 'Required local file or executable is missing.'}
+        return reasons.get(error.errno, 'Local I/O or process operation failed.') + (f' ({code})' if code else '')
+    if isinstance(error, (EOFError, KeyboardInterrupt)):
+        return 'Interactive operation cancelled; completion is unconfirmed.'
+    return 'Prerequisite or execution failed.'
