@@ -1,5 +1,6 @@
 """Capability-based Linux controller preparation; never VM creation."""
 
+from enum import Enum
 import grp
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
 from .e2e_images import require
@@ -17,6 +19,56 @@ TOOLS = {'virsh': 'libvirt-clients', 'virt-install': 'virtinst', 'qemu-img': 'qe
          'cloud-localds': 'cloud-image-utils', 'openssl': 'openssl', 'ssh-keygen': 'openssh-client',
          'ssh': 'openssh-client', 'ip': 'iproute2', 'qemu-system-x86_64': 'qemu-system-x86'}
 PACKAGES = tuple(sorted(set(TOOLS.values()) | {'libvirt-daemon-system'}))
+
+
+class PreparationResult(Enum):
+    READY = 'ready'
+    RELOGIN_REQUIRED = 'relogin-required'
+
+
+def relogin():
+    """Offer a native, non-forced logout only from a local GNOME session."""
+    print('✓ Host permissions configured successfully.\nA new login session is required.')
+    later = 'Log out manually when ready. After logging back in, run: make e2e-prepare'
+    if not sys.stdin.isatty():
+        print(later)
+        return
+    print('\n[1] Log out now\n[2] Log out later\n')
+    try:
+        while True:
+            choice = input('Choose [1/2]: ').strip()
+            if choice in ('', '2'):
+                print(later)
+                return
+            if choice == '1':
+                break
+            print('Choose 1 or 2; press Enter to log out later.')
+        print('After logging back in, run: make e2e-prepare')
+        print('Save your work first: logging out may lose unsaved data.')
+        if input('Log out of the current graphical session now? [y/N] ').strip().lower() not in ('y', 'yes'):
+            print(later)
+            return
+    except (EOFError, KeyboardInterrupt):
+        print('\n' + later)
+        return
+    desktop = os.environ.get('XDG_CURRENT_DESKTOP', '').split(':')
+    executable = shutil.which('gnome-session-quit')
+    if (not executable or 'GNOME' not in desktop
+            or os.environ.get('XDG_SESSION_TYPE') not in ('x11', 'wayland')
+            or not os.environ.get('DBUS_SESSION_BUS_ADDRESS')
+            or any(os.environ.get(name) for name in ('SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY'))):
+        print('Automatic logout is unavailable for this session. ' + later)
+        return
+    try:
+        # Keep the desktop's own confirmation/inhibitors. Never force or retry.
+        result = subprocess.run([executable, '--logout'], capture_output=True,
+                                text=True, timeout=30, check=False)
+        if result.returncode != 0:
+            print('Automatic logout is unavailable. ' + later)
+        else:
+            print('Logout requested. If you remain logged in, ' + later)
+    except (OSError, subprocess.SubprocessError, KeyboardInterrupt):
+        print('Automatic logout could not be completed. ' + later)
 
 
 def supported_host():
@@ -124,7 +176,13 @@ def prepare(storage, *, command, confirm, safe_path):
               + '. libvirt access is root-equivalent; only trusted administrators should receive it.')
         confirm('Grant these libvirt/KVM host permissions using sudo?')
         privileged(['usermod', '-aG', ','.join(additions), '--', account.pw_name], command)
-    require(not pending, 'Log out and log in again to apply libvirt/kvm groups, then rerun make e2e-prepare. No VM created.')
+    if pending:
+        # Successful usermod alone is insufficient evidence of configured membership.
+        configured = {name: grp.getgrnam(name) for name in pending}
+        require(all(account.pw_name in group.gr_mem or group.gr_gid == account.pw_gid
+                    for group in configured.values()),
+                'Host group permissions were not configured; inspect manually, no automatic retry.')
+        return PreparationResult.RELOGIN_REQUIRED
     require(os.access(kvm, os.R_OK | os.W_OK), 'No read/write KVM access; inspect device ACLs/permissions manually.')
     # Failure is not absence and must not trigger service/polkit configuration changes.
     command(['virsh', '--connect', 'qemu:///system', 'list', '--all', '--uuid'])
@@ -150,3 +208,5 @@ def prepare(storage, *, command, confirm, safe_path):
     require(info.st_gid == gid and stat.S_IMODE(info.st_mode) == 0o2750
             and os.access(storage, os.R_OK | os.W_OK | os.X_OK),
             'Existing disk directory has incompatible QEMU group/mode/access; inspect manually, no chmod/chown repair.')
+
+    return PreparationResult.READY

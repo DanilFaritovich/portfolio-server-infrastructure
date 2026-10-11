@@ -275,7 +275,12 @@ validates the declarative image registry and rejects redirects before following;
 `e2e_host` validates Linux x86_64/KVM/libvirt capabilities without host release
 allowlists. It handles only explicitly confirmed missing packages through a reviewed
 Ubuntu/Debian apt mapping, additive groups and exclusive dedicated directory
-creation. Unsupported installers require manual dependencies; prepared hosts
+creation. Configured but ineffective groups return `RELOGIN_REQUIRED`; the CLI
+releases the fixture lock before offering logout now/later and exits successfully
+without fixture creation. A separately confirmed local GNOME logout request keeps
+native confirmation/inhibitors; unsupported or failed requests use manual instructions.
+A fresh prepare revalidates permissions; group errors remain fail-closed.
+Unsupported installers require manual dependencies; prepared hosts
 continue only after capability/access/storage checks. Guest profiles stay strict. Neither implements
 provisioning or recovery. Schema-2 state records the distro; schema-1 Noble fixtures
 remain readable without migration. The lifecycle module

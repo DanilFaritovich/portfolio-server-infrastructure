@@ -40,7 +40,35 @@ for a new fixture, with separate default-deny TTY confirmations:
 2. Missing libvirt/kvm membership is offered separately, using only additive
    `usermod -aG`. **libvirt access is root-equivalent**; grant it only to trusted
    local administrators. If configured groups are not effective in this session,
-   prepare stops: log out/in and rerun it. No guest is created before relogin.
+   prepare finishes successfully with a relogin-required result, before disk/VM
+   creation. An interactive menu offers **Log out now** or **Log out later**:
+
+   ```text
+   ✓ Host permissions configured successfully.
+   A new login session is required.
+
+   [1] Log out now
+   [2] Log out later
+
+   Choose [1/2]:
+   ```
+
+   Log out now prints `After logging back in, run: make e2e-prepare`, warns about
+   unsaved data and requires a separate default-deny `[y/N]` confirmation. Only
+   local GNOME X11/Wayland sessions with a session bus and `gnome-session-quit`
+   receive the native `--logout` request; desktop confirmation/inhibitors remain.
+   Unsupported desktops, SSH sessions, missing tools and logout failures receive
+   manual logout instructions without retry or a traceback. Log out later, an empty
+   choice, declined confirmation or interrupted input preserves configured groups
+   and exits successfully with the same instruction. Without a TTY, only manual
+   instructions are printed. No sudo logout, newgrp/sg, forced session termination
+   or automatic reboot is used.
+
+   After logging back in, rerun `make e2e-prepare` (repeat `E2E_DISTRO` if selected).
+   It freshly checks effective groups, KVM/libvirt access and storage, then proceeds
+   with the existing confirmations; no extra permission commands are needed.
+   Group setup errors or unverified membership still fail closed. No guest or
+   fixture state is created before relogin.
 3. The missing `/var/lib/libvirt/images/portfolio-e2e-<UID>` directory is offered
    separately. Exclusive `mkdir` refuses a concurrently appearing path; only this
    new directory receives controller ownership, stock `libvirt-qemu` group and

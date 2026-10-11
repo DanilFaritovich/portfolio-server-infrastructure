@@ -362,7 +362,9 @@ class Stand:
             return
         require(not self.root.exists() and not self.root.is_symlink(), 'Existing E2E directory without state; inspect manually.')
         profile = e2e_images.select(os.environ.get('E2E_DISTRO'))
-        e2e_host.prepare(self.storage, command=command, confirm=confirm, safe_path=safe_path)
+        result = e2e_host.prepare(self.storage, command=command, confirm=confirm, safe_path=safe_path)
+        if result is e2e_host.PreparationResult.RELOGIN_REQUIRED:
+            return result
         require(not list(self.storage.iterdir()), 'E2E storage must be empty; no disk will be overwritten.')
         config = {'subnet': os.environ.get('E2E_SUBNET') or '192.168.231.0/24',
                   'cpus': int(os.environ.get('E2E_CPUS') or '2'), 'memory': int(os.environ.get('E2E_MEMORY') or '4096'),
@@ -716,7 +718,9 @@ def main():
             e2e_images.list_distros()
             return 0
         with stand_lock(stand.root):
-            getattr(stand, args.mode)()
+            result = getattr(stand, args.mode)()
+        if result is e2e_host.PreparationResult.RELOGIN_REQUIRED:
+            e2e_host.relogin()
         return 0
     except (ValueError, OSError, subprocess.SubprocessError, KeyboardInterrupt, EOFError, AttributeError, TypeError) as error:
         reason = str(error) if isinstance(error, E2EError) else 'Prerequisite or execution failed.'
