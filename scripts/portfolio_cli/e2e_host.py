@@ -23,17 +23,18 @@ PACKAGES = tuple(sorted(set(TOOLS.values()) | {'libvirt-daemon-system'}))
 
 class PreparationResult(Enum):
     READY = 'ready'
-    RELOGIN_REQUIRED = 'relogin-required'
+    REBOOT_REQUIRED = 'reboot-required'
 
 
-def relogin():
-    """Offer a native, non-forced logout only from a local GNOME session."""
-    print('✓ Host permissions configured successfully.\nA new login session is required.')
-    later = 'Log out manually when ready. After logging back in, run: make e2e-prepare'
+def offer_reboot():
+    """Offer a normal local system restart after verified group configuration."""
+    print('✓ Host permissions configured successfully.\n'
+          'A system restart is required to activate new permissions.')
+    later = 'Restart the system manually when ready. After rebooting, run: make e2e-prepare'
     if not sys.stdin.isatty():
         print(later)
         return
-    print('\n[1] Log out now\n[2] Log out later\n')
+    print('\n[1] Reboot now (recommended)\n[2] Reboot later\n')
     try:
         while True:
             choice = input('Choose [1/2]: ').strip()
@@ -42,33 +43,31 @@ def relogin():
                 return
             if choice == '1':
                 break
-            print('Choose 1 or 2; press Enter to log out later.')
-        print('After logging back in, run: make e2e-prepare')
-        print('Save your work first: logging out may lose unsaved data.')
-        if input('Log out of the current graphical session now? [y/N] ').strip().lower() not in ('y', 'yes'):
+            print('Choose 1 or 2; press Enter to reboot later.')
+        print('After rebooting, run: make e2e-prepare')
+        print('Save your work first: rebooting may lose unsaved data.')
+        if input('Reboot this system now? [y/N] ').strip().lower() not in ('y', 'yes'):
             print(later)
             return
     except (EOFError, KeyboardInterrupt):
         print('\n' + later)
         return
-    desktop = os.environ.get('XDG_CURRENT_DESKTOP', '').split(':')
-    executable = shutil.which('gnome-session-quit')
-    if (not executable or 'GNOME' not in desktop
-            or os.environ.get('XDG_SESSION_TYPE') not in ('x11', 'wayland')
-            or not os.environ.get('DBUS_SESSION_BUS_ADDRESS')
+    executable = shutil.which('systemctl')
+    if (not executable or os.getuid() == 0
             or any(os.environ.get(name) for name in ('SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY'))):
-        print('Automatic logout is unavailable for this session. ' + later)
+        print('Automatic reboot is unavailable for this session. ' + later)
         return
     try:
-        # Keep the desktop's own confirmation/inhibitors. Never force or retry.
-        result = subprocess.run([executable, '--logout'], capture_output=True,
-                                text=True, timeout=30, check=False)
+        # Captured output is non-interactive: explicitly respect inhibitors.
+        # Keep system authorization; never use sudo, force, fallback or retry.
+        result = subprocess.run([executable, '--check-inhibitors=yes', '--no-ask-password', 'reboot'],
+                                capture_output=True, text=True, timeout=30, check=False)
         if result.returncode != 0:
-            print('Automatic logout is unavailable. ' + later)
+            print('Automatic reboot is unavailable. ' + later)
         else:
-            print('Logout requested. If you remain logged in, ' + later)
+            print('Reboot requested. If the system does not restart, ' + later)
     except (OSError, subprocess.SubprocessError, KeyboardInterrupt):
-        print('Automatic logout could not be completed. ' + later)
+        print('Automatic reboot could not be confirmed; inspect system state before any manual retry. ' + later)
 
 
 def supported_host():
@@ -182,7 +181,7 @@ def prepare(storage, *, command, confirm, safe_path):
         require(all(account.pw_name in group.gr_mem or group.gr_gid == account.pw_gid
                     for group in configured.values()),
                 'Host group permissions were not configured; inspect manually, no automatic retry.')
-        return PreparationResult.RELOGIN_REQUIRED
+        return PreparationResult.REBOOT_REQUIRED
     require(os.access(kvm, os.R_OK | os.W_OK), 'No read/write KVM access; inspect device ACLs/permissions manually.')
     # Failure is not absence and must not trigger service/polkit configuration changes.
     command(['virsh', '--connect', 'qemu:///system', 'list', '--all', '--uuid'])

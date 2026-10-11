@@ -1574,9 +1574,12 @@ persistence. Failures preserve the guest for console diagnosis, without auto-res
 capabilities without a Ubuntu version allowlist. Compatible Ubuntu/Debian apt environments offer missing-package
 installation; other managers require manual setup when tools are missing. Prepare
 offers additive libvirt/kvm groups and a dedicated disk directory with separate `[y/N]` confirmations. Group
-changes finish successfully with a Log out now/later menu. Immediate logout warns
-about unsaved data and requires a separate `[y/N]`; supported local GNOME sessions
-use a non-forced native request, otherwise manual logout instructions are shown.
-After logging back in, rerun `make e2e-prepare` to recheck access and continue;
-no VM is created before relogin. Ready VMs are preserved and distro changes are blocked.
+changes finish successfully with a Reboot now/later menu only while configured groups
+remain inactive. Reboot now prints the rerun instruction, warns about unsaved data
+and requires a separate `[y/N]`. A local non-root session uses
+`systemctl --check-inhibitors=yes --no-ask-password reboot`, respecting system
+inhibitors/authorization without sudo or force; unavailable/remote/failed requests
+show manual restart instructions without retry. Reboot later exits successfully.
+After rebooting, rerun `make e2e-prepare` to recheck access and continue;
+no VM is created before permissions become active. Ready VMs are preserved and distro changes are blocked.
 SHA-256 verification and optional `E2E_IMAGE_SHA256` pinning remain mandatory checks.

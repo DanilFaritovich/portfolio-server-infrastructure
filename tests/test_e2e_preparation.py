@@ -202,16 +202,16 @@ class HostTests(unittest.TestCase):
             self.prepare()
         self.assertEqual(self.run.call_count, 2)
 
-    def test_group_grant_requires_separate_consent_and_relogin(self):
+    def test_group_grant_requires_separate_consent_and_reboot(self):
         self.groups['libvirt'] = SimpleNamespace(gr_gid=987654, gr_mem=[])
         self.run.side_effect = lambda *args, **kwargs: self.groups['libvirt'].gr_mem.append('tester')
-        self.assertIs(self.prepare(), host.PreparationResult.RELOGIN_REQUIRED)
+        self.assertIs(self.prepare(), host.PreparationResult.REBOOT_REQUIRED)
         self.assertEqual(self.run.call_args.args[0], ['sudo', '--', 'usermod', '-aG', 'libvirt', '--', 'tester'])
         self.confirm.assert_called_once()
 
-    def test_already_configured_group_requires_relogin_without_usermod(self):
+    def test_already_configured_group_requires_reboot_without_usermod(self):
         self.groups['libvirt'] = SimpleNamespace(gr_gid=987654, gr_mem=['tester'])
-        self.assertIs(self.prepare(), host.PreparationResult.RELOGIN_REQUIRED)
+        self.assertIs(self.prepare(), host.PreparationResult.REBOOT_REQUIRED)
         self.run.assert_not_called()
         self.confirm.assert_not_called()
 
@@ -221,7 +221,7 @@ class HostTests(unittest.TestCase):
             self.prepare()
         self.assertEqual(self.run.call_count, 1)
 
-    def test_fresh_login_rechecks_access_without_grant(self):
+    def test_after_reboot_rechecks_access_without_grant(self):
         self.groups['libvirt'] = SimpleNamespace(gr_gid=987654, gr_mem=['tester'])
         with patch.object(host.os, 'getgroups', return_value=[987654]):
             self.assertIs(self.prepare(), host.PreparationResult.READY)
@@ -393,25 +393,24 @@ class PackageTests(unittest.TestCase):
             run.assert_not_called()
 
 
-class ReloginTests(unittest.TestCase):
+class RebootTests(unittest.TestCase):
     def setUp(self):
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
         self.output = self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.stack.enter_context(patch.object(host.sys.stdin, 'isatty', return_value=True))
-        self.stack.enter_context(patch.dict(os.environ, {
-            'XDG_CURRENT_DESKTOP': 'ubuntu:GNOME', 'XDG_SESSION_TYPE': 'wayland',
-            'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/mock/bus'}, clear=True))
-        self.which = self.stack.enter_context(patch.object(host.shutil, 'which', return_value='/mock/gnome-session-quit'))
+        self.stack.enter_context(patch.dict(os.environ, {}, clear=True))
+        self.stack.enter_context(patch.object(host.os, 'getuid', return_value=1000))
+        self.which = self.stack.enter_context(patch.object(host.shutil, 'which', return_value='/mock/systemctl'))
         self.run = self.stack.enter_context(patch.object(host.subprocess, 'run', return_value=SimpleNamespace(returncode=0)))
 
     def interact(self, answers):
         with patch('builtins.input', side_effect=answers):
-            host.relogin()
+            host.offer_reboot()
         self.assertIn('make e2e-prepare', self.output.getvalue())
         self.assertNotIn('E2E STOP', self.output.getvalue())
 
-    def test_later_and_default_do_not_logout(self):
+    def test_later_and_default_do_not_reboot(self):
         for answer in ('2', ''):
             self.interact([answer])
         self.run.assert_not_called()
@@ -426,31 +425,38 @@ class ReloginTests(unittest.TestCase):
         self.run.assert_not_called()
         self.assertIn('unsaved data', self.output.getvalue())
 
-    def test_now_warns_before_consent_and_requests_native_logout(self):
+    def test_now_warns_before_consent_and_requests_native_reboot(self):
         def answer(prompt):
             if '[y/N]' in prompt:
                 self.assertIn('unsaved data', self.output.getvalue())
-                self.assertIn('After logging back in, run: make e2e-prepare', self.output.getvalue())
+                self.assertIn('After rebooting, run: make e2e-prepare', self.output.getvalue())
                 self.run.assert_not_called()
                 return 'y'
             return '1'
         with patch('builtins.input', side_effect=answer):
-            host.relogin()
-        self.assertEqual(self.run.call_args.args[0], ['/mock/gnome-session-quit', '--logout'])
+            host.offer_reboot()
+        self.assertEqual(self.run.call_args.args[0], ['/mock/systemctl', '--check-inhibitors=yes', '--no-ask-password', 'reboot'])
         self.assertEqual(self.run.call_args.kwargs['timeout'], 30)
+        self.run.assert_called_once()
+        self.assertIn('Reboot requested', self.output.getvalue())
+        self.assertIn('[1] Reboot now (recommended)', self.output.getvalue())
+
+    def test_root_does_not_bypass_system_authorization(self):
+        with patch.object(host.os, 'getuid', return_value=0):
+            self.interact(['1', 'y'])
+        self.run.assert_not_called()
 
     def test_unsupported_or_remote_session_falls_back_manually(self):
-        for env in ({'XDG_CURRENT_DESKTOP': 'KDE'}, {'XDG_SESSION_TYPE': 'tty'},
-                    {'DBUS_SESSION_BUS_ADDRESS': ''}, {'SSH_CONNECTION': 'mock'},
+        for env in ({'SSH_CONNECTION': 'mock'},
                     {'SSH_CLIENT': 'mock'}, {'SSH_TTY': '/mock'}):
             with patch.dict(os.environ, env):
                 self.interact(['1', 'yes'])
         self.which.return_value = None
         self.interact(['1', 'y'])
         self.run.assert_not_called()
-        self.assertIn('Automatic logout is unavailable', self.output.getvalue())
+        self.assertIn('Automatic reboot is unavailable', self.output.getvalue())
 
-    def test_logout_errors_are_manual_without_retry(self):
+    def test_reboot_errors_are_manual_without_retry(self):
         for error in (FileNotFoundError(), subprocess.TimeoutExpired('mock', 30),
                       subprocess.CalledProcessError(1, 'mock'), KeyboardInterrupt()):
             self.run.side_effect = error
@@ -459,11 +465,11 @@ class ReloginTests(unittest.TestCase):
         self.run.return_value.returncode = 1
         self.interact(['1', 'y'])
         self.assertEqual(self.run.call_count, 5)
-        self.assertIn('Log out manually', self.output.getvalue())
+        self.assertIn('Restart the system manually', self.output.getvalue())
 
     def test_non_tty_and_interrupted_input_are_safe(self):
         with patch.object(host.sys.stdin, 'isatty', return_value=False), patch('builtins.input') as read:
-            host.relogin()
+            host.offer_reboot()
             read.assert_not_called()
         for answers in ([EOFError()], [KeyboardInterrupt()], ['1', EOFError()], ['1', KeyboardInterrupt()]):
             self.interact(answers)
@@ -472,9 +478,9 @@ class ReloginTests(unittest.TestCase):
     def test_prepare_returns_before_fixture_or_vm_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             stand = e2e.Stand(Path(directory) / 'fixture')
-            with patch.object(host, 'prepare', return_value=host.PreparationResult.RELOGIN_REQUIRED), \
+            with patch.object(host, 'prepare', return_value=host.PreparationResult.REBOOT_REQUIRED), \
                     patch.object(e2e, 'command') as command, patch.object(e2e, 'confirm') as confirm:
-                self.assertIs(stand.prepare(), host.PreparationResult.RELOGIN_REQUIRED)
+                self.assertIs(stand.prepare(), host.PreparationResult.REBOOT_REQUIRED)
             command.assert_not_called()
             confirm.assert_not_called()
             self.assertFalse(stand.root.exists())
@@ -494,13 +500,26 @@ class ReloginTests(unittest.TestCase):
             self.assertFalse(locked)
 
         with patch.object(e2e, 'Stand') as stand, patch.object(e2e, 'stand_lock', side_effect=lock), \
-                patch.object(host, 'relogin', side_effect=menu) as relogin, \
+                patch.object(host, 'offer_reboot', side_effect=menu) as offer_reboot, \
                 patch.object(sys, 'argv', ['e2e.py', 'prepare']), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
-            stand.return_value.prepare.return_value = host.PreparationResult.RELOGIN_REQUIRED
+            stand.return_value.prepare.return_value = host.PreparationResult.REBOOT_REQUIRED
             self.assertEqual(e2e.main(), 0)
-        relogin.assert_called_once()
+        offer_reboot.assert_called_once()
         self.assertEqual(errors.getvalue(), '')
+
+    def test_cli_ready_or_failed_preparation_never_offers_reboot(self):
+        for failure in (False, True):
+            with self.subTest(failure=failure), patch.object(e2e, 'Stand') as stand, \
+                    patch.object(e2e, 'stand_lock', return_value=contextlib.nullcontext()), \
+                    patch.object(host, 'offer_reboot') as offer, \
+                    patch.object(sys, 'argv', ['e2e.py', 'prepare']), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                stand.return_value.prepare.return_value = host.PreparationResult.READY
+                if failure:
+                    stand.return_value.prepare.side_effect = e2e.E2EError('Group configuration failed')
+                self.assertEqual(e2e.main(), int(failure))
+                offer.assert_not_called()
 
 
 if __name__ == '__main__':
