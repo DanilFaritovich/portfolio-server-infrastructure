@@ -8,10 +8,12 @@ access, package compatibility, snapshot support or idempotency.
 
 ## Host preparation (explicit operator consent)
 
-Automatic preparation supports Ubuntu Linux **22.04 or 24.04 amd64** controllers
-with hardware virtualization enabled, at least 2 available CPU cores, 4 GiB guest
-RAM and sufficient disk space for a 25 GiB qcow2 disk, the cloud image and internal
-snapshots. Other controller releases/architectures are not automatically supported.
+Host eligibility depends on capabilities: **Linux x86_64**, hardware virtualization,
+working QEMU/KVM and system libvirt, required tools, permissions and safe storage.
+There is no host Ubuntu release allowlist. At least 2 available CPU cores, 4 GiB
+guest RAM and sufficient disk space for a 25 GiB qcow2 disk, the cloud image and
+internal snapshots are required. Guest support remains restricted to the registry
+profiles below; accepting a host does not add Guest OS support.
 Run `make deps` first to prepare the project's local Python tooling; never run
 `make` as root.
 
@@ -22,11 +24,19 @@ for a new fixture, with separate default-deny TTY confirmations:
 
 1. Missing dependencies are listed before offering `sudo apt-get update` and
    `sudo apt-get install --no-install-recommends --no-upgrade --no-remove` for
-   **only missing packages**. The package set is qemu-kvm, qemu-system-x86,
+   **only missing packages**. The reviewed package mapping is selected only when
+   os-release identifies Ubuntu or Debian and both apt-get and dpkg-query exist,
+   without restricting release numbers. An apt executable or ID_LIKE alone does
+   not establish compatibility. The package set is qemu-system-x86,
    qemu-utils, libvirt-daemon-system, libvirt-clients, virtinst, cloud-image-utils,
    openssl, iproute2 and openssh-client. Installed packages are not reinstalled;
    installed packages with missing executables require manual PATH/package repair.
    Native sudo and apt prompts remain interactive. Failure stops without retry.
+   Other managers, unknown OS metadata or missing apt/dpkg tools never trigger
+   automatic installation: missing commands are listed with manual installation
+   instructions. A manually prepared host may continue without package-manager
+   support if all tools and subsequent capability/access/storage checks pass.
+   No distribution-specific package names are guessed for unsupported managers.
 2. Missing libvirt/kvm membership is offered separately, using only additive
    `usermod -aG`. **libvirt access is root-equivalent**; grant it only to trusted
    local administrators. If configured groups are not effective in this session,
@@ -40,7 +50,9 @@ for a new fixture, with separate default-deny TTY confirmations:
 The setgid directory gives generated disk/seed files the QEMU group, with 0640
 file permissions. Custom QEMU identities, unsafe paths, missing parent directories,
 KVM/device permission errors, libvirt authorization/service errors or host security
-policy conflicts require manual administrator diagnosis. Preparation does not
+policy conflicts require manual administrator diagnosis. The existing libvirt/kvm
+group and stock libvirt-qemu storage conventions still apply; accepting a Linux
+host does not automatically migrate its hypervisor configuration. Preparation does not
 change libvirt configuration, start services, relax AppArmor/ACLs or grant sudo.
 A declined confirmation leaves later steps unexecuted; already approved package
 or group changes are retained. No automatic rollback or cleanup is attempted.

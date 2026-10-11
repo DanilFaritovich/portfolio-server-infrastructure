@@ -129,6 +129,7 @@ class HostTests(unittest.TestCase):
         self.confirm = Mock()
         self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.stack.enter_context(patch.object(host, 'supported_host'))
+        self.stack.enter_context(patch.object(host, 'package_manager', return_value='apt'))
         self.missing = self.stack.enter_context(patch.object(host, 'missing_packages', return_value=[]))
         self.stack.enter_context(patch.object(host, 'storage_parents'))
         self.stack.enter_context(patch.object(host, 'qemu_group', return_value=os.getgid()))
@@ -151,6 +152,21 @@ class HostTests(unittest.TestCase):
         self.prepare()
         self.confirm.assert_not_called()
         self.assertTrue(all(call.args[0][0] == 'virsh' for call in self.run.call_args_list))
+
+    def test_non_apt_prepared_host_passes_without_install_or_confirmation(self):
+        with patch.object(host, 'package_manager', return_value=None):
+            self.prepare()
+        self.missing.assert_not_called()
+        self.confirm.assert_not_called()
+        self.assertTrue(all(call.args[0][0] == 'virsh' for call in self.run.call_args_list))
+
+    def test_non_apt_missing_dependency_blocks_before_sudo_or_hypervisor(self):
+        with patch.object(host, 'package_manager', return_value=None), \
+                patch.object(host.shutil, 'which', side_effect=lambda tool: None if tool == 'virt-install' else '/mock'):
+            with self.assertRaisesRegex(ValueError, 'manually'):
+                self.prepare()
+        self.run.assert_not_called()
+        self.confirm.assert_not_called()
 
     def test_declining_install_stops_before_sudo(self):
         self.missing.return_value = ['virtinst']
@@ -320,15 +336,49 @@ class PackageTests(unittest.TestCase):
                 patch.object(host.grp, 'getgrnam', return_value=SimpleNamespace(gr_gid=42)):
             self.assertEqual(host.qemu_group(), 42)
 
-    def test_host_support_is_exact(self):
+    def test_host_support_uses_platform_not_distro_or_release(self):
         with patch.object(host.platform, 'system', return_value='Linux'), \
                 patch.object(host.platform, 'machine', return_value='x86_64'), \
-                patch.object(host.platform, 'freedesktop_os_release', return_value={'ID': 'ubuntu', 'VERSION_ID': '24.04'}) as release:
+                patch.object(host.platform, 'freedesktop_os_release') as release:
             host.supported_host()
-            for value in ({'ID': 'debian', 'VERSION_ID': '12'}, {'ID': 'ubuntu', 'VERSION_ID': '20.04'}):
-                release.return_value = value
-                with self.assertRaises(ValueError):
-                    host.supported_host()
+            release.assert_not_called()
+        for system, machine in (('Windows', 'x86_64'), ('Darwin', 'x86_64'), ('Linux', 'aarch64')):
+            with patch.object(host.platform, 'system', return_value=system), \
+                    patch.object(host.platform, 'machine', return_value=machine), self.assertRaises(ValueError):
+                host.supported_host()
+
+    def test_apt_detection_uses_family_and_tools_without_version_allowlist(self):
+        with patch.object(host.shutil, 'which', return_value='/mock'), \
+                patch.object(host.platform, 'freedesktop_os_release') as release:
+            for distribution in ('ubuntu', 'debian'):
+                for version in ('20.04', '24.04', '26.04', '99', None):
+                    release.return_value = {'ID': distribution, 'VERSION_ID': version}
+                    self.assertEqual(host.package_manager(), 'apt')
+            for metadata in ({'ID': 'fedora'}, {'ID': 'unknown', 'ID_LIKE': 'ubuntu debian'}, {}):
+                release.return_value = metadata
+                self.assertIsNone(host.package_manager())
+            release.side_effect = OSError('missing os-release')
+            self.assertIsNone(host.package_manager())
+        for missing in ('apt-get', 'dpkg-query'):
+            with patch.object(host.platform, 'freedesktop_os_release', return_value={'ID': 'ubuntu'}), \
+                    patch.object(host.shutil, 'which', side_effect=lambda tool: None if tool == missing else '/mock'):
+                self.assertIsNone(host.package_manager())
+
+    def test_unsupported_installer_accepts_preinstalled_tools_without_package_queries(self):
+        with patch.object(host, 'package_manager', return_value=None), \
+                patch.object(host.shutil, 'which', return_value='/mock'), \
+                patch.object(host.subprocess, 'run') as run:
+            self.assertEqual(host.dependency_plan(), [])
+            run.assert_not_called()
+
+    def test_unsupported_installer_missing_tools_stops_with_manual_instructions(self):
+        with patch.object(host, 'package_manager', return_value=None), \
+                patch.object(host.shutil, 'which', side_effect=lambda tool: None if tool == 'cloud-localds' else '/mock'), \
+                patch.object(host.subprocess, 'run') as run, contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaisesRegex(ValueError, 'manually'):
+                host.dependency_plan()
+            self.assertIn('cloud-localds', output.getvalue())
+            run.assert_not_called()
 
 
 if __name__ == '__main__':

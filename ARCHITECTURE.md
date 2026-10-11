@@ -272,8 +272,11 @@ one per-user KVM BIOS guest and dedicated NAT on `qemu:///system`. It uses virsh
 XML queries, virt-install XML generation, checked official Ubuntu cloud image,
 minimal cloud-init bootstrap and stopped internal qcow2 snapshots. `e2e_images`
 validates the declarative image registry and rejects redirects before following;
-`e2e_host` handles only explicitly confirmed missing Ubuntu controller packages,
-additive groups and exclusive dedicated directory creation. Neither implements
+`e2e_host` validates Linux x86_64/KVM/libvirt capabilities without host release
+allowlists. It handles only explicitly confirmed missing packages through a reviewed
+Ubuntu/Debian apt mapping, additive groups and exclusive dedicated directory
+creation. Unsupported installers require manual dependencies; prepared hosts
+continue only after capability/access/storage checks. Guest profiles stay strict. Neither implements
 provisioning or recovery. Schema-2 state records the distro; schema-1 Noble fixtures
 remain readable without migration. The lifecycle module
 owns fixture state/locking, resource validation and the interactive scenario;

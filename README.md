@@ -1570,8 +1570,9 @@ scenario covers installation, final verification, repeat provisioning and reboot
 persistence. Failures preserve the guest for console diagnosis, without auto-reset.
 
 `make e2e-list-distros` lists the local image registry. For a new fixture select
-`make e2e-prepare E2E_DISTRO=ubuntu-22.04`. On Ubuntu 22.04/24.04 amd64 controllers,
-prepare lists missing packages and offers apt installation, additive libvirt/kvm
-groups and a dedicated disk directory with separate `[y/N]` confirmations. Group
+`make e2e-prepare E2E_DISTRO=ubuntu-22.04`. Host checks use Linux x86_64/KVM/libvirt
+capabilities without a Ubuntu version allowlist. Compatible Ubuntu/Debian apt environments offer missing-package
+installation; other managers require manual setup when tools are missing. Prepare
+offers additive libvirt/kvm groups and a dedicated disk directory with separate `[y/N]` confirmations. Group
 changes require relogin; ready VMs are preserved and distro changes are blocked.
 SHA-256 verification and optional `E2E_IMAGE_SHA256` pinning remain mandatory checks.

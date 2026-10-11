@@ -1,4 +1,4 @@
-"""Explicit, narrowly scoped Ubuntu controller preparation; never VM creation."""
+"""Capability-based Linux controller preparation; never VM creation."""
 
 import grp
 import os
@@ -16,14 +16,39 @@ from .e2e_images import require
 TOOLS = {'virsh': 'libvirt-clients', 'virt-install': 'virtinst', 'qemu-img': 'qemu-utils',
          'cloud-localds': 'cloud-image-utils', 'openssl': 'openssl', 'ssh-keygen': 'openssh-client',
          'ssh': 'openssh-client', 'ip': 'iproute2', 'qemu-system-x86_64': 'qemu-system-x86'}
-PACKAGES = tuple(sorted(set(TOOLS.values()) | {'qemu-kvm', 'libvirt-daemon-system'}))
+PACKAGES = tuple(sorted(set(TOOLS.values()) | {'libvirt-daemon-system'}))
 
 
 def supported_host():
-    release = platform.freedesktop_os_release()
-    require(platform.system() == 'Linux' and platform.machine() == 'x86_64'
-            and release.get('ID') == 'ubuntu' and release.get('VERSION_ID') in ('22.04', '24.04'),
-            'Automatic E2E host preparation supports Ubuntu 22.04/24.04 amd64 only; prepare other hosts manually.')
+    require(platform.system() == 'Linux' and platform.machine() == 'x86_64',
+            'E2E requires a Linux x86_64 host with working KVM/libvirt; software emulation is unsupported.')
+
+
+def package_manager():
+    """Select a reviewed package mapping; OS release numbers are irrelevant."""
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        return None
+    # Do not infer package compatibility from ID_LIKE or an apt binary alone.
+    if release.get('ID') in ('ubuntu', 'debian') and all(
+            shutil.which(tool) for tool in ('apt-get', 'dpkg-query')):
+        return 'apt'
+    return None
+
+
+def dependency_plan():
+    """Prepared hosts need no supported installer; missing tools fail closed."""
+    manager = package_manager()
+    if manager == 'apt':
+        return missing_packages()
+    absent = [tool for tool in TOOLS if not shutil.which(tool)]
+    if absent:
+        print('Missing E2E host tools: ' + ', '.join(absent))
+    require(not absent, 'Automatic dependency installation is unavailable for this package manager/environment. '
+            'Install QEMU/KVM, system libvirt, virt-install, qemu-img, cloud-localds, OpenSSH, OpenSSL and iproute2 '
+            'manually using your distribution packages, then rerun make e2e-prepare. No sudo/install attempted.')
+    return []
 
 
 def missing_packages():
@@ -76,14 +101,14 @@ def prepare(storage, *, command, confirm, safe_path):
     supported_host()
     require(re.search(r'\b(vmx|svm)\b', Path('/proc/cpuinfo').read_text()),
             'CPU virtualization flags unavailable; enable hardware virtualization before installing E2E dependencies.')
-    missing = missing_packages()
+    missing = dependency_plan()
     if missing:
         print('Missing E2E host packages: ' + ', '.join(missing))
         print('Privileged plan: apt-get update; apt-get install --no-install-recommends --no-upgrade --no-remove ' + ' '.join(missing))
         confirm('Install only these missing E2E host dependencies using sudo/apt?')
         privileged(['apt-get', 'update'], command)
         privileged(['apt-get', 'install', '--no-install-recommends', '--no-upgrade', '--no-remove', *missing], command)
-        require(not missing_packages(), 'E2E packages/tools still unavailable after apt; STOP, no automatic retry.')
+        require(not dependency_plan(), 'E2E packages/tools still unavailable after apt; STOP, no automatic retry.')
     kvm = Path('/dev/kvm')
     require(kvm.exists() and stat.S_ISCHR(kvm.stat().st_mode),
             'KVM unavailable; enable hardware virtualization/KVM manually. Software emulation is unsupported.')
