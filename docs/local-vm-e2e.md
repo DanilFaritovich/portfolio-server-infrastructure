@@ -203,16 +203,20 @@ particular release digest. Mutable release URLs can change; any mismatch stops
 preparation. The checksum list is authenticated by HTTPS, not an independently
 verified GPG signature.
 
-Prepare requests default-deny creation consent and a new disposable root
+Prepare requests default-deny creation consent (including guest-agent installation)
+and a new disposable root
 password twice with hidden input: at least 12 printable ASCII characters.
 Short/non-ASCII input or a mismatch receives a specific safe message and repeats
 local entry within prepare, before fixture/VM creation. Ctrl+C cancels; EOF or
 interruption stops preparation. The password never enters argv, environment,
 inventory, reports or Git. Only its SHA512-crypt hash enters private cloud-init
 artifacts and the seed. Use a unique disposable password and keep it in your
-password manager: the wrapper cannot display/recover it later. cloud-init only
-establishes baseline root console/password SSH access and a fixture UUID marker;
-all managed provisioning remains in existing Ansible roles.
+password manager: the wrapper cannot display/recover it later. cloud-init
+establishes baseline root console/password SSH access and a fixture UUID marker,
+refreshes the guest APT index and installs/starts `qemu-guest-agent` for local
+readiness checks. The guest therefore needs working NAT/DNS and Ubuntu repository
+access during its first boot. No package upgrade is requested. All managed
+provisioning remains in existing Ansible roles.
 
 Prepare starts the VM and prints its UUID and console command. In another
 terminal, open `virsh -c qemu:///system console <UUID>` (or virt-manager serial
@@ -226,17 +230,50 @@ console), log in as root, and:
    Prove root console login works independently of SSH, then leave the console
    with Ctrl+]. Manual `poweroff` is not required.
 4. Return to prepare and confirm both these checks and consent to shut down the
-   guest and create the baseline. The wrapper revalidates the owned resources,
-   requests graceful shutdown with `virsh shutdown` and waits up to 120 seconds
+   guest and create the baseline. The wrapper revalidates the owned resources and
+   waits up to 300 seconds for automatic guest readiness through the local
+   QEMU guest-agent channel: the guest UUID must match, cloud-init must finish
+   without errors, SSH configuration must validate, SSH and `systemd-logind`
+   must be active, and a Power Button input device must exist. The probe runs
+   short read-only commands and collects only exit codes, never command output.
+   No SSH connection, password or host-trust acceptance is involved. This
+   prevents an early confirmation from sending shutdown before the guest has
+   booted its power-button handler. It then requests graceful shutdown with
+   `virsh shutdown` and waits up to 120 seconds
    for `shut off`. An already stopped guest needs no shutdown request; a guest
    already shutting down is only observed. No forced shutdown is attempted.
-   Declining confirmation leaves the guest running. Timeout, an unexpected state
-   or a query error stops preparation with the partial fixture retained.
+   Declining confirmation leaves the guest running. Readiness failure/timeout
+   prevents shutdown and baseline creation. Only the exact agent-not-connected
+   boot condition may be polled, using verified English and Russian replies.
+   The libvirt daemon can return translated error text even when the client
+   uses `LC_ALL=C`. Transport/protocol errors, lost probes and guest
+   errors stop immediately. Shutdown timeout, an unexpected state or a query
+   error also stops preparation with the partial fixture retained.
    The wrapper creates/verifies an internal **baseline** snapshot, marks the
    fixture ready and starts it again. Wait for DHCP before testing.
 
 An unsupported snapshot backend stops preparation with the partial fixture
 retained. No fallback to a different backend or automatic repair is attempted.
+Guest-agent transport failures report a fixed safe diagnosis when recognized,
+without exposing command arguments, guest output or raw libvirt diagnostics.
+For a readiness transport STOP, a manual read-only check is:
+
+```sh
+LC_ALL=C virsh -c qemu:///system qemu-agent-command <UUID> --timeout 5 '{"execute":"guest-ping"}'
+```
+
+This checks agent connectivity only. At the guest console, inspect
+`systemctl is-active qemu-guest-agent` and the readiness prerequisites above.
+The preparation readiness probe checks the initial cloud-init boot, which
+explicitly starts `ssh.service`. After a later reboot, stock socket activation
+can leave that service inactive and `/run/sshd` absent until SSH is activated;
+the initial-boot readiness probe can therefore remain pending even though
+`ssh.socket` is active. It does not start SSH or create runtime directories.
+A successful later ping or readiness probe does not explain the original error
+or finish preparation; the partial fixture remains retained and cannot be
+resumed automatically. Diagnose before any separately confirmed deletion or
+new preparation.
+
 The snapshot carries the complete owned domain definition, no memory state,
 and only an internal qcow2 disk snapshot; see
 [libvirt snapshot semantics](https://libvirt.org/formatsnapshot.html).

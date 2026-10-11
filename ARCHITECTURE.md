@@ -272,6 +272,9 @@ one per-user KVM BIOS guest and dedicated NAT on `qemu:///system`. It uses virsh
 XML queries, virt-install XML generation, checked official Ubuntu cloud image,
 minimal cloud-init bootstrap and stopped internal qcow2 snapshots. `e2e_images`
 validates the declarative image registry and rejects redirects before following;
+`e2e_readiness` bounds output-free read-only probes over the local QEMU agent
+channel. New fixtures install/start the guest agent through cloud-init; this
+does not create SSH trust or change the controller's packages.
 `e2e_host` validates Linux x86_64/KVM/libvirt capabilities without host release
 allowlists. It handles only explicitly confirmed missing packages through a reviewed
 Ubuntu/Debian apt mapping, additive groups and exclusive dedicated directory
@@ -309,8 +312,13 @@ exception; legacy fixtures are not rewritten or repaired.
 Successful list queries alone establish absence; query errors and partial state
 never authorize recreation. Prepare journals `preparing` before artifacts and
 marks `ready` only after a console-verified stopped baseline. After explicit
-console-check and shutdown consent, prepare revalidates resources, requests
-graceful shutdown and waits up to 120 seconds before baseline creation.
+console-check and shutdown consent, prepare revalidates resources and allows up
+to 300 seconds for UUID-bound cloud-init/SSH/logind/Power Button readiness before
+requesting graceful shutdown. One short guest probe is tracked at a time, with
+only exit codes collected; identity/guest/protocol errors stop, and only an
+explicit agent-disconnected boot response permits transport polling. Shutdown
+then waits up to 120 seconds before baseline creation. Legacy fixtures are not
+equipped with an agent automatically or resumed after failed preparation.
 Destructive actions validate
 paths/snapshots and foreign users before and after default-deny consent,
 use graceful shutdown and never force unsupported restoration.

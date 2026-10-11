@@ -24,13 +24,19 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from . import common, e2e_host, e2e_images
+from . import common, e2e_host, e2e_images, e2e_readiness
 from .e2e_images import E2EError, require
 from .common import ROOT
 
 URI = 'qemu:///system'
 NS = 'urn:portfolio:local-e2e:1'
 MODES = ('prepare', 'status', 'test', 'reset', 'delete', 'list-distros')
+# The libvirt daemon can translate its error even with client LC_ALL=C.
+# Only these exact, verified disconnected-agent replies permit boot polling.
+AGENT_DISCONNECTED_ERRORS = frozenset({
+    'error: Guest agent is not responding: QEMU guest agent is not connected',
+    'error: Агент гостя не отвечает: Агент гостевой системы QEMU не подключён',
+})
 
 
 def command_label(argv):
@@ -45,13 +51,32 @@ def command_label(argv):
     if argv and argv[0] == 'virsh' and len(argv) > 3 and argv[1:3] == ['--connect', URI]:
         labels = {'net-define': 'network definition', 'net-start': 'network activation',
                   'define': 'domain definition', 'start': 'domain startup',
-                  'snapshot-create': 'baseline creation'}
+                  'snapshot-create': 'baseline creation',
+                  'qemu-agent-command': 'guest readiness agent query',
+                  'domstate': 'domain state query'}
         return labels.get(argv[3], 'libvirt operation')
     return 'local command'
 
 
-def command(argv, *, capture=True, input=None, timeout=60, env=None):
+def agent_failure_reason(stderr):
+    """Return only fixed diagnoses; never publish libvirt or guest text."""
+    message = (stderr or '')[:8192].lower()
+    if 'qemu guest agent is not configured' in message:
+        return 'guest-agent channel unavailable; inspect the owned domain at console'
+    if 'has been disabled' in message or 'commandnotfound' in message:
+        return 'required guest-agent command unavailable; inspect guest-agent policy at console'
+    if 'guest agent is not responding' in message or 'timed out' in message:
+        return 'guest-agent query failed or timed out; inspect guest-agent service at console'
+    if 'permission denied' in message or 'authentication failed' in message:
+        return 'libvirt authorization failed; inspect controller access'
+    return 'unrecognized guest-agent transport failure; inspect libvirt and guest-agent locally'
+
+
+def command(argv, *, capture=True, input=None, timeout=60, env=None, agent_boot=False):
     """Never echo arguments/output on failure (cloud-init and prompts are private)."""
+    if agent_boot:
+        require(argv[:4] == ['virsh', '--connect', URI, 'qemu-agent-command'] and capture,
+                'Invalid guest readiness transport.')
     child_env = dict(env) if env is not None else dict(os.environ, LC_ALL='C')
     if argv and argv[0] in ('virt-install', 'cloud-localds', 'virsh', 'qemu-img'):
         # System tools may use /usr/bin/env python3 and require distro modules
@@ -65,9 +90,14 @@ def command(argv, *, capture=True, input=None, timeout=60, env=None):
             child_env.pop(name, None)
     result = subprocess.run(argv, input=input, text=True, capture_output=capture,
                             timeout=timeout, env=child_env, check=False)
+    if agent_boot:
+        # This exact boot condition is expected. Other libvirt failures are blockers.
+        if result.returncode != 0 and (result.stderr or '').strip() in AGENT_DISCONNECTED_ERRORS:
+            return None
+    reason = '; ' + agent_failure_reason(result.stderr) if agent_boot and result.returncode != 0 else ''
     require(result.returncode == 0, 'E2E subprocess failed (' + command_label(argv)
             + f', exit {result.returncode}); STOP and diagnose before retrying. '
-            'Command arguments and output are withheld to protect secrets.')
+            'Command arguments and output are withheld to protect secrets.' + reason)
     return result.stdout if capture else ''
 
 
@@ -222,6 +252,32 @@ class Stand:
         """Only the owned qcow2 may grant its protected storage group write access."""
         safe_path(self.storage, directory=True, private=False)
         safe_path(self.disk, private=False, group_write_gid=self.storage.stat().st_gid)
+
+    def guest_ready(self):
+        self.resources()
+        tree = parse_xml(virsh('dumpxml', self.state['uuid'], '--inactive'))
+        channels = tree.findall('devices/channel')
+        require(tree.find('features/acpi') is not None and len(channels) == 1
+                and channels[0].get('type') == 'unix'
+                and channels[0].find('target') is not None
+                and channels[0].find('target').get('type') == 'virtio'
+                and channels[0].find('target').get('name') == 'org.qemu.guest_agent.0',
+                'Guest readiness requires stock ACPI and one local guest-agent channel.')
+        def query(request):
+            answer = command(['virsh', '--connect', URI, 'qemu-agent-command', self.state['uuid'],
+                              json.dumps(request), '--timeout', '5'], timeout=10, agent_boot=True)
+            if answer is None:
+                return None
+            try:
+                data = json.loads(answer)
+            except (TypeError, json.JSONDecodeError):
+                raise E2EError('Invalid guest readiness response; STOP.') from None
+            require(isinstance(data, dict) and set(data) == {'return'} and isinstance(data['return'], dict),
+                    'Guest readiness command unsupported or failed; STOP.')
+            return data['return']
+        print('Waiting up to 300 seconds for guest cloud-init, SSH and shutdown readiness; no SSH trust required.', flush=True)
+        e2e_readiness.wait_ready(self.state['uuid'], query=query,
+                                 running=lambda: virsh('domstate', self.state['uuid']) == 'running')
 
     def domain_xml(self, tree, *, require_dac=False):
         require(tree is not None and tree.tag == 'domain' and tree.get('type') == 'kvm' and tree.findtext('uuid') == self.state['uuid']
@@ -436,7 +492,7 @@ class Stand:
         self.state = dict(config, schema=2, distro=profile['id'], phase='preparing', uuid=str(uuid.uuid4()), network_uuid=str(uuid.uuid4()),
                           mac='52:54:00:' + ':'.join(f'{b:02x}' for b in os.urandom(3)))
         self.no_overlap()
-        confirm(f'Create the local E2E VM/NAT and download {profile["name"]} official cloud image?')
+        confirm(f'Create the local E2E VM/NAT, download {profile["name"]} official cloud image and install qemu-guest-agent in the guest?')
         password = disposable_password()
         hashed = command(['openssl', 'passwd', '-6', '-stdin'], input=password + '\n').strip()
         require(re.fullmatch(r'\$6\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{86}', hashed), 'Invalid password hash; preparation stopped.')
@@ -452,12 +508,14 @@ class Stand:
         self.disk.chmod(0o660)
         # Storage has the operator-selected QEMU group and setgid bit; no chown/sudo here.
         cloud = {'hostname': 'portfolio-e2e', 'disable_root': False, 'ssh_pwauth': True,
+                 'package_update': True, 'packages': ['qemu-guest-agent'],
                  'users': [{'name': 'root', 'lock_passwd': False, 'hashed_passwd': hashed}],
                  'write_files': [
                      {'path': '/etc/portfolio-e2e-id', 'permissions': '0644', 'content': self.state['uuid'] + '\n'},
                      {'path': '/etc/ssh/sshd_config.d/00-e2e-bootstrap.conf', 'permissions': '0644',
                       'content': 'PermitRootLogin yes\nPasswordAuthentication yes\n'}],
-                 'runcmd': [['/usr/sbin/sshd', '-t'], ['systemctl', 'restart', 'ssh.service']]}
+                 'runcmd': [['/usr/sbin/sshd', '-t'], ['systemctl', 'restart', 'ssh.service'],
+                            ['systemctl', 'start', 'qemu-guest-agent']]}
         write_new(self.root / 'user-data', '#cloud-config\n' + yaml.safe_dump(cloud))
         del hashed
         write_new(self.root / 'meta-data', yaml.safe_dump({'instance-id': self.state['uuid'], 'local-hostname': 'portfolio-e2e'}))
@@ -479,6 +537,7 @@ class Stand:
                                  '--memory', str(config['memory']), '--vcpus', str(config['cpus']), '--virt-type', 'kvm',
                                  '--osinfo', profile['osinfo'], '--import', '--boot', 'hd', '--graphics', 'none',
                                  '--console', 'pty,target_type=serial', '--disk', f'path={self.disk},format=qcow2,bus=virtio',
+                                 '--channel', 'unix,target.type=virtio,target.name=org.qemu.guest_agent.0',
                                  '--disk', f'path={self.seed},device=cdrom,readonly=on', '--network',
                                  f'network={self.name},mac={self.state["mac"]},model=virtio', '--print-xml', '--dry-run']))
         metadata = tree.find('metadata')
@@ -502,6 +561,7 @@ class Stand:
               'Leave console with Ctrl+], then confirm below to shut down the guest and create the baseline. '
               'No SSH trust is accepted automatically.', flush=True)
         confirm('Have cloud-init/SSH and console recovery been verified? Shut down the guest and create the baseline?')
+        self.guest_ready()
         self.resources()
         self.stop()
         self.resources()

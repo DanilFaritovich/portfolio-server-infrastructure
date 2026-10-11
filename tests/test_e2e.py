@@ -401,6 +401,9 @@ class StandTests(unittest.TestCase):
     def test_prepare_decline_keeps_running_guest_without_shutdown_or_baseline(self):
         self.fresh_prepare('ubuntu-24.04', decline=True)
 
+    def test_prepare_readiness_failure_never_requests_shutdown_or_baseline(self):
+        self.fresh_prepare('ubuntu-24.04', readiness_failure=True)
+
     def test_stop_observes_shutdown_in_progress_without_second_request(self):
         with patch.object(e2e, 'virsh', side_effect=['in shutdown', 'in shutdown', 'shut off', 'shut off']) as run, \
                 patch.object(e2e.time, 'sleep') as sleep:
@@ -458,7 +461,7 @@ class StandTests(unittest.TestCase):
         with patch.object(Path, 'stat', wrong_group), self.assertRaisesRegex(ValueError, 'ownership/mode'):
             self.stand.disk_file()
 
-    def fresh_prepare(self, distro, *, shutdown_timeout=False, decline=False):
+    def fresh_prepare(self, distro, *, shutdown_timeout=False, decline=False, readiness_failure=False):
         # All host tools, download and hypervisor operations are synthetic.
         self.stand.delete()
         self.stand.storage.mkdir(mode=0o700)
@@ -487,11 +490,24 @@ class StandTests(unittest.TestCase):
                 self.domain.find('uuid').text = self.stand.state['uuid']
                 self.domain.find('devices/interface/mac').set('address', self.stand.state['mac'])
                 self.domain.remove(self.domain.find('metadata'))
+                ET.SubElement(ET.SubElement(self.domain, 'features'), 'acpi')
+                channel = ET.SubElement(self.domain.find('devices'), 'channel', type='unix')
+                ET.SubElement(channel, 'target', type='virtio', name='org.qemu.guest_agent.0')
+                self.assertIn('unix,target.type=virtio,target.name=org.qemu.guest_agent.0', args)
                 return e2e.xml_text(self.domain)
             return ''
         shutdown = []
+        readiness = []
+        def wait_ready(identity, **kwargs):
+            self.assertEqual(identity, self.stand.state['uuid'])
+            self.assertTrue(kwargs['running']())
+            self.assertFalse(any(c[0] == 'shutdown' for c in self.mutations()))
+            if readiness_failure:
+                raise e2e.E2EError('Guest readiness timed out')
+            readiness.append('ready')
         def hypervisor(*args):
             if args[0] == 'shutdown':
+                self.assertEqual(readiness, ['ready'])
                 self.assertEqual(self.vm_state, 'running')
                 self.calls.append(args)
                 shutdown.extend(['running', 'in shutdown', 'shut off'] if not shutdown_timeout else ['running'])
@@ -522,18 +538,21 @@ class StandTests(unittest.TestCase):
                 patch.object(self.stand, 'download', side_effect=download), \
                 patch.object(e2e, 'command', side_effect=run), patch.object(e2e, 'virsh', side_effect=hypervisor), \
                 patch.object(e2e, 'confirm', side_effect=confirmation), \
+                patch.object(e2e.e2e_readiness, 'wait_ready', side_effect=wait_ready) as ready, \
                 patch.object(e2e.time, 'sleep') as sleep, \
                 patch.object(e2e.time, 'monotonic', side_effect=[0, 121] if shutdown_timeout else [0, 1, 2]), \
                 patch.dict(os.environ, E2E_DISTRO=distro, E2E_CPUS='', E2E_MEMORY='', E2E_DISK_GB='', E2E_SUBNET=''):
-            if shutdown_timeout or decline:
-                with self.assertRaisesRegex(ValueError, 'declined' if decline else 'shutdown wait timed out'):
+            if shutdown_timeout or decline or readiness_failure:
+                reason = 'declined' if decline else 'Guest readiness timed out' if readiness_failure else 'shutdown wait timed out'
+                with self.assertRaisesRegex(ValueError, reason):
                     self.stand.prepare()
                 self.assertEqual(self.stand.load()['phase'], 'preparing')
-                expected = ['net-define', 'net-start', 'define', 'start'] + ([] if decline else ['shutdown'])
+                expected = ['net-define', 'net-start', 'define', 'start'] + ([] if decline or readiness_failure else ['shutdown'])
                 self.assertEqual([c[0] for c in self.mutations()], expected)
                 self.assertFalse(self.stand.inventory.exists())
                 self.assertFalse(self.snapshots)
                 sleep.assert_not_called()
+                self.assertEqual(ready.call_count, 0 if decline else 1)
                 return
             self.stand.prepare()
             self.assertEqual(sleep.call_count, 2)
@@ -551,6 +570,9 @@ class StandTests(unittest.TestCase):
         cloud = (self.stand.root / 'user-data').read_text()
         self.assertNotIn('disposable-test-password', cloud)
         self.assertIn('hashed_passwd', cloud)
+        config = yaml.safe_load(cloud)
+        self.assertEqual(config['packages'], ['qemu-guest-agent'])
+        self.assertIn(['systemctl', 'start', 'qemu-guest-agent'], config['runcmd'])
 
     def test_repeat_recaps_enforce_zero_provisioning_allow_exact_smoke(self):
         names = [yaml.safe_load((e2e.ROOT / 'playbooks' / n).read_text())[0]['name'] for n in
