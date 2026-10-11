@@ -1,6 +1,6 @@
 VENV := .venv
 ACTIONLINT := .tools/bin/actionlint
-YAML_FILES := .yamllint.yml .ansible-lint collections.yml inventories/production.example.yml playbooks roles .github/workflows
+YAML_FILES := scripts/portfolio_cli/e2e_distros.yml .yamllint.yml .ansible-lint collections.yml inventories/production.example.yml playbooks roles .github/workflows
 INVENTORY ?= inventories/production.yml
 # Optional legacy override; explicit inventory supplies the managed key path.
 AUTOMATION_KEY ?=
@@ -16,9 +16,9 @@ export PATH := $(abspath $(VENV))/bin:$(PATH)
 export INIT_FROM
 
 # LOCAL VM operations; never prerequisites of check/ci. No production inputs.
-.PHONY: e2e-prepare e2e-status e2e-test e2e-reset e2e-delete
-export E2E_CPUS E2E_MEMORY E2E_DISK_GB E2E_SUBNET E2E_IMAGE_SHA256 E2E_FROM
-e2e-prepare e2e-status e2e-test e2e-reset e2e-delete:
+.PHONY: e2e-prepare e2e-status e2e-test e2e-reset e2e-delete e2e-list-distros
+export E2E_DISTRO E2E_CPUS E2E_MEMORY E2E_DISK_GB E2E_SUBNET E2E_IMAGE_SHA256 E2E_FROM
+e2e-prepare e2e-status e2e-test e2e-reset e2e-delete e2e-list-distros:
 	@test -x $(VENV)/bin/python || { echo "Run make deps first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/e2e.py $(patsubst e2e-%,%,$@)
 

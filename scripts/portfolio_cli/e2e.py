@@ -14,34 +14,22 @@ import os
 from pathlib import Path
 import re
 import shlex
-import shutil
 import stat
 import subprocess
 import sys
 import time
-import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 
 import yaml
 
-from . import common
+from . import common, e2e_host, e2e_images
+from .e2e_images import E2EError, require
 from .common import ROOT
 
 URI = 'qemu:///system'
 NS = 'urn:portfolio:local-e2e:1'
-IMAGE = 'ubuntu-24.04-server-cloudimg-amd64.img'
-IMAGE_URL = 'https://cloud-images.ubuntu.com/releases/noble/release/' + IMAGE
-MODES = ('prepare', 'status', 'test', 'reset', 'delete')
-
-
-class E2EError(ValueError):
-    """Only static, safe operator diagnostics may use this exception."""
-
-
-def require(condition, message):
-    if not condition:
-        raise E2EError(message)
+MODES = ('prepare', 'status', 'test', 'reset', 'delete', 'list-distros')
 
 
 def command(argv, *, capture=True, input=None, timeout=60, env=None):
@@ -125,6 +113,11 @@ class Stand:
         self.state = None
 
     @property
+    def distro(self):
+        # Schema 1 was exclusively Noble; keep old fixtures readable without rewriting state.
+        return self.state['distro'] if self.state.get('schema') == 2 else e2e_images.registry(legacy=True)[0]
+
+    @property
     def disk(self):
         return self.storage / 'guest.qcow2'
 
@@ -142,13 +135,16 @@ class Stand:
         safe_path(path)
         try:
             self.state = json.loads(path.read_text())
-            require(set(self.state) == {'schema', 'uuid', 'network_uuid', 'phase', 'subnet', 'mac', 'cpus', 'memory', 'size'},
+            fields = {'schema', 'uuid', 'network_uuid', 'phase', 'subnet', 'mac', 'cpus', 'memory', 'size'}
+            require(set(self.state) == (fields if self.state.get('schema') == 1 else fields | {'distro'}),
                     'Unknown E2E state schema.')
-            require(self.state['schema'] == 1 and self.state['phase'] in ('preparing', 'ready'), 'Invalid E2E phase.')
+            require(type(self.state['schema']) is int and self.state['schema'] in (1, 2) and self.state['phase'] in ('preparing', 'ready'), 'Invalid E2E phase.')
             for field in ('uuid', 'network_uuid'):
                 require(str(uuid.UUID(self.state[field])) == self.state[field], 'Invalid E2E UUID.')
             require(re.fullmatch(r'52:54:00:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}', self.state['mac']), 'Invalid E2E MAC.')
             self.validate_config(self.state)
+            require(isinstance(self.distro, str) and self.distro, 'Invalid recorded E2E distro.')
+            e2e_images.select(self.distro)
         except (TypeError, KeyError, json.JSONDecodeError):
             raise ValueError('Invalid E2E state; STOP without adopting resources.') from None
         return self.state
@@ -302,6 +298,7 @@ class Stand:
         lease = virsh('net-dhcp-leases', self.state['network_uuid'], '--mac', self.state['mac']) if network else ''
         leased = bool(re.search(r'\b' + re.escape(self.ip) + r'/24\b', lease))
         print(f'VM={self.name} UUID={self.state["uuid"]} state={state} phase={phase}\n'
+              f'Distro={self.distro} ({e2e_images.select(self.distro)["name"]})\n'
               f'IP={self.ip} DHCP={leased} network={network} baseline={"baseline" in snapshots}\n'
               f'Fixture ready={phase == "ready" and domain and network and "baseline" in snapshots}\n'
               f'CPU={self.state["cpus"]} RAM MiB={self.state["memory"]} Disk GiB={self.state["size"]}\n'
@@ -330,19 +327,22 @@ class Stand:
     def download(self):
         # TLS authenticates the official checksum list; an optional pinned digest
         # also allows reproducible selection and detects a release changing mid-download.
-        base = IMAGE_URL.rsplit('/', 1)[0] + '/'
-        with urllib.request.urlopen(base + 'SHA256SUMS', timeout=60) as response:
-            require(response.url == base + 'SHA256SUMS', 'Image checksum redirect refused.')
+        profile = e2e_images.select(self.distro)
+        image_url, checksum_url = profile['image_url'], profile['checksum_url']
+        image_name = image_url.rsplit('/', 1)[1]
+        with e2e_images.open_official(checksum_url) as response:
+            require(response.url == checksum_url, 'Image checksum redirect refused.')
             checksums = response.read(65536).decode('ascii')
-        matches = re.findall(r'^([0-9a-f]{64})\s+\*?' + re.escape(IMAGE) + r'$', checksums, re.M)
+        matches = re.findall(r'^([0-9a-f]{64})\s+\*?' + re.escape(image_name) + r'$', checksums, re.M)
         require(len(matches) == 1, 'Official image checksum missing/ambiguous.')
         pinned = os.environ.get('E2E_IMAGE_SHA256', '')
+        require(not pinned or re.fullmatch(r'[0-9a-f]{64}', pinned), 'Invalid pinned image SHA-256.')
         require(not pinned or pinned == matches[0], 'Pinned image checksum differs from official release.')
         target = self.root / 'image.img'
         digest = hashlib.sha256()
         descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, 'wb') as output, urllib.request.urlopen(IMAGE_URL, timeout=60) as response:
-            require(response.url == IMAGE_URL, 'Image redirect refused.')
+        with os.fdopen(descriptor, 'wb') as output, e2e_images.open_official(image_url) as response:
+            require(response.url == image_url, 'Image redirect refused.')
             while chunk := response.read(1024 * 1024):
                 output.write(chunk)
                 digest.update(chunk)
@@ -355,22 +355,23 @@ class Stand:
     def prepare(self):
         if (self.root / 'state.json').exists():
             self.ready()
+            requested = os.environ.get('E2E_DISTRO', '')
+            require(not requested or e2e_images.select(requested)['id'] == self.distro,
+                    'Existing VM distro differs; no replacement. Explicitly inspect/delete before choosing another distro.')
             self.status()
             return
         require(not self.root.exists() and not self.root.is_symlink(), 'Existing E2E directory without state; inspect manually.')
-        safe_path(self.storage, directory=True, private=False)
+        profile = e2e_images.select(os.environ.get('E2E_DISTRO'))
+        e2e_host.prepare(self.storage, command=command, confirm=confirm, safe_path=safe_path)
         require(not list(self.storage.iterdir()), 'E2E storage must be empty; no disk will be overwritten.')
-        for tool in ('virsh', 'virt-install', 'qemu-img', 'cloud-localds', 'openssl', 'ssh-keygen', 'ip'):
-            require(shutil.which(tool), 'Missing E2E prerequisite: ' + tool + '; see docs/local-vm-e2e.md.')
-        require(Path('/dev/kvm').exists(), 'KVM unavailable; software emulation is not supported.')
         config = {'subnet': os.environ.get('E2E_SUBNET') or '192.168.231.0/24',
                   'cpus': int(os.environ.get('E2E_CPUS') or '2'), 'memory': int(os.environ.get('E2E_MEMORY') or '4096'),
                   'size': int(os.environ.get('E2E_DISK_GB') or '25')}
         self.validate_config(config)
-        self.state = dict(config, schema=1, phase='preparing', uuid=str(uuid.uuid4()), network_uuid=str(uuid.uuid4()),
+        self.state = dict(config, schema=2, distro=profile['id'], phase='preparing', uuid=str(uuid.uuid4()), network_uuid=str(uuid.uuid4()),
                           mac='52:54:00:' + ':'.join(f'{b:02x}' for b in os.urandom(3)))
         self.no_overlap()
-        confirm('Create the local E2E VM/NAT and download the official Ubuntu cloud image?')
+        confirm(f'Create the local E2E VM/NAT and download {profile["name"]} official cloud image?')
         password = getpass.getpass('New disposable root password (SSH bootstrap and serial console): ')
         require(len(password) >= 12 and password == getpass.getpass('Repeat disposable password: '), 'Passwords differ or are too short.')
         require(all(32 <= ord(c) < 127 for c in password), 'Use printable ASCII for the disposable console password.')
@@ -413,7 +414,7 @@ class Stand:
         virsh('net-start', self.state['network_uuid'])
         tree = parse_xml(command(['virt-install', '--connect', URI, '--name', self.name, '--uuid', self.state['uuid'],
                                  '--memory', str(config['memory']), '--vcpus', str(config['cpus']), '--virt-type', 'kvm',
-                                 '--osinfo', 'ubuntu24.04', '--import', '--boot', 'hd', '--graphics', 'none',
+                                 '--osinfo', profile['osinfo'], '--import', '--boot', 'hd', '--graphics', 'none',
                                  '--console', 'pty,target_type=serial', '--disk', f'path={self.disk},format=qcow2,bus=virtio',
                                  '--disk', f'path={self.seed},device=cdrom,readonly=on', '--network',
                                  f'network={self.name},mac={self.state["mac"]},model=virtio', '--print-xml', '--dry-run']))
@@ -711,6 +712,9 @@ def main():
     try:
         require(os.getuid() != 0, 'Run E2E as the controller user, never with sudo.')
         require(not os.environ.get('E2E_INVENTORY'), 'E2E inventory overrides are forbidden.')
+        if args.mode == 'list-distros':
+            e2e_images.list_distros()
+            return 0
         with stand_lock(stand.root):
             getattr(stand, args.mode)()
         return 0

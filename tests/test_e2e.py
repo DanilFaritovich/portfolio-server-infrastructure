@@ -133,6 +133,30 @@ class StandTests(unittest.TestCase):
         self.assertEqual(before, self.stand.disk.stat().st_mtime_ns)
         run.assert_not_called()
 
+    def test_existing_distro_change_blocks_without_host_preparation(self):
+        with patch.dict(os.environ, E2E_DISTRO='ubuntu-22.04'), patch.object(e2e.e2e_host, 'prepare') as host:
+            with self.assertRaisesRegex(ValueError, 'distro differs'):
+                self.stand.prepare()
+            host.assert_not_called()
+        self.assertFalse(self.mutations())
+
+    def test_schema2_keeps_recorded_distro_when_selection_omitted(self):
+        self.state.update(schema=2, distro='ubuntu-22.04')
+        (self.stand.root / 'state.json').write_text(json.dumps(self.state))
+        with patch.dict(os.environ, E2E_DISTRO=''), patch.object(e2e.e2e_host, 'prepare') as host, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.stand.prepare()
+            host.assert_not_called()
+        self.assertIn('ubuntu-22.04', output.getvalue())
+        self.assertFalse(self.mutations())
+
+    def test_invalid_recorded_distro_blocks(self):
+        for distro in ('unknown', '', None):
+            self.state.update(schema=2, distro=distro)
+            (self.stand.root / 'state.json').write_text(json.dumps(self.state))
+            with self.assertRaises(ValueError):
+                self.stand.load()
+
     def test_partial_prepare_stops_without_recreation(self):
         self.state['phase'] = 'preparing'
         (self.stand.root / 'state.json').write_text(json.dumps(self.state))
@@ -326,6 +350,12 @@ class StandTests(unittest.TestCase):
         self.assertTrue(self.stand.disk.exists())
 
     def test_fresh_prepare_uses_cloud_init_then_stopped_baseline(self):
+        self.fresh_prepare('ubuntu-24.04')
+
+    def test_jammy_prepare_uses_compatible_cloud_init_and_inventory(self):
+        self.fresh_prepare('ubuntu-22.04')
+
+    def fresh_prepare(self, distro):
         # All host tools, download and hypervisor operations are synthetic.
         self.stand.delete()
         self.stand.storage.mkdir(mode=0o700)
@@ -373,14 +403,17 @@ class StandTests(unittest.TestCase):
         def confirmation(message):
             if 'powered off' in message:
                 self.vm_state = 'shut off'
-        with patch.object(Path, 'exists', exists), patch.object(e2e.shutil, 'which', return_value='/synthetic'), \
+        with patch.object(Path, 'exists', exists), patch.object(e2e.e2e_host, 'prepare'), \
                 patch.object(e2e.getpass, 'getpass', return_value='disposable-test-password'), \
                 patch.object(self.stand, 'download', side_effect=download), \
                 patch.object(e2e, 'command', side_effect=run), patch.object(e2e, 'virsh', side_effect=hypervisor), \
                 patch.object(e2e, 'confirm', side_effect=confirmation), \
-                patch.dict(os.environ, E2E_CPUS='', E2E_MEMORY='', E2E_DISK_GB='', E2E_SUBNET=''):
+                patch.dict(os.environ, E2E_DISTRO=distro, E2E_CPUS='', E2E_MEMORY='', E2E_DISK_GB='', E2E_SUBNET=''):
             self.stand.prepare()
         self.assertEqual(self.stand.state['phase'], 'ready')
+        self.assertEqual(self.stand.state['schema'], 2)
+        self.assertEqual(self.stand.state['distro'], distro)
+        self.assertEqual(self.stand.load()['distro'], distro)
         self.stand.check_inventory(self.stand.inventory)
         self.assertEqual([c[0] for c in self.mutations()], ['net-define', 'net-start', 'define', 'start', 'snapshot-create', 'start'])
         cloud = (self.stand.root / 'user-data').read_text()
@@ -447,9 +480,9 @@ class StandTests(unittest.TestCase):
                 super().__init__(data)
                 self.url = url
         def fetch(url, **kwargs):
-            data = (digest + ' *' + e2e.IMAGE + '\n').encode() if url.endswith('SHA256SUMS') else payload + b'corruption'
+            data = (digest + ' *' + e2e.e2e_images.select()['image_url'].rsplit('/', 1)[1] + '\n').encode() if url.endswith('SHA256SUMS') else payload + b'corruption'
             return Response(data, url)
-        with patch.object(e2e.urllib.request, 'urlopen', side_effect=fetch), patch.dict(os.environ, E2E_IMAGE_SHA256=''):
+        with patch.object(e2e.e2e_images, 'open_official', side_effect=fetch), patch.dict(os.environ, E2E_IMAGE_SHA256=''):
             with self.assertRaisesRegex(ValueError, 'integrity failed'):
                 self.stand.download()
         self.assertTrue((self.stand.root / 'image.img').exists())

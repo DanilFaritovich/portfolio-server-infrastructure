@@ -1,52 +1,63 @@
 # Local Ubuntu VM E2E
 
 This is an **interactive local integration test**, outside `make check` and CI.
-It uses KVM, `qemu:///system`, virt-install, Ubuntu Server 24.04 amd64 cloud image
-and cloud-init. virt-manager can inspect the same guest. GNOME Boxes is not used.
+It uses KVM, `qemu:///system`, virt-install, a registry-selected official Ubuntu
+amd64 cloud image and cloud-init. virt-manager can inspect the same guest. GNOME Boxes is not used.
 No application deployment is included. Offline success does not demonstrate live
 access, package compatibility, snapshot support or idempotency.
 
-## Host preparation (operator actions)
+## Host preparation (explicit operator consent)
 
-Use an Ubuntu Linux amd64 controller with hardware virtualization enabled, at
-least 2 available CPU cores, 4 GiB guest RAM and sufficient disk space for a
-25 GiB qcow2 disk, the cloud image and internal snapshots. Check `/dev/kvm`.
-These commands are instructions, **not automatically executed by E2E**:
+Automatic preparation supports Ubuntu Linux **22.04 or 24.04 amd64** controllers
+with hardware virtualization enabled, at least 2 available CPU cores, 4 GiB guest
+RAM and sufficient disk space for a 25 GiB qcow2 disk, the cloud image and internal
+snapshots. Other controller releases/architectures are not automatically supported.
+Run `make deps` first to prepare the project's local Python tooling; never run
+`make` as root.
 
-```sh
-sudo apt update
-sudo apt install qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients \
-  virtinst cloud-image-utils openssl iproute2 openssh-client
-# Optional graphical inspection:
-sudo apt install virt-manager
-sudo usermod -aG libvirt,kvm "$USER"
-# Log out/in to apply groups; verify access without sudo:
-virsh -c qemu:///system list --all
-```
+`make e2e-prepare` checks CPU virtualization flags, installed packages and commands,
+`/dev/kvm` access, effective libvirt/kvm groups, non-sudo `qemu:///system` access,
+x86_64 KVM capabilities and disk directory ownership/mode. Host changes occur only
+for a new fixture, with separate default-deny TTY confirmations:
 
-The QEMU account/group is commonly `libvirt-qemu` on Ubuntu. Inspect the host's
-libvirt configuration first. Create **only the new dedicated empty directory**
-with your controller UID as owner and the actual QEMU group. Do not change
-permissions of a shared image directory or run `make` as root:
+1. Missing dependencies are listed before offering `sudo apt-get update` and
+   `sudo apt-get install --no-install-recommends --no-upgrade --no-remove` for
+   **only missing packages**. The package set is qemu-kvm, qemu-system-x86,
+   qemu-utils, libvirt-daemon-system, libvirt-clients, virtinst, cloud-image-utils,
+   openssl, iproute2 and openssh-client. Installed packages are not reinstalled;
+   installed packages with missing executables require manual PATH/package repair.
+   Native sudo and apt prompts remain interactive. Failure stops without retry.
+2. Missing libvirt/kvm membership is offered separately, using only additive
+   `usermod -aG`. **libvirt access is root-equivalent**; grant it only to trusted
+   local administrators. If configured groups are not effective in this session,
+   prepare stops: log out/in and rerun it. No guest is created before relogin.
+3. The missing `/var/lib/libvirt/images/portfolio-e2e-<UID>` directory is offered
+   separately. Exclusive `mkdir` refuses a concurrently appearing path; only this
+   new directory receives controller ownership, stock `libvirt-qemu` group and
+   mode 2750. Parent paths must already be protected root-owned directories.
+   Existing directory ownership, group and mode are validated, never repaired.
 
-```sh
-sudo install -d -o "$USER" -g libvirt-qemu -m 2750 \
-  "/var/lib/libvirt/images/portfolio-e2e-$(id -u)"
-make deps
-```
+The setgid directory gives generated disk/seed files the QEMU group, with 0640
+file permissions. Custom QEMU identities, unsafe paths, missing parent directories,
+KVM/device permission errors, libvirt authorization/service errors or host security
+policy conflicts require manual administrator diagnosis. Preparation does not
+change libvirt configuration, start services, relax AppArmor/ACLs or grant sudo.
+A declined confirmation leaves later steps unexecuted; already approved package
+or group changes are retained. No automatic rollback or cleanup is attempted.
 
-The setgid directory gives generated disk/seed files the QEMU group; files have
-0640 permissions. QEMU must be able to traverse the path and the host security
-policy must permit it. Resolve local permissions/AppArmor/libvirt authorization
-manually; the wrapper never runs sudo or installs host packages. libvirt access
-is root-equivalent: only trusted local administrators should have it.
+Optional graphical inspection remains a manual operator action (`virt-manager`).
+A ready existing fixture is freshly validated and displayed without host changes,
+downloads or guest recreation. Partial fixtures stop without resuming preparation.
 
 ## Prepare and first run
 
 After separately authorizing real local VM execution:
 
 ```sh
-make e2e-prepare
+make e2e-list-distros  # local registry listing, no host/network probes
+make e2e-prepare      # Ubuntu Server 24.04 LTS by default
+# Alternative for a NEW fixture:
+# make e2e-prepare E2E_DISTRO=ubuntu-22.04
 make e2e-status
 make e2e-test E2E_FROM=bootstrap
 ```
@@ -61,14 +72,35 @@ creation. NAT provides outbound Internet for existing APT/Docker operations;
 it is a separate bridge, not an outbound sandbox or air gap. Do not place
 production credentials in the guest.
 
-The image and its SHA256SUMS are fetched only from the official HTTPS
-[Ubuntu Noble release directory](https://cloud-images.ubuntu.com/releases/noble/release/).
-The wrapper compares the full downloaded image digest with the official list,
-refuses redirects, and retains `image.sha256`. Optionally set
-`E2E_IMAGE_SHA256=<previously verified 64-character digest>` to require a
-particular release digest. The mutable release URL can change; a checksum
-mismatch stops preparation. The digest list is authenticated by HTTPS, not an
-independently verified GPG signature.
+The declarative [image registry](../scripts/portfolio_cli/e2e_distros.yml) supports
+only **Ubuntu Server 24.04 LTS (`ubuntu-24.04`)** and **Ubuntu Server 22.04 LTS
+(`ubuntu-22.04`)**, both amd64. It records display identity, architecture, official
+image/checksum URLs and reviewed BIOS/qcow2/cloud-init/SSH compatibility profiles.
+Other Linux distributions, architectures, UEFI images and release versions are
+rejected. Jammy and Noble are allowed by the current provisioning roles; both use
+the same root-password cloud-init bootstrap and stock SSH service/socket handling.
+The conservative `ubuntu22.04` virt-install hardware profile works with both and
+is available in Jammy controller osinfo-db; it does not change the guest image.
+Mocked tests cover both selections; real package/SSH/convergence compatibility
+still requires separately authorized integration runs on each version.
+
+New state (schema 2) records the selected distro, shown by `e2e-status`. Existing
+schema-1 fixtures retain their original Noble identity without state rewrites.
+Omitting `E2E_DISTRO` for an existing fixture keeps its recorded distro. A different
+explicit selection blocks; only separately confirmed deletion permits preparation
+of another image. It never overwrites an existing VM.
+
+Images and SHA256SUMS come only from the official HTTPS release directories:
+[Ubuntu Noble](https://cloud-images.ubuntu.com/releases/noble/release/) and
+[Ubuntu Jammy](https://cloud-images.ubuntu.com/releases/jammy/release/).
+Strict registry validation rejects untrusted URLs and incompatible profiles,
+including duplicate YAML fields/IDs. Redirects are refused **before following**;
+image transport ignores environment proxies. The complete downloaded SHA-256 is
+compared with the official list and retained in `image.sha256`. Optionally set
+`E2E_IMAGE_SHA256=<previously verified 64-character lowercase digest>` to require a
+particular release digest. Mutable release URLs can change; any mismatch stops
+preparation. The checksum list is authenticated by HTTPS, not an independently
+verified GPG signature.
 
 Prepare requests default-deny creation consent and a new disposable root
 password twice with hidden input. The password never enters argv, environment,
@@ -228,8 +260,8 @@ hardlinks, unknown storage files or another VM referencing the storage/NAT,
 rechecks after confirmation, gracefully stops the owned guest, deletes its
 validated snapshots, undefines it and removes only its dedicated NAT and files.
 It never deletes shared pools/default networks, follows symlinks, uses wildcards
-or `rm -rf`. The pre-existing dedicated storage directory is also removed; recreate
-it explicitly for a new preparation. The sibling lock inode is retained.
+or `rm -rf`. The dedicated storage directory is also removed; a new preparation offers
+its creation again with separate consent. The sibling lock inode is retained.
 If deletion fails halfway, inspect actual resources; do not retry blindly.
 
 A failed prepare retains phase `preparing`. Another prepare refuses to resume,

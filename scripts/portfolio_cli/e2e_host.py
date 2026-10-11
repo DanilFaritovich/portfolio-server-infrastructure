@@ -1,0 +1,127 @@
+"""Explicit, narrowly scoped Ubuntu controller preparation; never VM creation."""
+
+import grp
+import os
+from pathlib import Path
+import platform
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import xml.etree.ElementTree as ET
+
+from .e2e_images import require
+
+TOOLS = {'virsh': 'libvirt-clients', 'virt-install': 'virtinst', 'qemu-img': 'qemu-utils',
+         'cloud-localds': 'cloud-image-utils', 'openssl': 'openssl', 'ssh-keygen': 'openssh-client',
+         'ssh': 'openssh-client', 'ip': 'iproute2', 'qemu-system-x86_64': 'qemu-system-x86'}
+PACKAGES = tuple(sorted(set(TOOLS.values()) | {'qemu-kvm', 'libvirt-daemon-system'}))
+
+
+def supported_host():
+    release = platform.freedesktop_os_release()
+    require(platform.system() == 'Linux' and platform.machine() == 'x86_64'
+            and release.get('ID') == 'ubuntu' and release.get('VERSION_ID') in ('22.04', '24.04'),
+            'Automatic E2E host preparation supports Ubuntu 22.04/24.04 amd64 only; prepare other hosts manually.')
+
+
+def missing_packages():
+    require(shutil.which('dpkg-query'), 'dpkg-query unavailable; prepare host dependencies manually.')
+    missing = set()
+    for package in PACKAGES:
+        result = subprocess.run(['dpkg-query', '-W', '-f=${Status}', package], text=True,
+                                capture_output=True, timeout=30, check=False)
+        require(result.returncode in (0, 1), 'Package query failed; no installation attempted.')
+        if result.returncode == 1 or result.stdout.strip() != 'install ok installed':
+            missing.add(package)
+    absent = [tool for tool in TOOLS if not shutil.which(tool)]
+    if absent:
+        print('Missing E2E host tools: ' + ', '.join(absent))
+    require(all(TOOLS[tool] in missing for tool in absent),
+            'Installed E2E package has a missing executable; repair PATH/package manually, no reinstall.')
+    return sorted(missing)
+
+
+def privileged(argv, command):
+    require(shutil.which('sudo'), 'sudo unavailable; ask the host administrator to perform the displayed preparation.')
+    # Native sudo prompt/output belongs to the terminal, never a hidden password pipe.
+    command(['sudo', '--', *argv], capture=False, timeout=None)
+
+
+def qemu_group():
+    config = Path('/etc/libvirt/qemu.conf')
+    require(config.is_file() and not config.is_symlink(), 'Inspect missing/unsafe libvirt qemu.conf manually.')
+    info = config.stat()
+    require(info.st_uid == 0 and info.st_mode & 0o022 == 0, 'Unsafe libvirt qemu.conf; inspect manually.')
+    text = config.read_text()
+    for field in ('user', 'group'):
+        values = re.findall(r'^\s*' + field + r'\s*=\s*(.*?)\s*(?:#.*)?$', text, re.M)
+        require(not values or values == ['"libvirt-qemu"'],
+                'Custom QEMU user/group configuration; prepare disk access manually.')
+    return grp.getgrnam('libvirt-qemu').gr_gid
+
+
+def storage_parents(storage):
+    require(storage == Path('/var/lib/libvirt/images') / f'portfolio-e2e-{os.getuid()}', 'Foreign E2E storage path.')
+    for parent in storage.parents:
+        require(not parent.is_symlink() and parent.is_dir(), 'Unsafe/missing E2E storage parent; inspect manually.')
+        info = parent.stat()
+        require(info.st_uid == 0 and info.st_mode & 0o022 == 0
+                and os.access(parent, os.X_OK), 'E2E storage parents require protected root ownership and traversal.')
+
+
+def prepare(storage, *, command, confirm, safe_path):
+    require(os.getuid() != 0, 'Run E2E as the controller user, never with sudo.')
+    supported_host()
+    require(re.search(r'\b(vmx|svm)\b', Path('/proc/cpuinfo').read_text()),
+            'CPU virtualization flags unavailable; enable hardware virtualization before installing E2E dependencies.')
+    missing = missing_packages()
+    if missing:
+        print('Missing E2E host packages: ' + ', '.join(missing))
+        print('Privileged plan: apt-get update; apt-get install --no-install-recommends --no-upgrade --no-remove ' + ' '.join(missing))
+        confirm('Install only these missing E2E host dependencies using sudo/apt?')
+        privileged(['apt-get', 'update'], command)
+        privileged(['apt-get', 'install', '--no-install-recommends', '--no-upgrade', '--no-remove', *missing], command)
+        require(not missing_packages(), 'E2E packages/tools still unavailable after apt; STOP, no automatic retry.')
+    kvm = Path('/dev/kvm')
+    require(kvm.exists() and stat.S_ISCHR(kvm.stat().st_mode),
+            'KVM unavailable; enable hardware virtualization/KVM manually. Software emulation is unsupported.')
+    account = pwd.getpwuid(os.getuid())
+    require(re.fullmatch(r'[a-z_][a-z0-9_-]*\$?', account.pw_name), 'Unsupported controller account name.')
+    required_groups = {name: grp.getgrnam(name) for name in ('libvirt', 'kvm')}
+    effective = set(os.getgroups()) | {os.getgid()}
+    pending = [name for name, group in required_groups.items() if group.gr_gid not in effective]
+    additions = [name for name in pending if account.pw_name not in required_groups[name].gr_mem
+                 and required_groups[name].gr_gid != account.pw_gid]
+    if additions:
+        print('Privileged plan: add controller to groups ' + ', '.join(additions)
+              + '. libvirt access is root-equivalent; only trusted administrators should receive it.')
+        confirm('Grant these libvirt/KVM host permissions using sudo?')
+        privileged(['usermod', '-aG', ','.join(additions), '--', account.pw_name], command)
+    require(not pending, 'Log out and log in again to apply libvirt/kvm groups, then rerun make e2e-prepare. No VM created.')
+    require(os.access(kvm, os.R_OK | os.W_OK), 'No read/write KVM access; inspect device ACLs/permissions manually.')
+    # Failure is not absence and must not trigger service/polkit configuration changes.
+    command(['virsh', '--connect', 'qemu:///system', 'list', '--all', '--uuid'])
+    capabilities = ET.fromstring(command(['virsh', '--connect', 'qemu:///system', 'capabilities']))
+    require(capabilities.find("guest/arch[@name='x86_64']/domain[@type='kvm']") is not None,
+            'libvirt does not advertise x86_64 KVM; inspect host configuration manually.')
+    gid = qemu_group()
+    storage_parents(storage)
+    if not storage.exists() and not storage.is_symlink():
+        print(f'Privileged plan: create only {storage}, owner UID={os.getuid()}, QEMU GID={gid}, mode=2750.')
+        confirm('Create the new dedicated E2E disk directory using sudo?')
+        storage_parents(storage)
+        # mkdir is exclusive: a concurrently appearing directory fails without changing it.
+        privileged(['mkdir', '-m', '2750', '--', str(storage)], command)
+        require(not storage.is_symlink() and storage.is_dir() and storage.stat().st_uid == 0,
+                'Disk directory changed during creation; STOP.')
+        privileged(['chown', '--no-dereference', f'{os.getuid()}:{gid}', '--', str(storage)], command)
+        # chown may clear setgid; owner performs the final mode change after validation.
+        safe_path(storage, directory=True, private=False)
+        storage.chmod(0o2750)
+    safe_path(storage, directory=True, private=False)
+    info = storage.stat()
+    require(info.st_gid == gid and stat.S_IMODE(info.st_mode) == 0o2750
+            and os.access(storage, os.R_OK | os.W_OK | os.X_OK),
+            'Existing disk directory has incompatible QEMU group/mode/access; inspect manually, no chmod/chown repair.')

@@ -270,7 +270,12 @@ authorized operator checks.
 `scripts/e2e.py` invokes `portfolio_cli.e2e`: a separate controller lifecycle for
 one per-user KVM BIOS guest and dedicated NAT on `qemu:///system`. It uses virsh
 XML queries, virt-install XML generation, checked official Ubuntu cloud image,
-minimal cloud-init bootstrap and stopped internal qcow2 snapshots. The module
+minimal cloud-init bootstrap and stopped internal qcow2 snapshots. `e2e_images`
+validates the declarative image registry and rejects redirects before following;
+`e2e_host` handles only explicitly confirmed missing Ubuntu controller packages,
+additive groups and exclusive dedicated directory creation. Neither implements
+provisioning or recovery. Schema-2 state records the distro; schema-1 Noble fixtures
+remain readable without migration. The lifecycle module
 owns fixture state/locking, resource validation and the interactive scenario;
 it does not implement provisioning. See [the operator guide](docs/local-vm-e2e.md).
 

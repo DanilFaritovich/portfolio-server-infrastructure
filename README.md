@@ -1556,7 +1556,7 @@ or sudo were revoked requires manual recovery inspection, without blind retries.
 ## Local Ubuntu VM E2E
 
 The optional interactive KVM/libvirt fixture tests the existing `make init-server`
-on a disposable Ubuntu Server 24.04 guest. It uses `qemu:///system`, virt-install,
+on a disposable Ubuntu Server 24.04 (default) or 22.04 amd64 guest. It uses `qemu:///system`, virt-install,
 cloud-init and a dedicated NAT; virt-manager can open its serial console.
 Defaults are 2 vCPU, 4 GiB RAM and 25 GiB qcow2, configurable for new fixtures.
 Production inventory, keys and host trust are excluded. Real VM commands are
@@ -1568,3 +1568,10 @@ before running `make e2e-prepare`, `make e2e-status`, `make e2e-test`,
 require explicit consent; tests retain all native stage confirmations. The
 scenario covers installation, final verification, repeat provisioning and reboot
 persistence. Failures preserve the guest for console diagnosis, without auto-reset.
+
+`make e2e-list-distros` lists the local image registry. For a new fixture select
+`make e2e-prepare E2E_DISTRO=ubuntu-22.04`. On Ubuntu 22.04/24.04 amd64 controllers,
+prepare lists missing packages and offers apt installation, additive libvirt/kvm
+groups and a dedicated disk directory with separate `[y/N]` confirmations. Group
+changes require relogin; ready VMs are preserved and distro changes are blocked.
+SHA-256 verification and optional `E2E_IMAGE_SHA256` pinning remain mandatory checks.
