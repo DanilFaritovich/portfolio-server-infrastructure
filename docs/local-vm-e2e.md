@@ -17,6 +17,11 @@ profiles below; accepting a host does not add Guest OS support.
 Run `make deps` first to prepare the project's local Python tooling; never run
 `make` as root.
 
+System hypervisor tools run without the controller virtualenv/Python environment
+in their subprocess environment. In particular, `/usr/bin/env python3` in
+virt-install must resolve the host Python with distro-provided gi/libvirt modules;
+the controller and scenario Ansible commands retain their pinned tooling.
+
 `make e2e-prepare` checks CPU virtualization flags, installed packages and commands,
 `/dev/kvm` access, effective libvirt/kvm groups, non-sudo `qemu:///system` access,
 x86_64 KVM capabilities and disk directory ownership/mode. Host changes occur only

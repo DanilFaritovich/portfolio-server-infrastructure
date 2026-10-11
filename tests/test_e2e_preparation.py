@@ -354,6 +354,41 @@ class HostTests(unittest.TestCase):
 
 
 class PackageTests(unittest.TestCase):
+    def test_system_tools_exclude_controller_python_but_scenario_keeps_it(self):
+        pinned = str((e2e.ROOT / '.venv/bin').resolve())
+        source = dict(PATH=pinned + os.pathsep + '/usr/bin', PYTHONPATH='synthetic-controller',
+                      PYTHONHOME='synthetic-controller', VIRTUAL_ENV='synthetic-controller')
+        for tool in ('virt-install', 'cloud-localds', 'virsh', 'qemu-img', 'make'):
+            with self.subTest(tool=tool), patch.object(e2e.subprocess, 'run', return_value=SimpleNamespace(
+                    returncode=0, stdout='synthetic')) as run:
+                e2e.command([tool], env=source)
+                child = run.call_args.kwargs['env']
+                self.assertEqual(child['PATH'], source['PATH'] if tool == 'make' else '/usr/bin')
+                self.assertEqual('PYTHONPATH' in child, tool == 'make')
+                self.assertEqual('PYTHONHOME' in child, tool == 'make')
+                self.assertEqual('VIRTUAL_ENV' in child, tool == 'make')
+        self.assertIn('PYTHONPATH', source)
+
+    def test_make_environment_does_not_select_project_python_for_system_tool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            # Synthetic system command, no libvirt or VM probes.
+            tool = base / 'virt-install'
+            tool.write_text('#!/usr/bin/env python3\nimport sys\nprint(sys.executable)\n')
+            tool.chmod(0o700)
+            script = base / 'probe.py'
+            script.write_text('import sys\nsys.path.insert(0, ' + repr(str(e2e.ROOT / 'scripts'))
+                              + ')\nfrom portfolio_cli import e2e\nprint(e2e.command(["virt-install"]).strip())\n')
+            makefile = base / 'Makefile'
+            makefile.write_text('include ' + str(e2e.ROOT / 'Makefile') + '\n'
+                                'probe:\n\t@$(VENV)/bin/python ' + str(script) + '\n')
+            run = subprocess.run(['make', '--no-print-directory', '-f', str(makefile), 'probe'],
+                                 cwd=e2e.ROOT, env=dict(os.environ, PATH=str(base) + os.pathsep + '/usr/bin:/bin'),
+                                 text=True, capture_output=True, check=False)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertNotIn('.venv', run.stdout)
+            self.assertIn('python3', run.stdout)
+
     def test_failed_commands_name_static_operation_without_exposing_payloads(self):
         cases = [(['openssl', 'passwd', 'SECRET'], 'password hashing'),
                  (['virt-install', '--name', 'SECRET'], 'domain XML generation'),

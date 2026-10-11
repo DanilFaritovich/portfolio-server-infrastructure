@@ -52,8 +52,19 @@ def command_label(argv):
 
 def command(argv, *, capture=True, input=None, timeout=60, env=None):
     """Never echo arguments/output on failure (cloud-init and prompts are private)."""
+    child_env = dict(env) if env is not None else dict(os.environ, LC_ALL='C')
+    if argv and argv[0] in ('virt-install', 'cloud-localds', 'virsh', 'qemu-img'):
+        # System tools may use /usr/bin/env python3 and require distro modules
+        # (gi/libvirt). Make's pinned controller venv must not select their Python.
+        controller_bins = {(ROOT / '.venv/bin').resolve()}
+        if sys.prefix != sys.base_prefix:
+            controller_bins.add((Path(sys.prefix) / 'bin').resolve())
+        child_env['PATH'] = os.pathsep.join(entry for entry in child_env.get('PATH', os.defpath).split(os.pathsep)
+                                           if Path(entry or '.').resolve() not in controller_bins)
+        for name in ('PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV'):
+            child_env.pop(name, None)
     result = subprocess.run(argv, input=input, text=True, capture_output=capture,
-                            timeout=timeout, env=env or dict(os.environ, LC_ALL='C'), check=False)
+                            timeout=timeout, env=child_env, check=False)
     require(result.returncode == 0, 'E2E subprocess failed (' + command_label(argv)
             + f', exit {result.returncode}); STOP and diagnose before retrying. '
             'Command arguments and output are withheld to protect secrets.')
