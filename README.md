@@ -91,6 +91,53 @@ and [ssh-keygen](https://man.openbsd.org/ssh-keygen).
 Confirm VPS prerequisites and the sudoers include before proceeding. Do not select
 an unrelated existing account as the managed `ansible_user` account.
 
+## Unified initialization
+
+After `make setup`, configure the local inventory and provider recovery/trust,
+prepare an independent human administrator key with existing local key commands,
+and load encrypted keys in the invoking shell. Then, in a terminal:
+
+```sh
+make init-server INIT_FROM=bootstrap HUMAN_USER=operator HUMAN_SUDO=admin \
+  HUMAN_KEY="$HOME/.ssh/portfolio-infra/operator_ed25519" \
+  HUMAN_PUBLIC_KEY="$HOME/.ssh/portfolio-infra/operator_ed25519.pub"
+```
+
+This is **LIVE / MUTATING**: bootstrap → Docker → SSH/UFW hardening → human access
+→ final SSH security → separately confirmed server operations, with mandatory
+verification between stages. Existing registration, recovery, password/trust and
+operations prompts remain. No application deployment, reboot or automatic recovery.
+
+`INIT_FROM` chooses the first stage authorized for application: `bootstrap`,
+`docker`, `hardening`, `human`, `ssh`, `operations`; omit it for interactive selection
+with no default. Earlier stages are skipped only after successful server verification.
+Remaining stages run existing idempotent wrappers and explicit verification; completed
+stages beyond the selected frontier are not auto-detected. `INIT_FROM=verify` verifies
+the entire pipeline without provisioning; Docker's disposable smoke test may change
+the image cache.
+
+A failed verifier cannot distinguish absence from broken access, pending activation
+or unsafe drift. It **stops**, never falls back to mutation. After a partial run,
+diagnose through existing read-only inspectors and retained human/provider recovery
+access. Remote work may still be running after interruption. Only after resolving
+uncertainty, explicitly select the first unfinished stage; preceding stages verify
+again. No log or local checkpoint authorizes continuation. Other controllers/raw
+Ansible still require manual serialization.
+
+One controller lock covers the whole run, confirmations and postflight. Terminal
+progress and the final report show verified stages. A new local `portfolio-init-*.jsonl`
+file in the temporary directory (normally `/tmp`, mode 0600) stores only schema,
+stage, status and elapsed seconds for that stage (`run` events use total run time).
+Application emits `applying → verifying → completed/failed`; skipped stages emit
+`verifying → verified_skip`. Its path is printed; retain/delete it manually.
+Inventory, identities, keys, passwords, exception text and subprocess output are
+never captured. Log-write errors stop later dispatch and may leave the last record
+incomplete. Terminal errors include the active command and an allowlisted static
+cause or safe process/I/O category, without arbitrary exception text or raw stderr.
+Ctrl+D at stage selection or plan confirmation cancels before host contact without
+traceback. Stage diagnostics remain in the terminal. Offline checks do not prove
+live access, repeat-run idempotency or provider recovery.
+
 ## Access and security
 
 The standard path is **bootstrap_login_user + interactive SSH password →

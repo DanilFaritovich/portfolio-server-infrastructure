@@ -15,7 +15,7 @@ from types import FunctionType
 MODULES = (
     'common', 'inventory', 'keys', 'clipboard', 'host_trust', 'ansible',
     'inspection', 'verification', 'provisioning', 'human_access',
-    'user_management', 'operations', 'local_keys', 'ssh', 'cli',
+    'user_management', 'operations', 'initialization', 'local_keys', 'ssh', 'cli',
 )
 
 

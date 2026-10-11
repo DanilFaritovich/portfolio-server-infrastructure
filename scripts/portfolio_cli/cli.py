@@ -12,6 +12,7 @@ from .common import ROOT
 from .host_trust import TRUST_GUIDANCE, server_trust
 from .human_access import human_access
 from .inventory import setup_inventory
+from .initialization import init_server
 from .local_keys import local_key
 from .operations import operations
 from .provisioning import live
@@ -21,7 +22,7 @@ from .user_management import USER_MANAGEMENT_MODES, user_management
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=[*USER_MANAGEMENT_MODES, 'show-server-trust', 'copy-server-trust', 'trust-server', 'generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
+    parser.add_argument('mode', choices=['init-server', *USER_MANAGEMENT_MODES, 'show-server-trust', 'copy-server-trust', 'trust-server', 'generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=None, help='Legacy key override; explicit inventories own the key path.')
     args = parser.parse_args()
@@ -60,6 +61,8 @@ def dispatch(args, inventory):
     """Dispatch inside the stage lock; exceptions retain their public CLI boundary."""
     if args.mode == 'setup':
         setup_inventory(inventory)
+    elif args.mode == 'init-server':
+        init_server(inventory, args.key or None)
     elif args.mode in ('show-server-trust', 'copy-server-trust', 'trust-server'):
         server_trust(args.mode, inventory)
     elif args.mode in ('generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key'):

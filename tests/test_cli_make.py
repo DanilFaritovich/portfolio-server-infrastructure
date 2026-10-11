@@ -102,6 +102,12 @@ exit 0
                          [PUBLIC, 'SHA256 fingerprint: SHA256:synthetic'])
         self.assertNotIn('unexpected ssh invocation', self.calls.read_text())
 
+    def test_init_server_wrapper_refuses_no_tty_without_host_contact(self):
+        result = self.make('init-server', INIT_FROM='bootstrap', HUMAN_USER='person', HUMAN_SUDO='admin')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('init-server requires an interactive terminal', result.stderr)
+        self.assertNotIn('unexpected ssh invocation', self.calls.read_text() if self.calls.exists() else '')
+
     def test_copy_public_key_wrapper_uses_mock_clipboard_without_ssh(self):
         self.executable('wl-copy', '#!/bin/sh\ncat > "$FAKE_CLIPBOARD"\n')
         clipboard = self.home / 'clipboard'

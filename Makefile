@@ -12,6 +12,8 @@ export PATH := $(abspath $(VENV))/bin:$(PATH)
 
 .PHONY: list-users show-user list-user-keys add-user-key revoke-user-key remove-user generate-user-key load-user-key show-public-key copy-public-key show-controller connect-controller connect-user deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
 .PHONY: show-server-trust copy-server-trust trust-server
+.PHONY: init-server
+export INIT_FROM
 
 # Human account inputs are supplied by the caller; USER is intentionally untouched.
 export AGENT_LOAD KEY_FINGERPRINT RECOVERY_USER RECOVERY_KEY KEY_NAME HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
@@ -19,6 +21,11 @@ export AGENT_LOAD KEY_FINGERPRINT RECOVERY_USER RECOVERY_KEY KEY_NAME HUMAN_USER
 # Dependency setup uses registries; checks below use installed dependencies offline.
 deps:
 	@sh scripts/setup.sh deps
+
+# LIVE / MUTATING: explicit frontier, existing confirmations and whole-run lock.
+init-server:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py init-server --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
 
 # Local setup prepares toolchain/dependencies and creates only missing inventory.
 setup:
