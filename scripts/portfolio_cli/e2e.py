@@ -517,11 +517,19 @@ class Stand:
     def delete(self):
         self.load()
         safe_path(self.storage, directory=True, private=False)
+        info = self.storage.stat()
+        storage_identity = (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode)
+        sudo_rmdir = not os.access(self.storage.parent, os.W_OK)
+        if sudo_rmdir:
+            e2e_host.storage_parents(self.storage)
+            require(e2e_host.shutil.which('sudo'), 'sudo unavailable; no deletion attempted.')
         domain, network = self.resources()
         snapshots = self.snapshots() if domain else []
         self.deletion_paths()  # All path checks precede the first mutation.
         self.no_foreign_users()
         confirm('Delete only the owned E2E VM, snapshots, NAT, disks and local fixture files?')
+        if sudo_rmdir:
+            confirm('Use sudo only to remove the empty dedicated E2E disk directory after deleting owned resources?')
         require((domain, network) == self.resources(), 'Resources changed during confirmation; STOP.')
         self.no_foreign_users()
         if domain:
@@ -540,10 +548,33 @@ class Stand:
         self.no_foreign_users()
         files, directories = self.deletion_paths()
         # Persistent sibling lock is intentionally retained, like the CLI lock.
+        # Retain controller state/ownership evidence until protected storage is
+        # removed. The root-owned parent requires sudo even for an owned child.
         for path in files:
-            path.unlink()
+            if path.is_relative_to(self.storage):
+                path.unlink()
         for path in sorted(directories, key=lambda p: len(p.parts), reverse=True):
-            path.rmdir()
+            if path != self.storage and path.is_relative_to(self.storage):
+                path.rmdir()
+        safe_path(self.storage, directory=True, private=False)
+        info = self.storage.stat()
+        require(storage_identity == (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode)
+                and not list(self.storage.iterdir()), 'Storage changed during deletion; STOP.')
+        self.no_foreign_users()
+        if sudo_rmdir:
+            e2e_host.storage_parents(self.storage)
+            e2e_host.privileged(['rmdir', '--', str(self.storage)], command)
+        else:
+            self.storage.rmdir()
+        require(not self.storage.exists() and not self.storage.is_symlink(), 'Storage removal incomplete; STOP.')
+        for path in files:
+            if not path.is_relative_to(self.storage) and path != self.root / 'state.json':
+                path.unlink()
+        for path in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+            if not path.is_relative_to(self.storage) and path != self.root:
+                path.rmdir()
+        (self.root / 'state.json').unlink()
+        self.root.rmdir()
         print('Owned E2E fixture deleted. No shared libvirt pool or network was removed.')
 
     def stopped_disk(self):

@@ -356,6 +356,11 @@ validated snapshots, undefines it and removes only its dedicated NAT and files.
 It never deletes shared pools/default networks, follows symlinks, uses wildcards
 or `rm -rf`. The dedicated storage directory is also removed; a new preparation offers
 its creation again with separate consent. The sibling lock inode is retained.
+When its root-owned parent prevents unprivileged removal, delete requests an
+additional default-deny sudo-rmdir confirmation before any mutation. Only the
+validated empty dedicated directory is removed through sudo. Controller files
+and state are retained until storage removal succeeds; no parent permissions
+are changed and no extra shell command is required.
 If deletion fails halfway, inspect actual resources; do not retry blindly.
 
 A failed prepare retains phase `preparing`. Another prepare refuses to resume,

@@ -239,6 +239,46 @@ class StandTests(unittest.TestCase):
         self.stand.delete()
         self.assertNotIn('undefine', [x[0] for x in self.mutations()])
 
+    def test_protected_storage_removal_uses_confirmed_sudo_with_state_retained(self):
+        def remove(argv, **kwargs):
+            self.assertEqual(argv, ['sudo', '--', 'rmdir', '--', str(self.stand.storage)])
+            self.assertTrue((self.stand.root / 'state.json').exists())
+            self.assertFalse(any(self.stand.storage.iterdir()))
+            self.stand.storage.rmdir()
+        with patch.object(e2e.os, 'access', return_value=False), \
+                patch.object(e2e.e2e_host, 'storage_parents') as parents, \
+                patch.object(e2e.e2e_host.shutil, 'which', return_value='/usr/bin/sudo'), \
+                patch.object(e2e, 'confirm') as consent, patch.object(e2e, 'command', side_effect=remove) as run:
+            self.domains = []
+            self.stand.delete()
+        self.assertEqual(consent.call_count, 2)
+        self.assertEqual(parents.call_count, 2)
+        run.assert_called_once()
+        self.assertFalse(self.stand.root.exists())
+
+    def test_protected_storage_sudo_decline_precedes_mutation(self):
+        with patch.object(e2e.os, 'access', return_value=False), \
+                patch.object(e2e.e2e_host, 'storage_parents'), \
+                patch.object(e2e.e2e_host.shutil, 'which', return_value='/usr/bin/sudo'), \
+                patch.object(e2e, 'confirm', side_effect=[None, ValueError('declined')]):
+            with self.assertRaisesRegex(ValueError, 'declined'):
+                self.stand.delete()
+        self.assertFalse(self.mutations())
+        self.assertTrue(self.stand.disk.exists())
+        self.assertTrue((self.stand.root / 'state.json').exists())
+
+    def test_failed_storage_removal_preserves_controller_evidence(self):
+        original = Path.rmdir
+        def fail(path):
+            if path == self.stand.storage:
+                raise PermissionError('synthetic protected parent')
+            original(path)
+        with patch.object(Path, 'rmdir', fail), self.assertRaises(PermissionError):
+            self.stand.delete()
+        self.assertTrue((self.stand.root / 'state.json').exists())
+        self.assertTrue(self.stand.storage.exists())
+        self.assertFalse(any(self.stand.storage.iterdir()))
+
     def test_delete_symlink_hardlink_unknown_storage_stops_before_shutdown(self):
         outside = self.base / 'outside'
         outside.write_text('preserve')
