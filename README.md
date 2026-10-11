@@ -1588,3 +1588,7 @@ Reboot later exits successfully.
 After rebooting, rerun `make e2e-prepare` to recheck access and continue;
 no VM is created before permissions become active. Ready VMs are preserved and distro changes are blocked.
 SHA-256 verification and optional `E2E_IMAGE_SHA256` pinning remain mandatory checks.
+If root-owned `qemu.conf` is unreadable, prepare separately offers read-only sudo
+inspection of file safety and QEMU identity within the same command, without
+printing configuration or changing file permissions. Failed/declined inspection
+or custom settings stop before disk/VM creation.

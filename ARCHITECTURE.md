@@ -287,6 +287,10 @@ failure classification avoids printing child stderr; even a zero exit with stder
 is unconfirmed because GNOME may swallow D-Bus failures. Uncertain completion
 requires diagnosis before any manual retry; desktop confirmation remains native.
 A fresh prepare revalidates permissions; group errors remain fail-closed.
+Unreadable root-owned QEMU configuration may receive separately confirmed
+read-only sudo inspection by isolated system Python. An unchanged file snapshot
+and stock identities are required; no configuration bytes are printed and no
+file permissions are changed. Failure stops before storage/VM creation.
 Unsupported installers require manual dependencies; prepared hosts
 continue only after capability/access/storage checks. Guest profiles stay strict. Neither implements
 provisioning or recovery. Schema-2 state records the distro; schema-1 Noble fixtures

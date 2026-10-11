@@ -192,7 +192,35 @@ def privileged(argv, command):
     command(['sudo', '--', *argv], capture=False, timeout=None)
 
 
-def qemu_group():
+# Executed by the system interpreter, never by a controller-writable script or
+# virtualenv. No configuration bytes or arbitrary exception messages are emitted.
+QEMU_INSPECT = r'''
+import os, re, stat, sys
+try:
+    fd = os.open('/etc/libvirt/qemu.conf', os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as stream:
+        before = os.fstat(stream.fileno())
+        expected = tuple(int(value) for value in sys.argv[1:])
+        snapshot = lambda s: (s.st_dev, s.st_ino, s.st_mtime_ns, s.st_ctime_ns, s.st_size)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or
+                before.st_mode & 0o022 or snapshot(before) != expected):
+            raise ValueError()
+        text = stream.read()
+        for field in ('user', 'group'):
+            values = re.findall(r'^\s*' + field + r'\s*=\s*(.*?)\s*(?:#.*)?$', text, re.M)
+            if values and values != ['"libvirt-qemu"']:
+                print('Custom QEMU user/group configuration; STOP, inspect manually.')
+                sys.exit(1)
+        if snapshot(os.fstat(stream.fileno())) != expected or snapshot(os.stat('/etc/libvirt/qemu.conf', follow_symlinks=False)) != expected:
+            raise ValueError()
+except (OSError, ValueError, UnicodeError):
+    print('QEMU configuration inspection failed or file changed; STOP, inspect manually.')
+    sys.exit(1)
+print('QEMU identity configuration verified; no host permissions changed.')
+'''
+
+
+def qemu_group(*, command=None, confirm=None):
     config = Path('/etc/libvirt/qemu.conf')
     require(config.is_file() and not config.is_symlink(), 'Inspect missing/unsafe libvirt qemu.conf manually.')
     info = config.stat()
@@ -200,9 +228,17 @@ def qemu_group():
     try:
         text = config.read_text()
     except PermissionError:
-        raise E2EError('QEMU configuration is not readable by the controller user. '
-                       'Ask the host administrator to review /etc/libvirt/qemu.conf and provide safe read access; '
-                       'no sudo, permission changes or default identity assumption attempted.') from None
+        if command is None or confirm is None:
+            raise E2EError('QEMU configuration is not readable by the controller user. '
+                           'Run make e2e-prepare for separately confirmed read-only sudo inspection.') from None
+        require(Path('/usr/bin/python3').is_file(),
+                'System Python unavailable for isolated QEMU inspection; inspect manually.')
+        print('QEMU configuration is not readable. Privileged plan: inspect only file safety and QEMU user/group; '
+              'no configuration output or permission changes.')
+        confirm('Inspect root-owned QEMU configuration read-only using sudo?')
+        snapshot = [str(value) for value in (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)]
+        privileged(['/usr/bin/python3', '-I', '-c', QEMU_INSPECT, *snapshot], command)
+        return grp.getgrnam('libvirt-qemu').gr_gid
     for field in ('user', 'group'):
         values = re.findall(r'^\s*' + field + r'\s*=\s*(.*?)\s*(?:#.*)?$', text, re.M)
         require(not values or values == ['"libvirt-qemu"'],
@@ -260,7 +296,7 @@ def prepare(storage, *, command, confirm, safe_path):
     capabilities = ET.fromstring(command(['virsh', '--connect', 'qemu:///system', 'capabilities']))
     require(capabilities.find("guest/arch[@name='x86_64']/domain[@type='kvm']") is not None,
             'libvirt does not advertise x86_64 KVM; inspect host configuration manually.')
-    gid = qemu_group()
+    gid = qemu_group(command=command, confirm=confirm)
     storage_parents(storage)
     if not storage.exists() and not storage.is_symlink():
         print(f'Privileged plan: create only {storage}, owner UID={os.getuid()}, QEMU GID={gid}, mode=2750.')

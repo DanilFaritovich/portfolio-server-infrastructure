@@ -359,6 +359,69 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn('SECRET', str(caught.exception))
             group.assert_not_called()
 
+    def test_unreadable_qemu_inspection_requires_consent_and_stops_on_failure(self):
+        info = SimpleNamespace(st_uid=0, st_mode=0o600, st_dev=1, st_ino=2,
+                               st_mtime_ns=3, st_ctime_ns=4, st_size=5)
+        with patch.object(Path, 'is_file', return_value=True), patch.object(Path, 'is_symlink', return_value=False), \
+                patch.object(Path, 'stat', return_value=info), \
+                patch.object(Path, 'read_text', side_effect=PermissionError('SECRET')), \
+                patch.object(host.shutil, 'which', return_value='/usr/bin/sudo'), \
+                patch.object(host.grp, 'getgrnam', return_value=SimpleNamespace(gr_gid=42)) as group:
+            events = []
+            confirm = Mock(side_effect=lambda message: events.append('confirm'))
+            command = Mock(side_effect=lambda *args, **kwargs: events.append('sudo'))
+            self.assertEqual(host.qemu_group(command=command, confirm=confirm), 42)
+            self.assertEqual(events, ['confirm', 'sudo'])
+            argv = command.call_args.args[0]
+            self.assertEqual(argv[:5], ['sudo', '--', '/usr/bin/python3', '-I', '-c'])
+            self.assertEqual(argv[5], host.QEMU_INSPECT)
+            self.assertEqual(argv[6:], ['1', '2', '3', '4', '5'])
+            self.assertEqual(command.call_args.kwargs, {'capture': False, 'timeout': None})
+            group.reset_mock()
+            command.reset_mock()
+            confirm.side_effect = images.E2EError('declined')
+            with self.assertRaisesRegex(ValueError, 'declined'):
+                host.qemu_group(command=command, confirm=confirm)
+            command.assert_not_called()
+            group.assert_not_called()
+            confirm.side_effect = None
+            command.side_effect = images.E2EError('sudo failed')
+            with self.assertRaisesRegex(ValueError, 'sudo failed'):
+                host.qemu_group(command=command, confirm=confirm)
+            group.assert_not_called()
+
+    def test_privileged_qemu_inspector_validates_identity_metadata_and_snapshot(self):
+        # Execute the exact privileged payload offline with only synthetic files.
+        for text, unsafe, changed, expected in (
+                ('# user = "custom"\n', False, False, 0),
+                ('user = "libvirt-qemu"\ngroup = "libvirt-qemu"', False, False, 0),
+                ('user = "custom"', False, False, 1),
+                ('group = "root"', False, False, 1),
+                ('user = "libvirt-qemu"\nuser = "libvirt-qemu"', False, False, 1),
+                ('', True, False, 1), ('', False, True, 1)):
+            with self.subTest(text=text, unsafe=unsafe, changed=changed), tempfile.TemporaryFile(mode='w+') as stream:
+                stream.write(text)
+                stream.seek(0)
+                info = SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | (0o666 if unsafe else 0o600),
+                                       st_dev=1, st_ino=2, st_mtime_ns=3, st_ctime_ns=4, st_size=5)
+                final = SimpleNamespace(**vars(info))
+                if changed:
+                    final.st_ino = 99
+                duplicate = os.dup(stream.fileno())
+                with patch.object(os, 'open', return_value=duplicate) as opening, \
+                        patch.object(os, 'fstat', return_value=info), patch.object(os, 'stat', return_value=final), \
+                        patch.object(sys, 'argv', ['-c', '1', '2', '3', '4', '5']), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = 0
+                    try:
+                        exec(host.QEMU_INSPECT, {})
+                    except SystemExit as error:
+                        code = error.code
+                    self.assertEqual(code, expected)
+                    if text.strip():
+                        self.assertNotIn(text.strip(), output.getvalue())
+                    opening.assert_called_once_with('/etc/libvirt/qemu.conf', os.O_RDONLY | os.O_NOFOLLOW)
+
     def test_cli_lock_failure_reports_safe_os_cause_and_never_prepares(self):
         for code, label in ((errno.EROFS, 'EROFS'), (errno.EACCES, 'EACCES'), (errno.EPERM, 'EPERM'),
                             (errno.ENOENT, 'ENOENT'), (errno.EIO, 'EIO')):
