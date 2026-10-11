@@ -26,11 +26,59 @@ class PreparationResult(Enum):
     REBOOT_REQUIRED = 'reboot-required'
 
 
+def reboot_command():
+    """Select one backend before dispatch; incomplete GNOME never falls through."""
+    if platform.system() != 'Linux':
+        return None, 'Linux is required for automatic reboot'
+    if os.getuid() == 0:
+        return None, 'run as the local controller user, not root'
+    if (any(os.environ.get(name) for name in ('SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY'))
+            or os.environ.get('XDG_SESSION_REMOTE', '').lower() not in ('', '0', 'no', 'false')):
+        return None, 'remote sessions cannot request automatic reboot'
+    desktop = os.environ.get('XDG_CURRENT_DESKTOP', '')
+    gnome = 'gnome' in desktop.lower().split(':')
+    if not desktop:
+        gnome = os.environ.get('XDG_SESSION_DESKTOP', '').lower() in ('gnome', 'gnome-xorg', 'gnome-wayland')
+    session = os.environ.get('XDG_SESSION_TYPE', '')
+    if gnome:
+        display = 'DISPLAY' if session == 'x11' else 'WAYLAND_DISPLAY'
+        if (session not in ('x11', 'wayland') or not os.environ.get(display)
+                or not os.environ.get('DBUS_SESSION_BUS_ADDRESS', '').startswith('unix:')):
+            return None, 'GNOME needs a local X11/Wayland display and session bus'
+        executable = shutil.which('gnome-session-quit')
+        if not executable:
+            return None, 'gnome-session-quit is not installed or not on PATH'
+        return [executable, '--reboot'], None
+    if session not in ('', 'tty', 'x11', 'wayland') or not Path('/run/systemd/system').is_dir():
+        return None, 'no supported local systemd session was detected'
+    executable = shutil.which('systemctl')
+    if not executable:
+        return None, 'systemctl is not installed or not on PATH'
+    return [executable, '--check-inhibitors=yes', '--no-ask-password', 'reboot'], None
+
+
+def reboot_failure_reason(stderr):
+    """Classify bounded diagnostics without exposing subprocess text or identities."""
+    message = (stderr or '')[:8192].lower()
+    if any(term in message for term in ('unknown option', 'unrecognized option')):
+        return 'installed reboot tool does not support the required options'
+    if any(term in message for term in ('inhibit', 'shutdown/block')):
+        return 'restart blocked by a session/application inhibitor'
+    if any(term in message for term in ('access denied', 'permission denied', 'not authorized',
+                                       'authentication', 'interactive authorization', 'not permitted')):
+        return 'system authorization denied or requires interactive authentication'
+    if any(term in message for term in ('connect to', 'connect:', 'serviceunknown', 'namehasnoowner',
+                                       'not provided by any', 'failed to call reboot', 'connection closed')):
+        return 'session/system service unavailable or request not acknowledged'
+    return 'reboot tool reported an unrecognized diagnostic'
+
+
 def offer_reboot():
     """Offer a normal local system restart after verified group configuration."""
     print('✓ Host permissions configured successfully.\n'
           'A system restart is required to activate new permissions.')
-    later = 'Restart the system manually when ready. After rebooting, run: make e2e-prepare'
+    later = ('Restart the system manually when ready using the desktop Restart action or ask the administrator. '
+             'After rebooting, run: make e2e-prepare')
     if not sys.stdin.isatty():
         print(later)
         return
@@ -52,22 +100,41 @@ def offer_reboot():
     except (EOFError, KeyboardInterrupt):
         print('\n' + later)
         return
-    executable = shutil.which('systemctl')
-    if (not executable or os.getuid() == 0
-            or any(os.environ.get(name) for name in ('SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY'))):
-        print('Automatic reboot is unavailable for this session. ' + later)
+    try:
+        argv, reason = reboot_command()
+    except OSError:
+        argv, reason = None, 'local session capability check failed'
+    if argv is None:
+        print('Automatic reboot unavailable: ' + reason + '. ' + later)
         return
     try:
-        # Captured output is non-interactive: explicitly respect inhibitors.
-        # Keep system authorization; never use sudo, force, fallback or retry.
-        result = subprocess.run([executable, '--check-inhibitors=yes', '--no-ask-password', 'reboot'],
-                                capture_output=True, text=True, timeout=30, check=False)
-        if result.returncode != 0:
-            print('Automatic reboot is unavailable. ' + later)
+        # GNOME owns desktop inhibitors/confirmation; systemctl checks inhibitors
+        # explicitly even with captured output. Never force, escalate or retry.
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False,
+                                env=dict(os.environ, LC_ALL='C'))
+        # GNOME can return zero after a failed D-Bus call: stderr is evidence too.
+        if result.returncode != 0 or result.stderr.strip():
+            reason = reboot_failure_reason(result.stderr) if result.stderr.strip() else 'reboot tool exited unsuccessfully'
+            print(f'Automatic reboot unconfirmed (exit status {result.returncode}): {reason}. '
+                  'Inspect system state before any manual retry. ' + later)
+        elif argv[-1] == '--reboot':
+            print('Reboot requested through GNOME; complete any desktop confirmation. '
+                  'If the system does not restart, ' + later)
         else:
             print('Reboot requested. If the system does not restart, ' + later)
-    except (OSError, subprocess.SubprocessError, KeyboardInterrupt):
-        print('Automatic reboot could not be confirmed; inspect system state before any manual retry. ' + later)
+    except subprocess.TimeoutExpired:
+        print('Automatic reboot unconfirmed: request timed out. Inspect system state before any manual retry. ' + later)
+    except KeyboardInterrupt:
+        print('Automatic reboot unconfirmed: request interrupted. Inspect system state before any manual retry. ' + later)
+    except FileNotFoundError:
+        print('Automatic reboot unavailable: selected reboot tool is no longer available. ' + later)
+    except PermissionError:
+        print('Automatic reboot unavailable: permission to execute the selected tool was denied. ' + later)
+    except OSError:
+        print('Automatic reboot unavailable: reboot tool could not be executed. ' + later)
+    except (subprocess.SubprocessError, UnicodeError):
+        print('Automatic reboot unconfirmed: request execution/output failed. '
+              'Inspect system state before any manual retry. ' + later)
 
 
 def supported_host():

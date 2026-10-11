@@ -277,10 +277,15 @@ allowlists. It handles only explicitly confirmed missing packages through a revi
 Ubuntu/Debian apt mapping, additive groups and exclusive dedicated directory
 creation. Configured but ineffective groups return `REBOOT_REQUIRED`; the CLI
 releases the fixture lock before offering reboot now/later and exits successfully
-without fixture creation. A separately confirmed local, non-root systemctl reboot
-request explicitly respects inhibitors and system authorization without sudo or
-password prompts. Unsupported/remote or failed requests use manual instructions;
-uncertain completion requires diagnosis before any manual retry.
+without fixture creation. Before a separately confirmed request, `e2e_host` selects
+one backend using local session capabilities: complete GNOME X11/Wayland uses
+`gnome-session-quit --reboot`; other supported Linux/systemd sessions use systemctl
+with explicit inhibitor checks and no authentication prompt. Incomplete GNOME,
+remote/root/unsupported sessions and missing tools use manual instructions.
+There is no force, sudo, OS-version selection or second-backend retry. Static
+failure classification avoids printing child stderr; even a zero exit with stderr
+is unconfirmed because GNOME may swallow D-Bus failures. Uncertain completion
+requires diagnosis before any manual retry; desktop confirmation remains native.
 A fresh prepare revalidates permissions; group errors remain fail-closed.
 Unsupported installers require manual dependencies; prepared hosts
 continue only after capability/access/storage checks. Guest profiles stay strict. Neither implements

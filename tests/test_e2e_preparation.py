@@ -394,6 +394,9 @@ class PackageTests(unittest.TestCase):
 
 
 class RebootTests(unittest.TestCase):
+    GNOME = {'XDG_CURRENT_DESKTOP': 'ubuntu:GNOME', 'XDG_SESSION_TYPE': 'wayland',
+             'WAYLAND_DISPLAY': 'wayland-0', 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/mock/bus'}
+
     def setUp(self):
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
@@ -401,8 +404,10 @@ class RebootTests(unittest.TestCase):
         self.stack.enter_context(patch.object(host.sys.stdin, 'isatty', return_value=True))
         self.stack.enter_context(patch.dict(os.environ, {}, clear=True))
         self.stack.enter_context(patch.object(host.os, 'getuid', return_value=1000))
+        self.stack.enter_context(patch.object(host.platform, 'system', return_value='Linux'))
+        self.stack.enter_context(patch.object(Path, 'is_dir', return_value=True))
         self.which = self.stack.enter_context(patch.object(host.shutil, 'which', return_value='/mock/systemctl'))
-        self.run = self.stack.enter_context(patch.object(host.subprocess, 'run', return_value=SimpleNamespace(returncode=0)))
+        self.run = self.stack.enter_context(patch.object(host.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stderr='')))
 
     def interact(self, answers):
         with patch('builtins.input', side_effect=answers):
@@ -446,15 +451,129 @@ class RebootTests(unittest.TestCase):
             self.interact(['1', 'y'])
         self.run.assert_not_called()
 
+    def test_local_gnome_reboots_via_session_manager_on_x11_and_wayland(self):
+        for session, display in (('x11', 'DISPLAY'), ('wayland', 'WAYLAND_DISPLAY')):
+            with self.subTest(session=session), patch.dict(os.environ, dict(self.GNOME, XDG_SESSION_TYPE=session,
+                                                                           **{display: ':mock'})):
+                self.run.reset_mock()
+                self.which.reset_mock()
+                self.which.side_effect = lambda name: '/mock/' + name
+                self.interact(['1', 'y'])
+                self.which.assert_called_once_with('gnome-session-quit')
+                self.run.assert_called_once()
+                self.assertEqual(self.run.call_args.args[0], ['/mock/gnome-session-quit', '--reboot'])
+                self.assertEqual(self.run.call_args.kwargs['env']['DBUS_SESSION_BUS_ADDRESS'], self.GNOME['DBUS_SESSION_BUS_ADDRESS'])
+                self.assertEqual(self.run.call_args.kwargs['env']['LC_ALL'], 'C')
+        self.assertIn('complete any desktop confirmation', self.output.getvalue())
+
+    def test_gnome_identity_is_exact_and_session_desktop_is_only_a_fallback(self):
+        for desktop, session_desktop, expected in (('ubuntu:GNOME', '', 'gnome-session-quit'),
+                                                  ('', 'gnome', 'gnome-session-quit'),
+                                                  ('NOTGNOME', 'gnome', 'systemctl'),
+                                                  ('KDE', 'gnome', 'systemctl')):
+            with self.subTest(desktop=desktop), patch.dict(os.environ, dict(self.GNOME,
+                    XDG_CURRENT_DESKTOP=desktop, XDG_SESSION_DESKTOP=session_desktop)):
+                self.which.reset_mock()
+                self.interact(['1', 'y'])
+                self.which.assert_called_once_with(expected)
+
+    def test_incomplete_gnome_never_falls_through_to_systemctl(self):
+        for changes in ({'XDG_SESSION_TYPE': 'tty'}, {'XDG_SESSION_TYPE': 'unknown'},
+                        {'WAYLAND_DISPLAY': ''}, {'DBUS_SESSION_BUS_ADDRESS': ''},
+                        {'DBUS_SESSION_BUS_ADDRESS': 'tcp:host=remote,port=1234'},
+                        {'XDG_SESSION_TYPE': 'x11', 'DISPLAY': ''}):
+            with self.subTest(changes=changes), patch.dict(os.environ, dict(self.GNOME, **changes)):
+                self.interact(['1', 'y'])
+        with patch.dict(os.environ, self.GNOME):
+            self.which.return_value = None
+            self.interact(['1', 'y'])
+        self.run.assert_not_called()
+        self.assertIn('GNOME needs a local X11/Wayland display and session bus', self.output.getvalue())
+        self.assertIn('gnome-session-quit is not installed', self.output.getvalue())
+
+    def test_other_linux_systemd_sessions_preserve_inhibitors(self):
+        for session in ('', 'tty', 'x11', 'wayland'):
+            with self.subTest(session=session), patch.dict(os.environ, XDG_CURRENT_DESKTOP='KDE', XDG_SESSION_TYPE=session):
+                self.run.reset_mock()
+                self.interact(['1', 'y'])
+                self.run.assert_called_once()
+                self.assertEqual(self.run.call_args.args[0],
+                                 ['/mock/systemctl', '--check-inhibitors=yes', '--no-ask-password', 'reboot'])
+
+    def test_non_linux_or_non_systemd_or_unknown_session_is_manual(self):
+        with patch.object(host.platform, 'system', return_value='Darwin'):
+            self.interact(['1', 'y'])
+        with patch.object(Path, 'is_dir', return_value=False):
+            self.interact(['1', 'y'])
+        with patch.dict(os.environ, XDG_SESSION_TYPE='unknown'):
+            self.interact(['1', 'y'])
+        with patch.object(host.platform, 'freedesktop_os_release') as release:
+            host.reboot_command()
+            release.assert_not_called()
+        self.run.assert_not_called()
+
     def test_unsupported_or_remote_session_falls_back_manually(self):
-        for env in ({'SSH_CONNECTION': 'mock'},
-                    {'SSH_CLIENT': 'mock'}, {'SSH_TTY': '/mock'}):
-            with patch.dict(os.environ, env):
+        for env in ({'SSH_CONNECTION': 'mock'}, {'SSH_CLIENT': 'mock'}, {'SSH_TTY': '/mock'},
+                    {'XDG_SESSION_REMOTE': '1'}, {'XDG_SESSION_REMOTE': 'yes'}, {'XDG_SESSION_REMOTE': 'unknown'}):
+            with patch.dict(os.environ, dict(self.GNOME, **env)):
                 self.interact(['1', 'yes'])
         self.which.return_value = None
         self.interact(['1', 'y'])
         self.run.assert_not_called()
-        self.assertIn('Automatic reboot is unavailable', self.output.getvalue())
+        self.assertIn('Automatic reboot unavailable:', self.output.getvalue())
+
+    def test_diagnostics_are_short_static_and_never_echo_sensitive_output(self):
+        cases = [('Operation inhibited by GNOME shutdown/block', 'session/application inhibitor'),
+                 ('Access denied', 'system authorization denied'),
+                 ('Interactive authentication required', 'interactive authentication'),
+                 ('Unknown option --check-inhibitors', 'does not support'),
+                 ('Could not connect to the session manager', 'service unavailable'),
+                 ('org.freedesktop.DBus.Error.ServiceUnknown', 'service unavailable'),
+                 ('Something unexpected', 'unrecognized diagnostic'), ('', 'exited unsuccessfully')]
+        for diagnostic, expected in cases:
+            with self.subTest(diagnostic=diagnostic):
+                self.run.reset_mock()
+                self.output.seek(0)
+                self.output.truncate()
+                self.run.return_value = SimpleNamespace(returncode=1,
+                    stderr=diagnostic + ('\n\x1b[31mSECRET-user/private/path\x07' if diagnostic else ''))
+                self.interact(['1', 'y'])
+                output = self.output.getvalue()
+                self.assertIn(expected, output)
+                self.assertNotIn('SECRET', output)
+                self.assertNotIn('\x1b', output)
+                self.assertNotIn('\x07', output)
+                self.assertLess(len(output), 1000)
+                self.run.assert_called_once()
+
+    def test_gnome_zero_exit_with_error_is_unconfirmed_without_second_backend(self):
+        self.run.return_value = SimpleNamespace(returncode=0, stderr='Could not connect to the session manager')
+        with patch.dict(os.environ, self.GNOME):
+            self.which.return_value = '/mock/gnome-session-quit'
+            self.interact(['1', 'y'])
+        self.run.assert_called_once()
+        self.which.assert_called_once_with('gnome-session-quit')
+        self.assertIn('unconfirmed (exit status 0)', self.output.getvalue())
+        self.assertNotIn('Reboot requested', self.output.getvalue())
+
+    def test_each_backend_error_has_no_retry_or_backend_switch(self):
+        for desktop in ('GNOME', 'KDE'):
+            for failure in (FileNotFoundError('SECRET'), PermissionError('SECRET'),
+                            subprocess.TimeoutExpired('SECRET', 30, stderr='SECRET'), KeyboardInterrupt(),
+                            UnicodeDecodeError('utf8', b'\xff', 0, 1, 'SECRET')):
+                with self.subTest(desktop=desktop, failure=type(failure).__name__), \
+                        patch.dict(os.environ, dict(self.GNOME, XDG_CURRENT_DESKTOP=desktop)):
+                    self.run.reset_mock()
+                    self.which.reset_mock()
+                    self.run.side_effect = failure
+                    self.interact(['1', 'y'])
+                    self.run.assert_called_once()
+                    self.which.assert_called_once()
+                    self.assertNotIn('SECRET', self.output.getvalue())
+        self.assertIn('request timed out', self.output.getvalue())
+        self.assertIn('request interrupted', self.output.getvalue())
+        self.assertIn('no longer available', self.output.getvalue())
+        self.assertIn('permission to execute', self.output.getvalue())
 
     def test_reboot_errors_are_manual_without_retry(self):
         for error in (FileNotFoundError(), subprocess.TimeoutExpired('mock', 30),

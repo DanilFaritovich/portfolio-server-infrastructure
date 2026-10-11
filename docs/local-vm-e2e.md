@@ -55,14 +55,36 @@ for a new fixture, with separate default-deny TTY confirmations:
 
    Reboot now prints `After rebooting, run: make e2e-prepare`, warns about unsaved
    data and requires a separate default-deny `[y/N]` confirmation. After releasing
-   the fixture lock, a local non-root session requests a normal system restart with
-   `systemctl --check-inhibitors=yes --no-ask-password reboot`. System authorization
-   and inhibitor locks are respected even with captured subprocess output; no sudo,
-   password prompt, force or inhibitor bypass is used. No GNOME/session bus is required.
-   SSH sessions, missing systemctl, unsupported options, authorization/inhibitor denial
-   and failed requests receive manual instructions without automatic retry. A timeout
-   or interruption cannot prove cancellation: inspect system state before a manual retry.
-   Use the desktop's normal Restart action or ask the administrator to restart safely.
+   the fixture lock, the CLI selects **one** backend from local session capabilities,
+   without consulting OS versions:
+
+   - Local GNOME X11/Wayland: `gnome-session-quit --reboot`, keeping the desktop's
+     normal confirmation and inhibitor handling. GNOME is an exact colon-separated
+     token in `XDG_CURRENT_DESKTOP`; only when that is unset, a GNOME-specific
+     `XDG_SESSION_DESKTOP` value can identify it. The corresponding display variable
+     (`DISPLAY` or `WAYLAND_DISPLAY`) and a Unix session D-Bus address are required.
+     Incomplete GNOME sessions or a missing tool receive manual instructions;
+     they never fall through to systemctl.
+   - Other local Linux/systemd sessions: `systemctl --check-inhibitors=yes
+     --no-ask-password reboot`. The systemd runtime directory and systemctl must
+     exist, and the session type must be a supported graphical/console type or unset
+     for a plain local terminal. System authorization and inhibitors are respected
+     even with captured subprocess output.
+
+   Root, non-Linux, SSH and remote/ambiguous `XDG_SESSION_REMOTE` sessions are
+   refused. There is no sudo, force, inhibitor bypass or automatic second backend
+   after failure. GNOME may show another desktop confirmation; a successful tool
+   exit only means a request, not completed reboot.
+
+   Failures show a short static reason: missing tool/session capability,
+   inhibitor, authorization, unsupported option, unavailable session/system service,
+   execution error, timeout or interruption. Child diagnostics are classified in
+   English without printing raw stderr, identities, paths or terminal controls.
+   Unrecognized diagnostics report the exit status and a generic safe reason.
+   GNOME can return zero after a failed D-Bus call; stderr still makes the outcome
+   unconfirmed. A timeout, interruption or other unconfirmed result cannot prove
+   cancellation: inspect system state before any manual retry. Use the desktop's
+   normal Restart action or ask the administrator to restart safely.
    Reboot later, an empty choice, declined confirmation or interrupted input preserves
    configured groups and exits successfully with the rerun instruction. Without a TTY,
    only manual instructions are printed. There is no unattended restart.

@@ -1576,10 +1576,15 @@ installation; other managers require manual setup when tools are missing. Prepar
 offers additive libvirt/kvm groups and a dedicated disk directory with separate `[y/N]` confirmations. Group
 changes finish successfully with a Reboot now/later menu only while configured groups
 remain inactive. Reboot now prints the rerun instruction, warns about unsaved data
-and requires a separate `[y/N]`. A local non-root session uses
-`systemctl --check-inhibitors=yes --no-ask-password reboot`, respecting system
-inhibitors/authorization without sudo or force; unavailable/remote/failed requests
-show manual restart instructions without retry. Reboot later exits successfully.
+and requires a separate `[y/N]`. A complete local non-root GNOME X11/Wayland
+session uses `gnome-session-quit --reboot` with native desktop confirmation;
+other supported Linux/systemd sessions use
+`systemctl --check-inhibitors=yes --no-ask-password reboot`. Selection depends on
+session capabilities, not OS versions. Both preserve normal inhibitor/authorization
+handling without sudo or force. Incomplete/remote/unsupported sessions and errors
+show a short safe reason and manual instructions, with no second-backend retry.
+Unconfirmed requests require state inspection before any manual retry.
+Reboot later exits successfully.
 After rebooting, rerun `make e2e-prepare` to recheck access and continue;
 no VM is created before permissions become active. Ready VMs are preserved and distro changes are blocked.
 SHA-256 verification and optional `E2E_IMAGE_SHA256` pinning remain mandatory checks.
