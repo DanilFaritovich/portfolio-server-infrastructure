@@ -278,9 +278,12 @@ No application networks or deployment configuration are created.
 `docker version`, `docker info`, `docker compose version`, `docker buildx version`,
 checks active/enabled status for both services and requires the active logging
 driver to be `local`. These probes report `changed=0`. The smoke test creates a
-`hello-world:latest` container with `--network none`, starts/attaches with a
-120-second timeout, then removes its exact ID in an `always` cleanup block,
-including on a failed start. Runtime operations accurately report changes.
+`hello-world:latest` container with `--network none`. Creation and attached execution
+each have a 120-second timeout plus a 10-second forced-termination grace. Start and
+`always` cleanup require a successful create returning a full valid container ID;
+a failed start still cleans that confirmed ID. A create timeout may leave daemon-side
+work running or a container created: STOP and inspect, without guessed cleanup or
+blind retries. Runtime operations accurately report changes.
 The smoke test can download an image from Docker Hub and leave it in the Docker
 image cache; verification is **not strictly read-only**. No test container is
 left running after the cleanup. No cache pruning removes unrelated operator data.

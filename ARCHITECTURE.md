@@ -75,6 +75,10 @@ later checks.
 Docker provisioning also runs independent Docker verification before reporting
 completion. Its disposable smoke test can populate the image cache and reports
 runtime changes even when the provisioning role itself is unchanged.
+Both smoke creation and attached execution bound the Docker client to 120 seconds
+plus a 10-second forced-termination grace. Start/cleanup require a successful create
+and a full 64-character hexadecimal ID. Timeout does not prove daemon-side
+cancellation; missing/unconfirmed IDs require diagnosis without guessed cleanup.
 
 Human registration validates and snapshots explicitly supplied public material
 before host contact. New accounts use the Ansible human role; existing managed

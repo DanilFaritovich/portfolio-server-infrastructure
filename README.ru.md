@@ -275,8 +275,12 @@ Application networks и deployment configuration не создаются.
 выполняет `docker version`, `docker info`, `docker compose version`,
 `docker buildx version`, проверяет active/enabled для обоих services и активный
 logging driver `local`. Эти probes дают `changed=0`. Smoke test создаёт контейнер
-`hello-world:latest` с `--network none`, запускает/ожидает его с timeout 120 секунд,
-затем удаляет точный container ID в `always` cleanup, включая ошибку запуска.
+`hello-world:latest` с `--network none`. Create и attached execution имеют отдельные
+timeout 120 секунд и ещё 10 секунд до принудительного завершения клиента. Start и
+`always` cleanup требуют успешного create с полным валидным container ID; ошибка
+start сохраняет cleanup подтверждённого ID. При create timeout daemon-side работа
+может продолжаться или container уже создан: STOP и диагностика без guessed cleanup
+и слепых повторов.
 Runtime operations корректно сообщают changes. Smoke test может скачать image
 из Docker Hub и оставить его в Docker image cache; verification **не является
 строго read-only**. После cleanup запущенный test container не остаётся.
