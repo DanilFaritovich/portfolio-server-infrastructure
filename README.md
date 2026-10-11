@@ -127,10 +127,15 @@ Ansible still require manual serialization.
 One controller lock covers the whole run, confirmations and postflight. Terminal
 progress and the final report show verified stages. A new local `portfolio-init-*.jsonl`
 file in the temporary directory (normally `/tmp`, mode 0600) stores only schema,
-stage, status and elapsed seconds. Its path is printed; retain/delete it manually.
+stage, status and elapsed seconds for that stage (`run` events use total run time).
+Application emits `applying → verifying → completed/failed`; skipped stages emit
+`verifying → verified_skip`. Its path is printed; retain/delete it manually.
 Inventory, identities, keys, passwords, exception text and subprocess output are
 never captured. Log-write errors stop later dispatch and may leave the last record
-incomplete. Stage diagnostics remain in the terminal. Offline checks do not prove
+incomplete. Terminal errors include the active command and an allowlisted static
+cause or safe process/I/O category, without arbitrary exception text or raw stderr.
+Ctrl+D at stage selection or plan confirmation cancels before host contact without
+traceback. Stage diagnostics remain in the terminal. Offline checks do not prove
 live access, repeat-run idempotency or provider recovery.
 
 ## Access and security

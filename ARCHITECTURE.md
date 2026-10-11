@@ -73,8 +73,14 @@ confirmation. Stage-specific registration/recovery/operations confirmations rema
 Errors, pending state, interruptions and log-write failures stop later dispatch.
 Continuation requires recovery diagnosis and explicit frontier selection, never
 log-based checkpoints, retry or rollback. Exclusive temporary JSONL files (0600)
-store only schema, fixed stage/status and monotonic elapsed seconds, without
-output, exception text, inventory or identities. These are diagnostic records,
+store only schema, fixed stage/status and monotonic elapsed seconds for the named
+stage (`run` events use whole-run time). Applying stages emit `applying` then
+`verifying` before `completed` or `failed`; verified skips retain `verified_skip`.
+Logs exclude output, exception text, inventory and identities. Terminal failures
+retain exact allowlisted static causes or safe process/I/O categories and the active
+command, never arbitrary exception text or raw stderr. EOF at frontier selection
+or plan confirmation cancels before host contact without traceback.
+These are diagnostic records,
 not authority over server state. The terminal shows progress and verified stages
 while retaining existing stage diagnostics and prompts.
 

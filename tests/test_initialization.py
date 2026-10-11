@@ -1,10 +1,12 @@
 """Offline orchestration tests; synthetic inputs and mocked stage execution only."""
 
 import contextlib
+import errno
 import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -56,6 +58,94 @@ class InitializationTests(unittest.TestCase):
                                        'secure-ssh', 'verify-ssh-security', 'setup-operations', 'verify-operations'])
         self.assertEqual(self.events()[-1]['status'], 'completed')
         self.assertIn('Applications remain separate', self.output.getvalue())
+
+    def test_phase_events_and_stage_durations_are_independent_of_run_duration(self):
+        seconds = [0]
+        def execute(mode, *_):
+            seconds[0] += 2 if mode.startswith('verify-') else (0 if mode == 'inspect-hardening' else 3)
+        self.stage.side_effect = execute
+        with patch.object(init.time, 'monotonic', side_effect=lambda: seconds[0]):
+            self.run_init()
+        events = self.events()
+        for stage, *_ in init.INIT_STAGES:
+            rows = [row for row in events if row['stage'] == stage]
+            self.assertEqual([row['status'] for row in rows], ['applying', 'verifying', 'completed'])
+            self.assertEqual([row['elapsed_seconds'] for row in rows], [0, 3, 5])
+        self.assertEqual(events[-1]['elapsed_seconds'], 30)
+
+    def test_verification_failure_records_phase_and_elapsed_time_without_error_text(self):
+        seconds = [0]
+        def execute(mode, *_):
+            seconds[0] += 2 if mode.startswith('verify-') else 3
+            if mode == 'verify-docker':
+                raise ValueError('secret remote reason')
+        self.stage.side_effect = execute
+        with patch.object(init.time, 'monotonic', side_effect=lambda: seconds[0]):
+            with self.assertRaisesRegex(ValueError, r'docker \(verify-docker\)'):
+                self.run_init()
+        rows = [row for row in self.events() if row['stage'] == 'docker']
+        self.assertEqual([row['status'] for row in rows], ['applying', 'verifying', 'failed'])
+        self.assertEqual([row['elapsed_seconds'] for row in rows], [0, 3, 5])
+        self.assertNotIn('secret', json.dumps(rows))
+
+    def test_application_failure_does_not_claim_verification(self):
+        self.stage.side_effect = ValueError('Registration declined; no VPS changes requested.')
+        with self.assertRaisesRegex(ValueError, 'Registration declined'):
+            self.run_init()
+        self.assertEqual([row['status'] for row in self.events()], ['started', 'applying', 'failed'])
+
+    def test_verification_only_logs_fresh_stage_elapsed_time(self):
+        seconds = [0]
+        self.stage.side_effect = lambda *_: seconds.__setitem__(0, seconds[0] + 2)
+        with patch.dict(os.environ, INIT_FROM='verify'), \
+                patch.object(init.time, 'monotonic', side_effect=lambda: seconds[0]):
+            self.run_init()
+        events = self.events()
+        for stage, *_ in init.INIT_STAGES:
+            rows = [row for row in events if row['stage'] == stage]
+            self.assertEqual([row['status'] for row in rows], ['verifying', 'verified_skip'])
+            self.assertEqual([row['elapsed_seconds'] for row in rows], [0, 2])
+        self.assertEqual(events[-1]['elapsed_seconds'], 12)
+
+    def test_safe_cause_reaches_cli_terminal_but_never_log(self):
+        reason = 'Managed key-only SSH access failed.'
+        self.stage.side_effect = ValueError(reason)
+        with patch.object(cli, 'pipeline_lock', contextlib.nullcontext), \
+                patch.object(sys, 'argv', ['access.py', 'init-server', '--inventory', '/fixture']):
+            self.assertEqual(cli.main(), 1)
+        self.assertIn(reason, self.output.getvalue())
+        self.assertIn('bootstrap-user', self.output.getvalue())
+        self.assertNotIn(reason, json.dumps(self.events()))
+
+    def test_untrusted_exception_details_are_not_echoed_in_diagnostics(self):
+        errors = [ValueError('Managed key-only SSH access failed. secret\x1b[31m'),
+                  subprocess.CalledProcessError(7, ['secret-command'], output='secret stdout', stderr='secret stderr'),
+                  subprocess.TimeoutExpired(['secret-command'], 3, output='secret stdout', stderr='secret stderr'),
+                  OSError(errno.ENOSPC, 'secret message', '/secret/path')]
+        expected = ['Stage validation or execution failed', 'exit status 7', 'timed out', 'ENOSPC']
+        for error, cause in zip(errors, expected):
+            with self.subTest(error=type(error)):
+                self.stage.side_effect = error
+                with self.assertRaises(ValueError) as caught:
+                    self.run_init()
+                self.assertIn(cause, str(caught.exception))
+                self.assertNotIn('secret', str(caught.exception))
+        self.assertNotIn('secret', self.output.getvalue())
+        for path in Path(self.temp.name).glob('*.jsonl'):
+            self.assertNotIn('secret', path.read_text())
+
+    def test_eof_at_selection_or_plan_is_clean_cli_cancellation_without_dispatch(self):
+        for selection, answers in (('', [EOFError]), ('bootstrap', [EOFError]),
+                                   ('', ['bootstrap', EOFError])):
+            with self.subTest(selection=selection), patch.dict(os.environ, INIT_FROM=selection), \
+                    patch.object(cli, 'pipeline_lock', contextlib.nullcontext), \
+                    patch.object(sys, 'argv', ['access.py', 'init-server', '--inventory', '/fixture']):
+                self.answer.side_effect = answers
+                self.assertEqual(cli.main(), 1)
+        self.assertIn('Initialization cancelled (end of input); no host contact requested.', self.output.getvalue())
+        self.assertNotIn('Traceback', self.output.getvalue())
+        self.stage.assert_not_called()
+        self.assertEqual(list(Path(self.temp.name).glob('*.jsonl')), [])
 
     def test_every_continuation_verifies_dependencies_and_preserves_remaining_order(self):
         for boundary, frontier in enumerate([row[0] for row in init.INIT_STAGES] + ['verify']):
