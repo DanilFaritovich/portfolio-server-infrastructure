@@ -24,6 +24,11 @@ class SetupTests(unittest.TestCase):
         (self.root / 'inventories').mkdir()
         for name in ('setup.sh', 'install-uv.sh', 'install-actionlint.sh', 'access.py'):
             shutil.copy(ROOT / 'scripts' / name, self.root / 'scripts' / name)
+        shutil.copytree(
+            ROOT / 'scripts' / 'portfolio_cli',
+            self.root / 'scripts' / 'portfolio_cli',
+            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'),
+        )
         shutil.copy(ROOT / 'inventories/production.example.yml', self.root / 'inventories/production.example.yml')
         for name in ('requirements-dev.txt', 'collections.yml'):
             shutil.copy(ROOT / name, self.root / name)
