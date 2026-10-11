@@ -59,7 +59,26 @@ local setup -> password bootstrap -> managed access verification
 -> separately confirmed server operations -> operations verification -> STOP
 ```
 
-Each command dispatches only its existing stage sequence. Initial password
+`init-server` is the whole-pipeline exception: `initialization.py` calls existing
+stage functions directly under the CLI's single lock, without nested CLI/Make
+invocations. An operator-selected `INIT_FROM` frontier authorizes remaining
+applications; earlier stages must pass their independent verifiers before being
+skipped. `verify` selects verification only. A failed verifier never establishes
+absence or authorizes mutation. Remaining stages use existing preflight/postflight
+and an explicit verifier at every dependency boundary; Stage 3 also runs its streamed
+inspector before application. No provisioning roles or recovery logic are duplicated.
+
+Initialization requires a TTY, prepared human admin key and default-deny plan
+confirmation. Stage-specific registration/recovery/operations confirmations remain.
+Errors, pending state, interruptions and log-write failures stop later dispatch.
+Continuation requires recovery diagnosis and explicit frontier selection, never
+log-based checkpoints, retry or rollback. Exclusive temporary JSONL files (0600)
+store only schema, fixed stage/status and monotonic elapsed seconds, without
+output, exception text, inventory or identities. These are diagnostic records,
+not authority over server state. The terminal shows progress and verified stages
+while retaining existing stage diagnostics and prompts.
+
+Other commands dispatch only their existing stage sequence. Initial password
 bootstrap uses `bootstrap_login_user`; managed paths select `ansible_user` and
 `ansible_private_key_file`. Explicit inventory access requires all three fields
 together and rejects conflicting key overrides. Legacy inventories retain their

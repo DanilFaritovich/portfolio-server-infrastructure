@@ -90,6 +90,48 @@ recovery console и рабочую административную сессию
 Заранее подтвердите VPS prerequisites и включение sudoers.d. Не выбирайте чужую
 существующую учётную запись как управляемого пользователя `ansible_user`.
 
+## Единая инициализация
+
+После `make setup` настройте локальный inventory, provider recovery и host trust,
+подготовьте отдельный human-admin ключ существующими локальными командами.
+Зашифрованные ключи загрузите в agent вызывающей оболочки. Запуск из терминала:
+
+```sh
+make init-server INIT_FROM=bootstrap HUMAN_USER=operator HUMAN_SUDO=admin \
+  HUMAN_KEY="$HOME/.ssh/portfolio-infra/operator_ed25519" \
+  HUMAN_PUBLIC_KEY="$HOME/.ssh/portfolio-infra/operator_ed25519.pub"
+```
+
+Это **LIVE / MUTATING**: bootstrap → Docker → SSH/UFW hardening → human access
+→ final SSH security → отдельно подтверждаемые server operations с обязательной
+проверкой между этапами. Подтверждения регистрации ключа, recovery, password/trust
+и operations сохраняются. Деплой приложений, reboot и автоматическое recovery исключены.
+
+`INIT_FROM` задаёт первый этап, разрешённый для применения: `bootstrap`, `docker`,
+`hardening`, `human`, `ssh`, `operations`. Без переменной выбор интерактивный,
+без значения по умолчанию. Предыдущие этапы пропускаются только после успешной
+фактической проверки сервера. Оставшиеся выполняются существующими идемпотентными
+wrappers с явной верификацией; выполненные этапы после выбранной границы автоматически
+не определяются. `INIT_FROM=verify` проверяет весь pipeline без provisioning;
+disposable Docker smoke test может изменить image cache.
+
+Ошибка проверки не отличает отсутствие этапа от потери доступа, pending activation
+или небезопасного drift: **STOP**, без перехода к mutation. После частичного запуска
+сначала диагностируйте состояние существующими read-only inspectors и сохранённым
+human/provider recovery-доступом. После прерывания remote work может продолжаться.
+Только устранив неопределённость, явно выберите первый незавершённый этап: предыдущие
+будут проверены заново. Лог и локальный checkpoint не разрешают продолжение.
+Другие контроллеры/raw Ansible по-прежнему требуют ручной сериализации.
+
+Один controller lock действует на весь запуск, подтверждения и postflight.
+Терминал показывает прогресс и итог проверенных этапов. Новый локальный файл
+`portfolio-init-*.jsonl` в temporary directory (обычно `/tmp`, права 0600) содержит
+только schema, этап, статус и elapsed seconds. Путь выводится; сохранение/удаление
+остаётся ручным. Inventory, идентификаторы доступа, ключи, пароли, тексты исключений
+и subprocess output не сохраняются. Ошибка записи останавливает дальнейшие действия;
+последняя запись может остаться неполной. Диагностика этапов остаётся в терминале.
+Offline checks не доказывают live-доступ, идемпотентность повторного запуска и provider recovery.
+
 ## Доступ и безопасность
 
 Стандартный путь: **bootstrap_login_user + интерактивный SSH password →
