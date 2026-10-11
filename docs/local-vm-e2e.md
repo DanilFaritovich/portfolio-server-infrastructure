@@ -191,7 +191,10 @@ preparation. The checksum list is authenticated by HTTPS, not an independently
 verified GPG signature.
 
 Prepare requests default-deny creation consent and a new disposable root
-password twice with hidden input. The password never enters argv, environment,
+password twice with hidden input: at least 12 printable ASCII characters.
+Short/non-ASCII input or a mismatch receives a specific safe message and repeats
+local entry within prepare, before fixture/VM creation. Ctrl+C cancels; EOF or
+interruption stops preparation. The password never enters argv, environment,
 inventory, reports or Git. Only its SHA512-crypt hash enters private cloud-init
 artifacts and the seed. Use a unique disposable password and keep it in your
 password manager: the wrapper cannot display/recover it later. cloud-init only

@@ -76,6 +76,22 @@ def confirm(message):
     require(answer.strip().lower() in ('y', 'yes'), 'E2E operation declined.')
 
 
+def disposable_password():
+    """Retry local input only, before fixture state or VM creation."""
+    while True:
+        password = getpass.getpass('New disposable root password (at least 12 printable ASCII characters): ')
+        if len(password) < 12:
+            print('Password must contain at least 12 characters. Try again; Ctrl+C cancels preparation.')
+            continue
+        if not all(32 <= ord(c) < 127 for c in password):
+            print('Password must use printable ASCII characters. Try again; Ctrl+C cancels preparation.')
+            continue
+        if password != getpass.getpass('Repeat disposable password: '):
+            print('Passwords do not match. Try again; Ctrl+C cancels preparation.')
+            continue
+        return password
+
+
 def safe_path(path, *, directory=False, private=True):
     require(path.is_absolute() and path.resolve() == path and
             not any(p.is_symlink() for p in (path, *path.parents)), 'Unsafe E2E path.')
@@ -375,9 +391,7 @@ class Stand:
                           mac='52:54:00:' + ':'.join(f'{b:02x}' for b in os.urandom(3)))
         self.no_overlap()
         confirm(f'Create the local E2E VM/NAT and download {profile["name"]} official cloud image?')
-        password = getpass.getpass('New disposable root password (SSH bootstrap and serial console): ')
-        require(len(password) >= 12 and password == getpass.getpass('Repeat disposable password: '), 'Passwords differ or are too short.')
-        require(all(32 <= ord(c) < 127 for c in password), 'Use printable ASCII for the disposable console password.')
+        password = disposable_password()
         hashed = command(['openssl', 'passwd', '-6', '-stdin'], input=password + '\n').strip()
         require(re.fullmatch(r'\$6\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{86}', hashed), 'Invalid password hash; preparation stopped.')
         del password

@@ -354,6 +354,31 @@ class HostTests(unittest.TestCase):
 
 
 class PackageTests(unittest.TestCase):
+    def test_password_reprompts_locally_with_precise_safe_messages(self):
+        valid = 'synthetic-disposable-password'
+        with patch.object(e2e.getpass, 'getpass', side_effect=[
+                'short', 'non-ascii-password-\u2603', valid, 'different-password', valid, valid]) as prompt, \
+                patch.object(e2e, 'command') as command, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(e2e.disposable_password(), valid)
+        self.assertEqual(prompt.call_count, 6)
+        self.assertIn('at least 12', prompt.call_args_list[0].args[0])
+        self.assertIn('at least 12', output.getvalue())
+        self.assertIn('printable ASCII', output.getvalue())
+        self.assertIn('do not match', output.getvalue())
+        self.assertNotIn(valid, output.getvalue())
+        self.assertNotIn('different-password', output.getvalue())
+        command.assert_not_called()
+
+    def test_password_interruption_and_eof_stop_without_commands(self):
+        for error in (EOFError(), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(e2e.getpass, 'getpass', side_effect=error), \
+                    patch.object(e2e, 'command') as command:
+                with self.assertRaises(type(error)):
+                    e2e.disposable_password()
+                command.assert_not_called()
+
     def test_missing_packages_query_and_broken_tools(self):
         with patch.object(host.shutil, 'which', return_value='/mock'), \
                 patch.object(host.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='install ok installed')) as run:
