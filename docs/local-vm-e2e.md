@@ -99,8 +99,14 @@ for a new fixture, with separate default-deny TTY confirmations:
 3. The missing `/var/lib/libvirt/images/portfolio-e2e-<UID>` directory is offered
    separately. Exclusive `mkdir` refuses a concurrently appearing path; only this
    new directory receives controller ownership, stock `libvirt-qemu` group and
-   mode 2750. Parent paths must already be protected root-owned directories.
-   Existing directory ownership, group and mode are validated, never repaired.
+   mode 2750. The final chmod also uses sudo: an owner outside the QEMU group
+   cannot retain setgid with an unprivileged chmod. Parent paths must already
+   be protected root-owned directories. Existing ownership/group are never repaired.
+   For the empty dedicated directory left by the earlier chmod bug, prepare may
+   separately offer finishing mode 0750 to 2750 within the same command. It requires
+   the correct controller/QEMU ownership, no symlinks or access ACL, and an unchanged
+   directory snapshot and empty contents after confirmation. No existing fixture,
+   VM data, other mode or ownership/group drift receives this exception.
 
 The setgid directory gives generated disk/seed files the QEMU group, with 0640
 file permissions. Custom QEMU identities, unsafe paths, missing parent directories,

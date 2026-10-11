@@ -307,9 +307,31 @@ def prepare(storage, *, command, confirm, safe_path):
         require(not storage.is_symlink() and storage.is_dir() and storage.stat().st_uid == 0,
                 'Disk directory changed during creation; STOP.')
         privileged(['chown', '--no-dereference', f'{os.getuid()}:{gid}', '--', str(storage)], command)
-        # chown may clear setgid; owner performs the final mode change after validation.
+        # chown may clear setgid. A non-root owner outside the QEMU group
+        # cannot restore it: Linux silently strips S_ISGID on chmod.
         safe_path(storage, directory=True, private=False)
-        storage.chmod(0o2750)
+        require(storage.stat().st_gid == gid, 'Disk directory group changed during creation; STOP.')
+        privileged(['chmod', '2750', '--', str(storage)], command)
+    else:
+        safe_path(storage, directory=True, private=False)
+        info = storage.stat()
+        # Recover only the empty directory left by the old non-root chmod.
+        # Never migrate ownership/groups, touch VM data or normalize other drift.
+        if (info.st_gid == gid and stat.S_IMODE(info.st_mode) == 0o750
+                and not list(storage.iterdir()) and 'system.posix_acl_access' not in os.listxattr(storage)):
+            snapshot = (info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+                        info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
+            print('Privileged plan: finish the empty dedicated E2E directory by setting mode 2750; '
+                  'no ownership/group or VM changes.')
+            confirm('Finish this empty E2E disk directory using sudo chmod 2750?')
+            storage_parents(storage)
+            safe_path(storage, directory=True, private=False)
+            current = storage.stat()
+            require(snapshot == (current.st_dev, current.st_ino, current.st_uid, current.st_gid,
+                                 current.st_mode, current.st_mtime_ns, current.st_ctime_ns)
+                    and not list(storage.iterdir()) and 'system.posix_acl_access' not in os.listxattr(storage),
+                    'Disk directory changed during confirmation; STOP.')
+            privileged(['chmod', '2750', '--', str(storage)], command)
     safe_path(storage, directory=True, private=False)
     info = storage.stat()
     require(info.st_gid == gid and stat.S_IMODE(info.st_mode) == 0o2750

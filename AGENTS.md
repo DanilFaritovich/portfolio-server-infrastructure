@@ -1,5 +1,7 @@
 # Repository Instructions
 
+- E2E storage exception: `make e2e-prepare` may separately confirm finishing only an empty dedicated controller-owned/QEMU-group directory from mode 0750 to 2750, without access ACLs or symlinks, after unchanged-snapshot revalidation. New directory final chmod uses sudo because non-group owners silently lose setgid. Never repair other modes, ownership/groups or directories containing data; existing fixtures remain untouched.
+
 This repository is for Ansible-based provisioning of a personal portfolio VPS on Ubuntu. The implemented pipeline is local setup -> bootstrap managed automation access -> verify access -> provision Docker host -> verify Docker -> firewall/SSH host hardening -> verify hardening -> human access -> verify users -> final SSH policy -> verify SSH security -> separately confirmed server operations -> verify operations -> STOP. Application deployment remains separate.
 
 - `scripts/access.py` is the compatible CLI entry point; controller implementation lives in `scripts/portfolio_cli/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for responsibilities, dependency direction, execution flows and security boundaries. File-based legacy imports use isolated helper globals through `portfolio_cli.compat`; native CLI execution uses the package directly. Keep both paths covered by offline tests. Server-side `library/` and `scripts/user_management.py` remain separate payloads.

@@ -1592,3 +1592,7 @@ If root-owned `qemu.conf` is unreadable, prepare separately offers read-only sud
 inspection of file safety and QEMU identity within the same command, without
 printing configuration or changing file permissions. Failed/declined inspection
 or custom settings stop before disk/VM creation.
+Prepare also offers separately confirmed completion of an empty dedicated disk
+directory left at 0750 by an earlier setgid bug, verifying ownership/group and
+unchanged state before sudo chmod 2750. No extra shell command is needed;
+other directory drift or existing data remains blocking.

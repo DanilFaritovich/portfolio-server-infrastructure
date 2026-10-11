@@ -289,6 +289,10 @@ class HostTests(unittest.TestCase):
                 root_owned = True
             elif argv[2] == 'chown':
                 root_owned = False
+                # Model chown clearing setgid and an owner outside QEMU's group.
+                self.storage.chmod(0o750)
+            elif argv[2] == 'chmod':
+                self.storage.chmod(int(argv[3], 8))
             return ''
         self.run.side_effect = execute
         with patch.object(Path, 'stat', side_effect=probe, autospec=True):
@@ -297,6 +301,7 @@ class HostTests(unittest.TestCase):
         sudo = [call.args[0] for call in self.run.call_args_list if call.args[0][0] == 'sudo']
         self.assertEqual(sudo[0], ['sudo', '--', 'mkdir', '-m', '2750', '--', str(self.storage)])
         self.assertEqual(sudo[1][2:4], ['chown', '--no-dereference'])
+        self.assertEqual(sudo[2], ['sudo', '--', 'chmod', '2750', '--', str(self.storage)])
         self.assertEqual(self.storage.stat().st_mode & 0o7777, 0o2750)
 
     def test_privileged_mkdir_refuses_a_concurrently_appearing_directory(self):
@@ -311,6 +316,40 @@ class HostTests(unittest.TestCase):
             self.prepare()
         self.assertEqual(self.storage.stat().st_mode & 0o7777, 0o700)
         self.assertFalse(any('chown' in call.args[0] for call in self.run.call_args_list))
+
+    def test_empty_missing_setgid_directory_can_finish_only_after_confirmation(self):
+        self.storage.chmod(0o750)
+        def execute(argv, **kwargs):
+            if argv[0] == 'sudo':
+                self.assertEqual(argv, ['sudo', '--', 'chmod', '2750', '--', str(self.storage)])
+                self.storage.chmod(0o2750)
+            return self.run.return_value
+        self.run.side_effect = execute
+        self.assertEqual(self.prepare(), host.PreparationResult.READY)
+        self.confirm.assert_called_once()
+        self.assertEqual(stat.S_IMODE(self.storage.stat().st_mode), 0o2750)
+
+    def test_missing_setgid_recovery_decline_drift_data_and_acl_block(self):
+        for case in ('decline', 'drift', 'data', 'acl'):
+            with self.subTest(case=case):
+                self.storage.chmod(0o750)
+                self.run.reset_mock()
+                self.confirm.reset_mock()
+                self.confirm.side_effect = None
+                if case == 'decline':
+                    self.confirm.side_effect = images.E2EError('declined')
+                elif case == 'drift':
+                    self.confirm.side_effect = lambda message: self.storage.chmod(0o700)
+                elif case == 'data':
+                    (self.storage / 'disk').write_text('synthetic')
+                with patch.object(host.os, 'listxattr', return_value=['system.posix_acl_access'] if case == 'acl' else []):
+                    with self.assertRaises(ValueError):
+                        self.prepare()
+                self.assertFalse(any(call.args[0][0] == 'sudo' for call in self.run.call_args_list))
+                if case == 'data':
+                    (self.storage / 'disk').unlink()
+                if case in ('data', 'acl'):
+                    self.confirm.assert_not_called()
 
 
 
