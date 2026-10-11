@@ -33,11 +33,30 @@ NS = 'urn:portfolio:local-e2e:1'
 MODES = ('prepare', 'status', 'test', 'reset', 'delete', 'list-distros')
 
 
+def command_label(argv):
+    """Only fixed operation names may enter diagnostics; argv may hold secrets."""
+    labels = {'openssl': 'password hashing', 'cloud-localds': 'cloud-init seed creation',
+              'virt-install': 'domain XML generation', 'sudo': 'confirmed host preparation',
+              'ssh': 'SSH verification', 'make': 'scenario wrapper'}
+    if argv and argv[0] in labels:
+        return labels[argv[0]]
+    if argv and argv[0] == 'qemu-img' and len(argv) > 1 and argv[1] in ('info', 'convert', 'resize'):
+        return 'disk ' + argv[1]
+    if argv and argv[0] == 'virsh' and len(argv) > 3 and argv[1:3] == ['--connect', URI]:
+        labels = {'net-define': 'network definition', 'net-start': 'network activation',
+                  'define': 'domain definition', 'start': 'domain startup',
+                  'snapshot-create': 'baseline creation'}
+        return labels.get(argv[3], 'libvirt operation')
+    return 'local command'
+
+
 def command(argv, *, capture=True, input=None, timeout=60, env=None):
     """Never echo arguments/output on failure (cloud-init and prompts are private)."""
     result = subprocess.run(argv, input=input, text=True, capture_output=capture,
                             timeout=timeout, env=env or dict(os.environ, LC_ALL='C'), check=False)
-    require(result.returncode == 0, 'E2E subprocess failed; STOP and inspect locally through console.')
+    require(result.returncode == 0, 'E2E subprocess failed (' + command_label(argv)
+            + f', exit {result.returncode}); STOP and diagnose before retrying. '
+            'Command arguments and output are withheld to protect secrets.')
     return result.stdout if capture else ''
 
 

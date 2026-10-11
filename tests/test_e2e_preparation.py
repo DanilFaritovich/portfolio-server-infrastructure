@@ -354,6 +354,22 @@ class HostTests(unittest.TestCase):
 
 
 class PackageTests(unittest.TestCase):
+    def test_failed_commands_name_static_operation_without_exposing_payloads(self):
+        cases = [(['openssl', 'passwd', 'SECRET'], 'password hashing'),
+                 (['virt-install', '--name', 'SECRET'], 'domain XML generation'),
+                 (['virsh', '--connect', e2e.URI, 'net-start', 'SECRET'], 'network activation'),
+                 (['qemu-img', 'convert', 'SECRET'], 'disk convert'),
+                 (['SECRET\x1b[31m', 'SECRET'], 'local command')]
+        for argv, label in cases:
+            with self.subTest(label=label), patch.object(e2e.subprocess, 'run', return_value=SimpleNamespace(
+                    returncode=7, stdout='SECRET', stderr='SECRET\x1b[31m')):
+                with self.assertRaises(images.E2EError) as caught:
+                    e2e.command(argv, input='SECRET')
+                self.assertIn(label, str(caught.exception))
+                self.assertIn('exit 7', str(caught.exception))
+                self.assertNotIn('SECRET', str(caught.exception))
+                self.assertNotIn('\x1b', str(caught.exception))
+
     def test_password_reprompts_locally_with_precise_safe_messages(self):
         valid = 'synthetic-disposable-password'
         with patch.object(e2e.getpass, 'getpass', side_effect=[

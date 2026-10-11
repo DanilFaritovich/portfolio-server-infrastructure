@@ -129,7 +129,10 @@ custom identities or concurrent file changes stop preparation before disk/VM
 creation; no default identity is assumed after a failed read.
 CLI failures report the operation and safe OS error categories (for example,
 `E2E STOP (fixture lock)` with `EROFS` indicates a read-only filesystem or
-controller sandbox). Arbitrary exception text, paths and subprocess output are
+controller sandbox). Failed subprocesses also name a fixed operation (such as
+network activation or domain XML generation) and exit status, without arguments
+or child output. These diagnostics do not prove cancellation or authorize retry.
+Arbitrary exception text, paths and subprocess output are
 excluded. Diagnose controller restrictions before requesting a new run; they
 do not establish a VM or libvirt failure.
 
