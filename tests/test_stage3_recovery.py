@@ -182,6 +182,86 @@ class Stage3RecoveryTests(unittest.TestCase):
             fake.params.pop('activation_check')
             pending.unlink()
 
+    def test_failed_ssh_handler_preserves_receipt_and_blocks_repeat_activation(self):
+        import copy
+        import yaml
+        from test_pipeline_reliability import ActivationReceiptTests, ROOT
+
+        fake, _ = self.prepared()
+        fake.params['report_only'] = True
+        main = self.host.fixture_path('/etc/ssh/sshd_config')
+        # Valid existing ports, but the role must add its explicit public-key setting.
+        main.write_text(main.read_text().replace('PubkeyAuthentication yes\n', ''))
+        original = main.read_bytes()
+        pending = self.host.fixture_path('/etc/ssh/portfolio-listeners.pending')
+        events = self.host.directory / 'handler-events'
+        spy = self.host.directory / 'handler-spy'
+        spy.write_text(f'''#!{ROOT / '.venv/bin/python'}
+import sys
+from pathlib import Path
+with Path({str(events)!r}).open('a') as stream:
+    stream.write(sys.argv[1] + '\\n')
+sys.exit(1 if sys.argv[1] == 'activate' else 0)
+''')
+        spy.chmod(0o700)
+        names = ('Preview the SSH port block before changing sources',
+                 'Record pending SSH listener activation before changing sources',
+                 'Configure SSH ports and public-key authentication with full candidate validation',
+                 'Apply validated SSH configuration before independent connection verification')
+        tasks = copy.deepcopy([task for task in self.host.tasks if task['name'] in names])
+        for task in tasks:
+            task.pop('become', None)
+            options = task.get('ansible.builtin.blockinfile', task.get('ansible.builtin.copy'))
+            if options is None:
+                continue
+            options.pop('owner', None)
+            options.pop('group', None)
+            if 'path' in options:
+                options.update(path=str(main), validate='/bin/true %s')
+            else:
+                options['dest'] = str(pending)
+        handlers = yaml.safe_load((ROOT / 'roles/host_hardening/handlers/main.yml').read_text())
+        for handler in handlers:
+            handler.pop('become', None)
+            if 'ansible.builtin.file' in handler:
+                handler['ansible.builtin.file']['path'] = str(pending)
+                continue
+            if 'portfolio_hardening_info' in handler:
+                operation = 'postflight' if handler['portfolio_hardening_info'].get('verify') else 'candidate'
+                handler.pop('portfolio_hardening_info')
+            elif 'ansible.builtin.systemd_service' in handler:
+                operation = 'generate' if handler['ansible.builtin.systemd_service'].get('daemon_reload') else 'activate'
+                handler.pop('ansible.builtin.systemd_service')
+            else:
+                operation = 'syntax' if handler['ansible.builtin.command']['argv'][0] == '/usr/sbin/sshd' else 'activate'
+            handler['ansible.builtin.command'] = {'argv': [str(spy), operation]}
+        preflight = {'name': 'Require production preflight before activation', 'ansible.builtin.assert': {
+            'that': 'preflight_ready', 'fail_msg': 'Pending SSH activation; stop and inspect.'}}
+        variables = {'preflight_ready': self.host.inspect(fake)['ready'], 'ansible_port': 2222,
+                     'ssh_listen_ports': [2222, 2200], 'firewall_allowed_tcp_ports': [80, 443],
+                     'hardening_before': {'ssh_activation': 'service', 'ssh_adoption': [],
+                                          'socket_reload_required': False}}
+        self.assertTrue(variables['preflight_ready'])
+        first = ActivationReceiptTests.run_fixture(self, self.host.directory,
+                                                   [preflight] + tasks, handlers, variables)
+        self.assertNotEqual(first.returncode, 0)
+        self.assertNotEqual(main.read_bytes(), original)
+        self.assertIn('PubkeyAuthentication yes', main.read_text())
+        self.assertTrue(pending.is_file())
+        receipt = pending.read_bytes()
+        installed = main.read_bytes()
+        self.assertEqual(events.read_text().splitlines(), ['syntax', 'activate'])
+        self.assertNotIn('Verify activated SSH listeners', first.stdout)
+        variables['preflight_ready'] = self.host.inspect(fake)['ready']
+        self.assertFalse(variables['preflight_ready'])
+        second = ActivationReceiptTests.run_fixture(self, self.host.directory,
+                                                    [preflight] + tasks, handlers, variables)
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn('Pending SSH activation', second.stdout)
+        self.assertEqual(events.read_text().splitlines(), ['syntax', 'activate'])
+        self.assertEqual(main.read_bytes(), installed)
+        self.assertEqual(pending.read_bytes(), receipt)
+
     def test_pending_final_policy_cannot_be_activated_via_another_stage(self):
         fake, _ = self.prepared()
         pending = self.host.fixture_path('/etc/ssh/portfolio-security.pending')
