@@ -89,6 +89,24 @@ class OperationsInspectorTests(unittest.TestCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
 
+    def test_pending_activation_blocks_inspection_and_verification_without_writes(self):
+        for path in ('/etc/docker/portfolio-activation.pending',
+                     '/etc/systemd/journald.conf.d/portfolio-activation.pending'):
+            target = self.root / path.lstrip('/')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            for symlink in (False, True):
+                if symlink:
+                    target.symlink_to(target.parent / 'missing')
+                else:
+                    target.write_text('Interrupted before activation')
+                for verify in (False, True):
+                    with self.subTest(path=path, symlink=symlink, verify=verify):
+                        report = info.inspect(verify)
+                        self.assertFalse(report['ready'])
+                        self.assertIn('activation must be complete', report['report'])
+                        self.assertTrue(target.exists() or target.is_symlink())
+                target.unlink()
+
     def test_release_classifier_requires_consistent_supported_ubuntu_metadata(self):
         stable = {'ID': 'ubuntu', 'VERSION_CODENAME': 'noble', 'VERSION_ID': '24.04',
                   'PRETTY_NAME': 'Ubuntu 24.04 LTS', 'VERSION': '24.04 LTS (Noble Numbat)'}

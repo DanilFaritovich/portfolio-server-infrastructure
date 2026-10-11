@@ -330,6 +330,11 @@ def inspect(verify=False):
     def probe(ok, message, missing=False):
         add('PASS' if ok else ('WARN' if missing and not verify else 'FAIL'), message)
 
+    for pending in ('/etc/docker/portfolio-activation.pending',
+                    '/etc/systemd/journald.conf.d/portfolio-activation.pending'):
+        probe(path_state(pending) == 'absent', display_path(pending) +
+              ': activation must be complete; use recovery access to inspect configuration/runtime before retrying')
+
     release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
     lsb = {}
     if Path('/etc/lsb-release').exists():

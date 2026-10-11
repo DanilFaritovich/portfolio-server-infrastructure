@@ -214,7 +214,10 @@ def execute(params):
     if lock_path.exists() or lock_path.is_symlink():
         safe(lock_path)
     with open(lock_path, 'a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise PreflightError('Another user mutation is running; stop and inspect its result before retrying.') from None
         before, content, owned = read_account(name, controller)
         require(params.get('token') == before['token'], 'Account/key state changed after preflight; stop and inspect.')
         def validate_recovery(target_keys):

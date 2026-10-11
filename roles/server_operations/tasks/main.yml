@@ -51,6 +51,29 @@
     state: present
   become: true
 
+- name: Preview bounded journald retention
+  ansible.builtin.template:
+    src: journald.j2
+    dest: /etc/systemd/journald.conf.d/99-portfolio.conf
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  check_mode: true
+  register: server_operations_journal_candidate
+
+# This must precede the file write; a deferred handler cannot protect interruption.
+- name: Record pending journald activation before changing configuration  # noqa: no-handler
+  ansible.builtin.copy:
+    content: "Journald configuration activation is unconfirmed. Inspect through recovery access before retrying.\n"
+    dest: /etc/systemd/journald.conf.d/portfolio-activation.pending
+    owner: root
+    group: root
+    mode: '0600'
+    force: false
+  become: true
+  when: server_operations_journal_candidate.changed
+
 - name: Configure bounded journald retention
   ansible.builtin.template:
     src: journald.j2

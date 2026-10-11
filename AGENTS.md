@@ -14,6 +14,8 @@ This repository is for Ansible-based provisioning of a personal portfolio VPS on
 - `collections.yml` pins collections installed explicitly by setup/deps; keep it outside ansible-lint's automatic requirements discovery. Make prepends the absolute project `.venv/bin` to PATH for matching Ansible subprocesses.
 
 - Use `develop` as the base for task branches and open Pull Requests into `develop`. Do not merge without an explicit request.
+- Server CLI dispatch holds a non-blocking per-controller-user lock through postflight; keep its inode and fail before dispatch on contention. Other controllers/raw Ansible remain manually serialized. SSH loss/interruption does not prove remote cancellation; STOP and diagnose before retrying.
+- Docker, Stage 3 SSH listeners and journald use pending activation markers before managed file changes; handlers clear them only after activation checks. Normal preflight/verification refuses pending state. Preserve existing SSH adoption/security receipts; never clear evidence automatically during retry. `docker-host` runs independent Docker postflight, including the existing disposable smoke test.
 - Keep Ansible changes idempotent and reviewable. Use built-in modules where practical, parameterize host-specific values, and limit privilege escalation to tasks that need it.
 - Do not contact a live host, including Ansible `--check`, without explicit approval for that operation. CI must use offline checks and must not contact production.
 - Do not read, commit, or expose real inventories, private keys, passwords, tokens, or other secrets. Preserve the existing `LICENSE`.

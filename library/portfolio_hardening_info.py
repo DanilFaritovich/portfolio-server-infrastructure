@@ -28,6 +28,10 @@ options:
     description: Validate generated socket listeners before restarting, without requiring live convergence.
     type: bool
     default: false
+  activation_check:
+    description: Internal SSH handler validates runtime while its activation receipt is still pending.
+    type: bool
+    default: false
   current_port:
     description: Current inventory SSH route that must survive the transition.
     type: int
@@ -525,6 +529,19 @@ def inspect(module):
         'Interrupted SSH adoption: disk files may be partially replaced while live listeners remain unchanged. '
         'Use recovery access to inspect main/includes, restore or finish the approved tree, validate sshd -t and '
         'effective ports before clearing /etc/ssh/portfolio-adoption.pending. Do not reload or retry blindly.'))
+    handler_check = module.params.get('activation_check', False) and module.params['verify']
+    if not candidate and not handler_check:
+        checks.probe('SSH listener activation', lambda: require(
+            not Path('/etc/ssh/portfolio-listeners.pending').exists() and
+            not Path('/etc/ssh/portfolio-listeners.pending').is_symlink(),
+            'Interrupted SSH listener activation: use recovery access to inspect disk/runtime and validate '
+            'the approved listener mode before clearing /etc/ssh/portfolio-listeners.pending. Do not retry blindly.'))
+    if not handler_check:
+        checks.probe('final SSH policy activation', lambda: require(
+            not Path('/etc/ssh/portfolio-security.pending').exists() and
+            not Path('/etc/ssh/portfolio-security.pending').is_symlink(),
+            'Pending final SSH policy activation: use the retained administrator/provider console and '
+            'its protected receipt recovery procedure. Do not activate it through another stage.'))
     installed = module.get_bin_path('ufw') is not None
 
     def activation():
@@ -895,6 +912,7 @@ def main():
         'report_only': {'type': 'bool', 'default': False},
         'refresh_rules': {'type': 'bool', 'default': False},
         'socket_candidate': {'type': 'bool', 'default': False},
+        'activation_check': {'type': 'bool', 'default': False},
         'current_port': {'type': 'int'},
     }, supports_check_mode=True)
     try:

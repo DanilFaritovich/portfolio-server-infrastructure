@@ -1,14 +1,43 @@
 """Controller prerequisites and pinned Ansible execution with temporary overlays."""
 
+from pathlib import Path
+import contextlib
+import fcntl
 import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 
 from .common import ROOT, require
+
+
+@contextlib.contextmanager
+def pipeline_lock():
+    """Serialize server stages for this controller user, including postflight.
+
+    Keep the inode after release: unlinking a flock file lets later callers lock
+    a different inode. This is not a distributed lock or a remote cancellation.
+    """
+    path = Path.home() / '.portfolio-infrastructure.pipeline.lock'
+    parent = path.parent.lstat()
+    require(stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.getuid() and parent.st_mode & 0o022 == 0,
+            'Unsafe local pipeline lock directory; inspect its ownership and permissions.')
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(descriptor, 'r+') as lock:
+        metadata = os.fstat(lock.fileno())
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid()
+                and metadata.st_nlink == 1 and metadata.st_mode & 0o777 == 0o600,
+                'Unsafe local pipeline lock; inspect its ownership and permissions.')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('Another server stage is running on this controller. '
+                             'Stop; wait for its result and inspect before retrying.') from None
+        yield
 
 
 def prerequisites(mode):

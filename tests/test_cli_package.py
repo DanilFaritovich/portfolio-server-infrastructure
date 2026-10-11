@@ -71,7 +71,8 @@ class PackageTests(unittest.TestCase):
             for command in commands:
                 with self.subTest(command=command), \
                         patch.object(sys, 'argv', ['access.py', command, '--inventory', '/fixture.yml']), \
-                        patch.object(cli.os, 'umask'), patch.object(cli, handler) as run:
+                        patch.object(cli.os, 'umask'), patch.object(cli, handler) as run, \
+                        patch.object(cli, 'pipeline_lock', contextlib.nullcontext):
                     self.assertEqual(cli.main(), 0)
                     if handler == 'setup_inventory':
                         run.assert_called_once_with(Path('/fixture.yml'))
@@ -81,6 +82,17 @@ class PackageTests(unittest.TestCase):
                         run.assert_called_once_with(command)
                     else:
                         run.assert_called_once_with(command, Path('/fixture.yml'), None)
+
+    def test_legacy_pipeline_lock_keeps_mock_globals_isolated(self):
+        other = load_access('other_pipeline_lock_access')
+        with tempfile.TemporaryDirectory() as first_home, tempfile.TemporaryDirectory() as second_home:
+            with patch.object(access, 'Path') as first_path, patch.object(other, 'Path') as second_path:
+                first_path.home.return_value = Path(first_home)
+                second_path.home.return_value = Path(second_home)
+                with access.pipeline_lock(), other.pipeline_lock():
+                    pass
+            self.assertTrue((Path(first_home) / '.portfolio-infrastructure.pipeline.lock').exists())
+            self.assertTrue((Path(second_home) / '.portfolio-infrastructure.pipeline.lock').exists())
 
     def test_native_managed_failure_stops_docker_mutation(self):
         with patch.object(provisioning, 'managed_access', return_value=('controller', Path('/fixture.key'))), \

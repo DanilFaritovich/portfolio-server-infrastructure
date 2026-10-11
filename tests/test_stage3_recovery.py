@@ -160,6 +160,52 @@ class Stage3RecoveryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'SSH adoption interrupted'):
                     adoption.adopt(Mock(params={'adoption': []}))
 
+    def test_pending_listeners_block_preflight_and_public_verification(self):
+        fake, _ = self.prepared()
+        pending = self.host.fixture_path('/etc/ssh/portfolio-listeners.pending')
+        for symlink in (False, True):
+            if symlink:
+                pending.symlink_to(pending.parent / 'missing')
+            else:
+                pending.write_text('Interrupted before reload')
+            for verify in (False, True):
+                fake.params.update(verify=verify, report_only=True)
+                report = self.host.inspect(fake)
+                self.assertFalse(report['ready'])
+                self.assertIn('Interrupted SSH listener activation', report['report'])
+                self.assertTrue(pending.exists() or pending.is_symlink())
+            # Only the internal activation postflight bypasses this one latch;
+            # all other SSH/UFW runtime checks still execute.
+            fake.params.update(verify=True, activation_check=True)
+            report = self.host.inspect(fake)
+            self.assertNotIn('Interrupted SSH listener activation', report['report'])
+            fake.params.pop('activation_check')
+            pending.unlink()
+
+    def test_pending_final_policy_cannot_be_activated_via_another_stage(self):
+        fake, _ = self.prepared()
+        pending = self.host.fixture_path('/etc/ssh/portfolio-security.pending')
+        pending.write_text('{}')
+        for verify in (False, True):
+            fake.params.update(verify=verify, report_only=True)
+            report = self.host.inspect(fake)
+            self.assertFalse(report['ready'])
+            self.assertIn('Do not activate it through another stage', report['report'])
+        fake.params.update(verify=True, activation_check=True)
+        self.assertNotIn('Do not activate it through another stage', self.host.inspect(fake)['report'])
+        # Handler allowance retains the existing exact-policy/receipt checks.
+        from pathlib import Path
+        import yaml
+        handlers = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                   'roles/ssh_security/handlers/main.yml').read_text())
+        installed = next(i for i, task in enumerate(handlers)
+                         if task.get('portfolio_ssh_security', {}).get('operation') == 'installed')
+        reload = next(i for i, task in enumerate(handlers) if 'ansible.builtin.systemd_service' in task)
+        complete = next(i for i, task in enumerate(handlers)
+                        if task.get('portfolio_ssh_security', {}).get('operation') == 'complete')
+        self.assertLess(installed, reload)
+        self.assertLess(reload, complete)
+
     def test_uncatchable_adoption_interruption_remains_fail_closed(self):
         for stop_after in (1, 2):
             with self.subTest(stop_after=stop_after):

@@ -294,9 +294,55 @@ make docker-host
 make verify-docker
 ```
 
-Второй `make docker-host` должен дать `changed=0`, если внешнее состояние не
-изменилось. Live access, installation, runtime behavior и полная host idempotency
+`make docker-host` теперь автоматически запускает `verify-docker` после provisioning;
+успех требует независимых runtime-проверок. Smoke test может пополнить image cache.
+На втором запуске provisioning role должна дать `changed=0`, если внешнее состояние
+не изменилось; последующий smoke test всё равно создаёт и удаляет container и
+сообщает changes. Live access, runtime behavior и полная host idempotency
 проверяются вручную; агент эти команды против VPS не запускал.
+
+## Прерывания этапов и безопасный повтор
+
+Серверные Make/CLI-команды удерживают неблокирующий локальный lock
+`~/.portfolio-infrastructure.pipeline.lock`, включая confirmation и postflight.
+Другой этап того же пользователя контроллера остановится до dispatch, даже из
+другого checkout или inventory. Не удаляйте lock-файл: завершение процесса
+освобождает блокировку, а удаление inode может нарушить сериализацию. Локальные
+команды и интерактивный SSH остаются доступны для recovery. Другие пользователи/ПК,
+прямые Python-вызовы и raw Ansible не охвачены lock; исключайте их пересечение вручную.
+
+При потере SSH, timeout или прерывании — STOP. Удалённая работа могла завершиться
+или ещё выполняться; освобождение локального lock этого не доказывает. Получите
+recovery-доступ, подтвердите завершение прежней удалённой работы и исследуйте
+состояние перед осознанным повтором. Ошибка блокирует зависимые проверки;
+автоматических retry нет. Существующие UFW snapshots, SSH receipts, human ledgers,
+removal receipts и APT snapshots сохраняют свои recovery-правила. Не удаляйте
+ownership state и не усыновляйте частично созданные accounts для обхода отказа.
+Pending финальной SSH policy также блокирует обычный hardening и зависимые этапы;
+используйте recovery её защищённого receipt, а не активацию через Stage 3.
+
+Новые маркеры активации блокируют повторные изменения и обычную verification:
+
+| Этап | Pending marker | Что нужно подтвердить для recovery |
+| --- | --- | --- |
+| Docker | `/etc/docker/portfolio-activation.pending` | Согласованную daemon policy, активные services и bounded `local` logging |
+| Stage 3 SSH listeners | `/etc/ssh/portfolio-listeners.pending` | Согласованные main/includes, валидный syntax, сохранённый service/socket mode, effective listeners, firewall routes и новый независимый SSH/sudo |
+| Journald | `/etc/systemd/journald.conf.d/portfolio-activation.pending` | Согласованную retention policy и успешную активацию штатного journald service |
+
+Маркер может остаться, даже если запись не началась или активация успешно завершилась
+непосредственно перед прерыванием. Это свидетельство для диагностики, а не указание
+перезапустить service. Через сохранённый administrator/provider-console доступ
+сравните disk policy и metadata с согласованной конфигурацией, проверьте runtime и
+выберите проверенное исправление/активацию только при необходимости. После получения
+этих доказательств оператор может осознанно удалить только соответствующий новый
+маркер, затем выполнить существующую `verify-docker`, `verify-hardening` или
+`verify-operations` до следующих изменений. Это LIVE-операции с отдельным разрешением.
+Установка файла, активация service и проверка доступа — отдельные шаги;
+атомарность всего этапа и durability при crash/power loss не гарантируются.
+
+Docker smoke test использует exact-ID cleanup в `always`; crash контроллера или
+потеря транспорта могут помешать cleanup. Проверьте оставшийся test container и
+удаляйте только доказанный exact ID после review; не выполняйте prune чужих ресурсов.
 
 ## Host hardening (Stage 3)
 

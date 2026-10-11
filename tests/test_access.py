@@ -1,6 +1,7 @@
 """Offline regression tests: synthetic inventories and mocked SSH/Ansible processes."""
 
 import importlib.util
+import contextlib
 import io
 import json
 import os
@@ -274,6 +275,7 @@ class AccessTests(unittest.TestCase):
 
     def test_reboot_cli_returns_failure_for_denial_or_prerequisite_error(self):
         with patch.object(access, 'live', side_effect=ValueError('synthetic refusal')), \
+                patch.object(access, 'pipeline_lock', contextlib.nullcontext), \
                 patch('sys.argv', ['access.py', 'reboot-host', '--inventory', str(self.inventory),
                                    '--key', str(self.key)]), patch('builtins.print'):
             self.assertEqual(access.main(), 1)

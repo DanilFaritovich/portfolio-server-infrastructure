@@ -56,7 +56,10 @@ class DockerTests(unittest.TestCase):
                     access.live(mode, self.inventory, self.key)
                 prepare.assert_not_called()
                 trust.assert_called_once_with('fixture.example.test', 2222, allow_trust=False)
-                self.assertEqual([Path(c.args[0][3]).name for c in run.call_args_list], ['verify.yml', mode + '.yml'])
+                expected_playbooks = ['verify.yml', mode + '.yml']
+                if mode == 'docker-host':
+                    expected_playbooks.append('verify-docker.yml')
+                self.assertEqual([Path(c.args[0][3]).name for c in run.call_args_list], expected_playbooks)
                 for overlay in overlays:
                     host = overlay['all']['hosts']['fixture']
                     self.assertEqual(host['ansible_user'], 'ansible')
@@ -179,7 +182,7 @@ class DockerTests(unittest.TestCase):
 
     def test_daemon_configuration_converges_and_only_changed_copy_notifies(self):
         config = yaml.safe_load((ROOT / 'roles/docker_host/defaults/main.yml').read_text())['docker_host_daemon_config']
-        original = next(t for t in self.tasks if 'ansible.builtin.copy' in t)
+        original = next(t for t in self.tasks if t.get('name') == 'Install validated bounded container logging configuration')
         self.assertEqual(original['ansible.builtin.copy']['validate'], '/usr/bin/dockerd --validate --config-file %s')
         self.assertEqual(original['notify'], 'Restart Docker after validated configuration changes')
         self.assertEqual(sum('notify' in t for t in self.tasks), 1)

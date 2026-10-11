@@ -15,6 +15,23 @@
         fail_msg: Use make verify-docker after make bootstrap-user and make docker-host.
         quiet: true
 
+    - name: Inspect pending Docker activation
+      ansible.builtin.stat:
+        path: /etc/docker/portfolio-activation.pending
+        follow: false
+        get_checksum: false
+        get_mime: false
+      register: verify_docker_pending
+      become: true
+
+    - name: Refuse unconfirmed Docker activation
+      ansible.builtin.assert:
+        that:
+          - not verify_docker_pending.stat.exists
+          - not (verify_docker_pending.stat.islnk | default(false))
+        fail_msg: Pending Docker activation; inspect configuration/runtime through recovery access before retrying.
+        quiet: true
+
     - name: Verify Docker Engine and CLI plugins
       ansible.builtin.command:
         argv: "{{ item }}"

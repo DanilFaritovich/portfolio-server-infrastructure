@@ -40,3 +40,20 @@
   changed_when: true
   when: hardening_before.ssh_activation == 'socket'
   listen: Reload SSH after validated configuration changes
+
+- name: Verify activated SSH listeners before completing the receipt
+  portfolio_hardening_info:
+    current_port: "{{ ansible_port | int }}"
+    ssh_ports: "{{ ssh_listen_ports }}"
+    tcp_ports: "{{ firewall_allowed_tcp_ports }}"
+    verify: true
+    activation_check: true
+  become: true
+  listen: Reload SSH after validated configuration changes
+
+- name: Complete SSH listener activation receipt
+  ansible.builtin.file:
+    path: /etc/ssh/portfolio-listeners.pending
+    state: absent
+  become: true
+  listen: Reload SSH after validated configuration changes

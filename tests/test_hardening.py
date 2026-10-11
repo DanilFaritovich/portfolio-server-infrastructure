@@ -418,6 +418,7 @@ def inspect(module):''')
             result = {'ready': ready, 'report': 'Hardening preflight\n' +
                       ('WARN  safe convergence\nResult: READY' if ready else 'FAIL  blocking state\nResult: NOT READY')}
             with self.subTest(ready=ready), patch.object(access, 'prerequisites'), \
+                    patch.object(access, 'pipeline_lock', return_value=contextlib.nullcontext()), \
                     patch.object(access, 'known_host'), patch.object(access.subprocess, 'run', side_effect=[
                         subprocess.CompletedProcess([], 0, 'ansible\n', ''),
                         subprocess.CompletedProcess([], 0, json.dumps(result), 'sensitive-stderr')]), \
@@ -597,7 +598,8 @@ path.write_text(json.dumps(state))
         self.assertEqual(set(json.loads(state.read_text())['ports']), {2222, 2200, 80, 443})
 
     def test_invalid_ssh_candidate_is_not_installed_or_notified_and_rerun_converges(self):
-        original = next(t for t in self.tasks if 'ansible.builtin.blockinfile' in t)
+        original = next(t for t in self.tasks if t.get('name') ==
+                        'Configure SSH ports and public-key authentication with full candidate validation')
         self.assertEqual(original['ansible.builtin.blockinfile']['validate'], '/usr/sbin/sshd -t -f %s')
         self.assertEqual(sum('notify' in task for task in self.tasks), 3)
         handlers = yaml.safe_load((ROOT / 'roles/host_hardening/handlers/main.yml').read_text())
@@ -636,7 +638,8 @@ sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
         self.assertIn('Port 2200\nPort 2222\nPubkeyAuthentication yes', dest.read_text())
 
     def test_real_handler_notifications_order_candidates_and_convergence(self):
-        task = copy.deepcopy(next(t for t in self.tasks if 'ansible.builtin.blockinfile' in t))
+        task = copy.deepcopy(next(t for t in self.tasks if t.get('name') ==
+            'Configure SSH ports and public-key authentication with full candidate validation'))
         task.pop('become')
         task['ansible.builtin.blockinfile'].update(
             path=str(self.directory / 'sshd_config'), owner=os.getuid(), group=os.getgid(), mode='0600',
@@ -652,8 +655,8 @@ sys.exit(1 if 'Port 99999' in Path(sys.argv[1]).read_text() else 0)
         validator.chmod(0o700)
 
         handlers = yaml.safe_load((ROOT / 'roles/host_hardening/handlers/main.yml').read_text())
-        reload_task = copy.deepcopy(next(t for t in self.tasks if t.get('name', '').startswith(
-            'Schedule socket convergence')))
+        reload_task = copy.deepcopy(next(t for t in self.tasks if t.get('name') ==
+            'Schedule convergence for the prepared SSH activation'))
         events = self.directory / 'events.jsonl'
         reject_generated = self.directory / 'reject-generated'
         spy = self.directory / 'spy'
@@ -682,10 +685,13 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
             elif 'portfolio_hardening_info' in handler:
                 handler['ansible.builtin.command'] = {'argv': [str(spy), handler['name']]}
                 handler.pop('portfolio_hardening_info')
+            elif 'ansible.builtin.file' in handler:
+                handler['ansible.builtin.file']['path'] = str(self.directory / 'portfolio-listeners.pending')
         playbook = self.directory / 'local.yml'
-        def run(activation, ports, reload_required=False):
-            variables = {'ssh_listen_ports': ports, 'hardening_before': {
-                'ssh_activation': activation, 'socket_reload_required': reload_required}}
+        def run(activation, ports, reload_required=False, candidate_changed=False):
+            variables = {'ssh_listen_ports': ports, 'hardening_ssh_candidate': {'changed': candidate_changed},
+                'hardening_before': {'ssh_activation': activation, 'socket_reload_required': reload_required,
+                                     'ssh_adoption': []}}
             playbook.write_text(yaml.safe_dump([{'name': 'Local hardening fixture', 'hosts': 'localhost',
                 'gather_facts': False, 'vars': variables, 'tasks': [task, reload_task], 'handlers': handlers}]))
             return subprocess.run([str(ROOT / '.venv/bin/ansible-playbook'), '-i', 'localhost,', '-c', 'local',
@@ -714,7 +720,7 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual(dest.read_bytes(), installed)
         self.assertEqual([json.loads(line)[0] for line in events.read_text().splitlines()],
-            [handlers[i]['name'] for i in (0, 2, 3, 4)])
+            [handlers[i]['name'] for i in (0, 2, 3, 4, 5)])
         events.unlink()
         repeated = run('socket', [2222, 2200], False)
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
@@ -722,10 +728,10 @@ if Path({str(reject_generated)!r}).exists() and sys.argv[1].startswith('Validate
         self.assertFalse(events.exists())
         dest.write_text('PermitRootLogin yes\nPasswordAuthentication yes\n')
         events.unlink(missing_ok=True)
-        service = run('service', [2222, 2200])
+        service = run('service', [2222, 2200], candidate_changed=True)
         self.assertEqual(service.returncode, 0, service.stdout + service.stderr)
         self.assertEqual([json.loads(line)[0] for line in events.read_text().splitlines()],
-                         [handlers[i]['name'] for i in (0, 1)])
+                         [handlers[i]['name'] for i in (0, 1, 5)])
 
     def test_offline_make_and_verification_have_no_mutation_or_live_calls(self):
         for target in ('harden', 'verify-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security', 'check', 'ci'):
@@ -1174,6 +1180,8 @@ elif sys.argv[1] == 'restart':
             handler.pop('become', None)
             if 'portfolio_hardening_info' in handler:
                 handler['fixture_info'] = handler.pop('portfolio_hardening_info')
+                if handler['name'] == 'Verify activated SSH listeners before completing the receipt':
+                    handler['fixture_info']['activation_check'] = True
             elif handler.get('ansible.builtin.systemd_service', {}).get('daemon_reload'):
                 handler.pop('ansible.builtin.systemd_service')
                 handler['ansible.builtin.command'] = {'argv': [str(spy), 'generate']}
@@ -1182,21 +1190,28 @@ elif sys.argv[1] == 'restart':
                 self.assertEqual(handler['ansible.builtin.command']['argv'],
                                  ['systemctl', 'restart', 'ssh.socket', 'ssh.service'])
                 handler['ansible.builtin.command'] = {'argv': [str(spy), 'restart']}
+            elif handler.get('ansible.builtin.file', {}).get('path') == '/etc/ssh/portfolio-listeners.pending':
+                handler['ansible.builtin.file']['path'] = str(self.directory / 'portfolio-listeners.pending')
             else:
                 handler.pop('ansible.builtin.command', None)
                 handler.pop('ansible.builtin.systemd_service', None)
                 handler['ansible.builtin.command'] = {'argv': [str(spy), 'syntax']}
-        schedule = copy.deepcopy(next(t for t in self.tasks if t['name'].startswith('Schedule socket convergence')))
+        schedule = copy.deepcopy(next(t for t in self.tasks if t.get('name') ==
+            'Schedule convergence for the prepared SSH activation'))
         final = copy.deepcopy(self.tasks[-1])
         final.pop('become')
         final['fixture_info'] = final.pop('portfolio_hardening_info')
         self.assertTrue(final['fixture_info']['verify'])
         playbook = self.directory / 'transaction.yml'
-        def run(reload_required):
+        def run(reload_required, pending_marker=True):
+            pending = self.directory / 'portfolio-listeners.pending'
+            if pending_marker:
+                pending.touch(exist_ok=True)
             playbook.write_text(yaml.safe_dump([{'hosts': 'localhost', 'gather_facts': False,
                 'vars': {'ansible_port': 2222, 'ssh_listen_ports': [2222, 2200],
-                         'firewall_allowed_tcp_ports': [80, 443], 'hardening_before': {
-                             'ssh_activation': 'socket', 'socket_reload_required': reload_required}},
+                         'firewall_allowed_tcp_ports': [80, 443], 'hardening_ssh_candidate': {'changed': False},
+                         'hardening_before': {'ssh_activation': 'socket', 'socket_reload_required': reload_required,
+                                              'ssh_adoption': []}},
                 'tasks': [schedule, {'ansible.builtin.meta': 'flush_handlers'}, final], 'handlers': handlers}]))
             return subprocess.run([str(ROOT / '.venv/bin/ansible-playbook'), '-i', 'localhost,', '-c', 'local',
                 '-e', json.dumps({'ansible_python_interpreter': str(ROOT / '.venv/bin/python')}), str(playbook)],
@@ -1207,16 +1222,18 @@ elif sys.argv[1] == 'restart':
         first = run(plan['socket_reload_required'])
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual(events.read_text().splitlines(), ['syntax', 'generate', 'restart'])
+        self.assertFalse((self.directory / 'portfolio-listeners.pending').exists())
         fake.params.update(verify=True, report_only=True)
         after = self.inspect(fake)
         self.assertTrue(all(f['status'] == 'PASS' for f in after['findings']), after['report'])
         fake.params.update(verify=False, report_only=False)
         converged = self.inspect(fake)
         self.assertFalse(converged['socket_reload_required'])
-        second = run(converged['socket_reload_required'])
+        second = run(converged['socket_reload_required'], pending_marker=False)
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertIn('changed=0', second.stdout)
         self.assertEqual(events.read_text().splitlines(), ['syntax', 'generate', 'restart'])
+        self.assertFalse((self.directory / 'portfolio-listeners.pending').exists())
 
     def test_candidate_requires_desired_routes_even_when_generated_and_loaded_agree(self):
         fake = self.inspection_fixture()
@@ -1337,13 +1354,27 @@ elif sys.argv[1] == 'restart':
         self.assertTrue(handlers[3]['portfolio_hardening_info']['socket_candidate'])
         self.assertEqual(handlers[4]['ansible.builtin.command']['argv'], ['systemctl', 'restart', 'ssh.socket', 'ssh.service'])
         for handler in handlers[2:]:
-            self.assertEqual(handler['when'], "hardening_before.ssh_activation == 'socket'")
+            if handler['name'] not in ('Verify activated SSH listeners before completing the receipt',
+                                       'Complete SSH listener activation receipt'):
+                self.assertEqual(handler['when'], "hardening_before.ssh_activation == 'socket'")
             self.assertEqual(handler['listen'], handlers[0]['listen'])
         allow = next(i for i, task in enumerate(self.tasks) if task.get('loop') == '{{ ssh_listen_ports }}')
-        config = next(i for i, task in enumerate(self.tasks) if 'ansible.builtin.blockinfile' in task)
+        config = next(i for i, task in enumerate(self.tasks) if task.get('name') ==
+                      'Configure SSH ports and public-key authentication with full candidate validation')
         self.assertLess(allow, config)
         self.assertEqual(self.tasks[-2]['ansible.builtin.meta'], 'flush_handlers')
         self.assertIs(self.tasks[-1]['portfolio_hardening_info']['verify'], True)
+        self.assertLess(handlers.index(next(h for h in handlers if h['name'] ==
+            'Validate installed SSH configuration immediately before reload')),
+            handlers.index(next(h for h in handlers if h['name'] ==
+            'Regenerate Ubuntu SSH socket configuration without changing live listeners')))
+        self.assertLess(handlers.index(next(h for h in handlers if h['name'] ==
+            'Validate effective generated socket before restarting any SSH listener')),
+            handlers.index(next(h for h in handlers if h['name'] ==
+            'Apply validated socket listeners and restart their SSH consumer together')))
+        self.assertLess(handlers.index(next(h for h in handlers if h['name'] ==
+            'Verify activated SSH listeners before completing the receipt')),
+            handlers.index(next(h for h in handlers if h['name'] == 'Complete SSH listener activation receipt')))
 
     def test_port_assertions_and_absent_ufw_preflight(self):
         task = self.tasks[0]
@@ -1633,7 +1664,8 @@ def adopt(module):''')
         task['fixture_adopt'] = task.pop('portfolio_ssh_adopt')
         task.pop('become')
         task.pop('notify')
-        block = copy.deepcopy(next(t for t in self.tasks if 'ansible.builtin.blockinfile' in t))
+        block = copy.deepcopy(next(t for t in self.tasks if t.get('name') ==
+            'Configure SSH ports and public-key authentication with full candidate validation'))
         block.pop('become')
         block.pop('notify')
         block['ansible.builtin.blockinfile'].update(path=str(main), owner=os.getuid(), group=os.getgid(),

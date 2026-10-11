@@ -94,6 +94,8 @@ def live(mode, inventory, key=None):
         # Host-level ansible_become=False would override task-level become=True.
         stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
         run_playbook(inventory, alias, stage | {'ansible_become_flags': '-n'}, mode + '.yml')
+        if mode == 'docker-host':
+            run_playbook(inventory, alias, stage | {'ansible_become_flags': '-n'}, 'verify-docker.yml')
     if mode in ('harden', 'verify-hardening'):
         stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
         stage['ansible_become_flags'] = '-n'
