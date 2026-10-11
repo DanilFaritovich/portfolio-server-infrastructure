@@ -114,6 +114,37 @@
     mode: '0600'
   become: true
 
+- name: Preview the SSH port block before changing sources
+  ansible.builtin.blockinfile:
+    path: /etc/ssh/sshd_config
+    marker: '# {mark} ANSIBLE PORTFOLIO SSH PORTS'
+    insertbefore: BOF
+    block: |
+      {% for port in ssh_listen_ports | sort %}
+      Port {{ port }}
+      {% endfor %}
+      PubkeyAuthentication yes
+    validate: /usr/sbin/sshd -t -f %s
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  check_mode: true
+  register: hardening_ssh_candidate
+
+- name: Record pending SSH listener activation before changing sources
+  ansible.builtin.copy:
+    content: "SSH listener activation is unconfirmed. Inspect through recovery access before retrying.\n"
+    dest: /etc/ssh/portfolio-listeners.pending
+    owner: root
+    group: root
+    mode: '0600'
+    force: false
+  become: true
+  when: >-
+    hardening_ssh_candidate.changed or hardening_before.ssh_adoption | length > 0
+    or hardening_before.socket_reload_required
+
 - name: Adopt the exact legacy SSH Port after firewall preparation and full candidate validation
   portfolio_ssh_adopt:
     sources: "{{ hardening_before.ssh_sources }}"
@@ -140,11 +171,12 @@
   become: true
   notify: Reload SSH after validated configuration changes
 
-- name: Schedule socket convergence when installed configuration is already unchanged
+- name: Schedule convergence for the prepared SSH activation
   ansible.builtin.debug:
-    msg: Regenerate and validate the socket candidate before applying listeners.
-  changed_when: hardening_before.socket_reload_required
-  when: hardening_before.ssh_activation == 'socket'
+    msg: Activate the prepared SSH policy using the existing listener mode.
+  changed_when: >-
+    hardening_ssh_candidate.changed or hardening_before.ssh_adoption | length > 0
+    or hardening_before.socket_reload_required
   notify: Reload SSH after validated configuration changes
 
 - name: Apply validated SSH configuration before independent connection verification

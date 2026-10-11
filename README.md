@@ -278,9 +278,12 @@ No application networks or deployment configuration are created.
 `docker version`, `docker info`, `docker compose version`, `docker buildx version`,
 checks active/enabled status for both services and requires the active logging
 driver to be `local`. These probes report `changed=0`. The smoke test creates a
-`hello-world:latest` container with `--network none`, starts/attaches with a
-120-second timeout, then removes its exact ID in an `always` cleanup block,
-including on a failed start. Runtime operations accurately report changes.
+`hello-world:latest` container with `--network none`. Creation and attached execution
+each have a 120-second timeout plus a 10-second forced-termination grace. Start and
+`always` cleanup require a successful create returning a full valid container ID;
+a failed start still cleans that confirmed ID. A create timeout may leave daemon-side
+work running or a container created: STOP and inspect, without guessed cleanup or
+blind retries. Runtime operations accurately report changes.
 The smoke test can download an image from Docker Hub and leave it in the Docker
 image cache; verification is **not strictly read-only**. No test container is
 left running after the cleanup. No cache pruning removes unrelated operator data.
@@ -297,9 +300,55 @@ make docker-host
 make verify-docker
 ```
 
-The second `make docker-host` should report `changed=0` if external state has not
-changed. Live access, installation, runtime behavior and full host idempotency
+`make docker-host` now runs `verify-docker` automatically after provisioning;
+success requires its independent runtime checks. Its smoke test may populate the
+image cache. On the second run the provisioning role should report `changed=0`
+if external state has not changed; the subsequent smoke test still creates and
+removes a container and reports changes. Live access, runtime behavior and full host idempotency
 must be verified manually; the agent has not run these commands against the VPS.
+
+## Interrupted stages and safe repetition
+
+Server Make/CLI stages use a non-blocking local lock at
+`~/.portfolio-infrastructure.pipeline.lock`, including confirmation and postflight.
+Another stage for the same controller user fails before dispatch, even from another
+checkout or inventory. Do not delete this lock file: process exit releases its lock,
+and removing the inode can defeat serialization. Local commands and interactive SSH
+remain available for recovery. Different controller users/PCs, direct Python calls
+and raw Ansible are outside this lock; serialize those operations manually.
+
+On SSH loss, timeout or interruption, STOP. Remote work may have completed or may
+still be running; a released local lock does not prove that it stopped. Establish
+recovery access, confirm the earlier remote work has ended, and inspect state before
+any deliberate retry. Failed stages never run their dependent checks or retry
+automatically. Existing UFW snapshots, SSH receipts, human ledgers/removal receipts
+and APT snapshots retain their existing recovery rules; do not remove ownership
+state or adopt partially created accounts to bypass a refusal.
+Pending final SSH policy also blocks normal hardening and its consumers; use its
+protected receipt recovery procedure, rather than activating it through Stage 3.
+
+New activation markers block repeat mutation and normal verification:
+
+| Stage | Pending marker | Required recovery evidence |
+| --- | --- | --- |
+| Docker | `/etc/docker/portfolio-activation.pending` | Approved daemon policy, active services and bounded `local` logging |
+| Stage 3 SSH listeners | `/etc/ssh/portfolio-listeners.pending` | Approved main/includes, valid syntax, preserved service/socket mode, effective listeners, firewall routes and fresh independent SSH/sudo |
+| Journald | `/etc/systemd/journald.conf.d/portfolio-activation.pending` | Approved retention policy and successful activation of the stock journald service |
+
+A marker can remain even if the write never occurred or activation succeeded just
+before interruption. It is recovery evidence, not a command to restart a service.
+Through retained administrator/provider-console access, compare disk policy and
+metadata with the approved configuration, diagnose runtime, and choose a reviewed
+repair/activation only when necessary. Once that evidence is complete, an operator
+may deliberately remove only the corresponding new marker, then run the existing
+`verify-docker`, `verify-hardening` or `verify-operations` before further changes.
+Those are LIVE operations requiring separate authorization. File installation,
+service activation and access verification are separate steps; no whole-stage
+atomicity or crash/power-loss durability is promised.
+
+The Docker smoke test uses exact-ID cleanup in `always`; a controller crash or
+lost transport can prevent that cleanup. Inspect any retained test container and
+remove only its proven exact ID after review; never prune unrelated resources.
 
 ## Host hardening stage (Stage 3)
 

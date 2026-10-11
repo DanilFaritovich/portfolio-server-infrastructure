@@ -15,7 +15,7 @@ def inspect_host(host, port, interpreter, key, inputs, user):
         '-o', 'KbdInteractiveAuthentication=no',
         '-i', str(key), '-p', str(port), user + '@' + host,
     ]
-    login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False)
+    login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False, timeout=30)
     if login.returncode or login.stdout.strip() != user:
         print('Hardening preflight\nFAIL  managed SSH access\n'
               'FAIL  host inspection unavailable without managed key-only access\n\nResult: NOT READY')
@@ -28,7 +28,7 @@ def inspect_host(host, port, interpreter, key, inputs, user):
     payload = '__name__ = "portfolio_inspection"\n' + (ROOT / 'library/portfolio_hardening_info.py').read_text()
     payload += '\ninspect_stream(json.loads(' + repr(json.dumps(params)) + '))\n'
     process = subprocess.run(ssh + ['sudo -n ' + shlex.quote(interpreter) + ' -I -B -'],
-                             input=payload, capture_output=True, text=True, check=False)
+                             input=payload, capture_output=True, text=True, check=False, timeout=300)
     try:
         require(process.returncode == 0, 'Managed sudo or host inspection failed.')
         result = json.loads(process.stdout)

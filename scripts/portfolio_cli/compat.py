@@ -34,7 +34,7 @@ def install(namespace):
     for name, value in exports.items():
         if not isinstance(value, FunctionType) or not value.__module__.startswith(__package__ + '.'):
             continue
-        decorated = name in ('public_key_snapshot', 'add_user_public_key')
+        decorated = name in ('public_key_snapshot', 'add_user_public_key', 'pipeline_lock')
         original = value.__wrapped__ if decorated else value
         bound = FunctionType(original.__code__, namespace, original.__name__,
                              original.__defaults__, original.__closure__)

@@ -93,6 +93,23 @@ class EngineTests(unittest.TestCase):
                 'recovery_fingerprint': engine.fingerprint(key(4)),
                 'token': before['token'], 'recovery_user': 'recovery', 'recovery_token': recovery['token']} | extra
 
+    def test_contended_mutation_fails_immediately_without_key_or_ledger_changes(self):
+        import fcntl
+
+        snapshot = {path: path.read_bytes() for path in self.state.iterdir() if path.is_file()}
+        keys = self.home / 'operator/.ssh/authorized_keys'
+        original = keys.read_bytes()
+        params = self.params('add-user-key', key=key(2))
+        with open(self.state / '.management.lock', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(engine.PreflightError, 'Another user mutation'):
+                engine.execute(params)
+        self.assertEqual(keys.read_bytes(), original)
+        for path, data in snapshot.items():
+            self.assertEqual(path.read_bytes(), data)
+        # A fresh authorized request after release remains usable.
+        self.assertTrue(engine.execute(params)['changed'])
+
     def test_controller_key_addition_and_legacy_registration_are_refused(self):
         for comment in ('', ' different-comment'):
             with self.subTest(comment=comment), self.assertRaisesRegex(engine.PreflightError, 'independent'):

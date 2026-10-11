@@ -15,6 +15,23 @@
         fail_msg: Use make verify-docker after make bootstrap-user and make docker-host.
         quiet: true
 
+    - name: Inspect pending Docker activation
+      ansible.builtin.stat:
+        path: /etc/docker/portfolio-activation.pending
+        follow: false
+        get_checksum: false
+        get_mime: false
+      register: verify_docker_pending
+      become: true
+
+    - name: Refuse unconfirmed Docker activation
+      ansible.builtin.assert:
+        that:
+          - not verify_docker_pending.stat.exists
+          - not (verify_docker_pending.stat.islnk | default(false))
+        fail_msg: Pending Docker activation; inspect configuration/runtime through recovery access before retrying.
+        quiet: true
+
     - name: Verify Docker Engine and CLI plugins
       ansible.builtin.command:
         argv: "{{ item }}"
@@ -45,21 +62,32 @@
         verify_docker_service.rc != 0 or
         verify_docker_service.stdout != ('active' if item.0 == 'is-active' else 'enabled')
 
-    # Keep the ID returned by Docker; cleanup also runs after a failed start.
+    # A timeout does not prove daemon-side cancellation. Never guess an ID.
     - name: Run a disposable runtime smoke test
       block:
         - name: Create an isolated disposable container
           ansible.builtin.command:
-            argv: [docker, create, --network, none, hello-world:latest]
+            argv: [timeout, --kill-after=10s, 120s, docker, create, --network, none, hello-world:latest]
           become: true
           register: verify_docker_container
           changed_when: true
+          failed_when: >-
+            verify_docker_container.rc != 0 or
+            (verify_docker_container.stdout | trim) is not match('^[0-9a-f]{64}$')
 
         - name: Start and wait for the smoke container
           ansible.builtin.command:
             argv: [timeout, --kill-after=10s, 120s, docker, start, --attach, "{{ verify_docker_container.stdout | trim }}"]
           become: true
           changed_when: true
+
+      rescue:
+        - name: Stop after unconfirmed smoke creation or execution
+          ansible.builtin.fail:
+            msg: >-
+              Docker smoke creation or execution failed or timed out; STOP and inspect before retrying.
+              Daemon-side creation may have completed or may still be running. Cleanup uses only a full
+              container ID returned by a successful create; no guessed cleanup or pruning is attempted.
 
       always:
         - name: Remove the smoke container even if execution fails
@@ -68,5 +96,6 @@
           when:
             - verify_docker_container is defined
             - verify_docker_container.rc | default(1) == 0
+            - (verify_docker_container.stdout | default('') | trim) is match('^[0-9a-f]{64}$')
           become: true
           changed_when: true

@@ -12,6 +12,7 @@
     ssh_ports: "{{ ssh_listen_ports }}"
     tcp_ports: "{{ firewall_allowed_tcp_ports }}"
     verify: true
+    activation_check: true
   register: security_reload_sources
   become: true
   listen: Reload final SSH authentication policy
@@ -41,6 +42,7 @@
     ssh_ports: "{{ ssh_listen_ports }}"
     tcp_ports: "{{ firewall_allowed_tcp_ports }}"
     verify: true
+    activation_check: true
   register: security_after
   become: true
   listen: Reload final SSH authentication policy

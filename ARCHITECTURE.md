@@ -15,7 +15,7 @@ the same commands, arguments, output formats and exit codes.
 
 | Module | Responsibility |
 | --- | --- |
-| `cli.py` | Argument parsing, command dispatch, umask and sanitized top-level errors. |
+| `cli.py` | Argument parsing, locked server command dispatch, umask and sanitized failure/interruption errors. |
 | `common.py` | Repository root, default automation key path, SSH policy constants and validation guards. |
 | `inventory.py` | Exclusive inventory creation, static inventory validation, access selection and hardening port inputs. |
 | `keys.py` | Key path/metadata validation, public key parsing and identity comparison, locked non-overwriting generation and temporary public snapshots. |
@@ -23,7 +23,7 @@ the same commands, arguments, output formats and exit codes.
 | `clipboard.py` | Public-material clipboard backend selection and explicit local tool installation prompts. |
 | `host_trust.py` | Initial bootstrap trust, endpoint-bound JSON transfer, atomic known_hosts imports and signed cross-port host identity proof. |
 | `ssh.py` | Interactive controller/human SSH commands and host-bound probes of offered authentication methods. |
-| `ansible.py` | Controller prerequisites and pinned playbook execution using a temporary inventory overlay. |
+| `ansible.py` | Controller prerequisites, local pipeline serialization and pinned playbook execution using a temporary inventory overlay. |
 | `inspection.py` | SSH stdin transports for hardening/operations inspectors and the remote user-management engine. |
 | `verification.py` | Independent managed and human Ansible access verification over selected ports. |
 | `provisioning.py` | Bootstrap/access, Docker, hardening and separately confirmed reboot orchestration. |
@@ -72,6 +72,14 @@ Reboot requires a separate default-deny confirmation and bounded recovery,
 followed by access, Docker and hardening verification in order. Failure stops
 later checks.
 
+Docker provisioning also runs independent Docker verification before reporting
+completion. Its disposable smoke test can populate the image cache and reports
+runtime changes even when the provisioning role itself is unchanged.
+Both smoke creation and attached execution bound the Docker client to 120 seconds
+plus a 10-second forced-termination grace. Start/cleanup require a successful create
+and a full 64-character hexadecimal ID. Timeout does not prove daemon-side
+cancellation; missing/unconfirmed IDs require diagnosis without guessed cleanup.
+
 Human registration validates and snapshots explicitly supplied public material
 before host contact. New accounts use the Ansible human role; existing managed
 accounts use the additive remote engine. Final SSH security proves managed and
@@ -119,6 +127,65 @@ Docker preflight and operations policy remain implemented in those components.
 
 ## State and security invariants
 
+Server CLI commands hold a non-blocking exclusive `flock` on the current user's
+`~/.portfolio-infrastructure.pipeline.lock` throughout preflight, confirmation,
+execution and postflight. The same lock covers different inventories, ports and
+repository checkouts for that user. Unsafe lock metadata or contention fails
+before dispatch; the stable inode is never unlinked. Process exit releases this
+local lock, including interruption. Local key/trust commands and interactive SSH
+sessions remain independent so recovery access remains available.
+
+This lock does not coordinate other controller users/machines, direct Python
+handler calls or raw Ansible. Operators must serialize those paths manually.
+The remote key engine keeps its own snapshot-bound server lock, now failing
+immediately on contention instead of queuing a mutation that might start after
+the caller's transport timeout. Existing SSH/APT module locks and snapshots
+retain their narrower scopes; there is no host-wide transaction.
+
+Docker, Stage 3 SSH listeners and journald now use pending activation markers.
+Ansible previews the managed file with check mode, records pending state before
+an intended file change and activates through existing handlers. SSH also records
+pending state for legacy adoption and socket convergence. The marker is cleared
+only after activation and its server postflight succeed. SSH handler postflight
+uses the internal `activation_check` option to run strict runtime checks while
+retaining the marker; ordinary inspection/verification refuses pending state.
+Pending final SSH policy also blocks Stage 3 and its consumers, preventing an
+unrelated stage from activating an incomplete authentication change. Final SSH
+handlers use that internal allowance for source inspection while retaining their
+existing exact-policy/fingerprint/receipt check before reload and receipt
+completion afterward.
+Docker checks the active logging driver, and journald checks service activity;
+independent controller/operations postflight still follows. Journald's effective
+configuration probe reads disk policy, not an introspection of the running
+daemon's complete configuration.
+
+Markers are fail-closed recovery evidence, not rollback instructions or ownership
+records. Failure before the file write can leave a conservative pending marker;
+failure after successful activation but before receipt cleanup can do the same.
+Recovery requires inspecting approved disk policy, service state and access before
+deliberately clearing that exact marker. Neither multiple file writes nor the
+whole pipeline is atomic. These receipts do not guarantee power-loss durability
+or protect changes by unrelated root processes.
+
+SSH failure, timeout or interruption leaves remote execution unconfirmed and may
+leave a remote operation running. Dependent checks stop; the CLI never retries,
+rolls back or interprets local lock release as remote completion. Hardening SSH
+stdin probes now have bounded login/payload timeouts like operations/user probes.
+Temporary Ansible overlays are cleaned on handled failure and interruption;
+uncatchable controller termination can still leave a private temporary overlay.
+
+| Pipeline | Failure/repetition boundary |
+| --- | --- |
+| Bootstrap | Public-input and sudo-path preflight; additive account/key/sudo tasks followed by independent managed login/sudo. No whole-account transaction. |
+| Docker | Package/configuration/data safety preflight; activation receipt and independent runtime verification. Installed packages remain present on partial failure. |
+| Host hardening | Protected UFW base/rule snapshots and bounded additive recovery; validated SSH adoption/listener receipts, ordered activation and fresh route verification. |
+| Human creation/addition | Server ownership/privilege preflight, protected records and additive engine postflight. Partial fresh creation is refused as unmanaged/orphan state; no adoption or rollback. Public imports remain access-unverified. |
+| Final SSH policy | Fresh independent managed/human proofs, confirmation, exact staged sources and protected activation receipt. An incomplete policy cannot be activated by another normal stage. |
+| Operations | Read-only hardening/operations preflight, native effective APT policy checks, journald activation receipt and operations postflight. No reboot/prune/vacuum rollback. |
+| APT-only repair | Exact approved bytes/metadata, module lock and unchanged snapshots; narrowly scoped replacement followed by operations verification. |
+| User keys/removal | Server lock, fresh target/controller/recovery snapshots, staged key replacement and postflight. Ledger-write failure requires explicit identical-line registration; userdel failure after revocation requires recovery diagnosis. Homes are retained. |
+| Reboot | Fresh managed access/sudo and default-deny confirmation; bounded reboot/reconnection, then access, Docker and hardening in order. No retry on unknown reboot state. |
+
 - Actual inventories remain local and ignored; the committed inventory is an
   example. Setup never overwrites an existing inventory.
 - Private key material is never read by Python or uploaded. Python validates
@@ -157,7 +224,7 @@ Docker preflight and operations policy remain implemented in those components.
 Tests and other file-based consumers can load `access.py` under arbitrary module
 names without registering it in `sys.modules`. `compat.install` exports the
 original helpers and globals, binding the existing function code to each
-importer's own namespace. It reconstructs the two contextmanager wrappers so
+importer's own namespace. It reconstructs the public contextmanager wrappers so
 their underlying generators also use that namespace. Legacy attribute mocks
 therefore affect only that imported instance, leaving package functions and
 other imports independent. No function source is duplicated or dynamically

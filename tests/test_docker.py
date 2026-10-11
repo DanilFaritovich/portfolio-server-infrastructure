@@ -56,7 +56,10 @@ class DockerTests(unittest.TestCase):
                     access.live(mode, self.inventory, self.key)
                 prepare.assert_not_called()
                 trust.assert_called_once_with('fixture.example.test', 2222, allow_trust=False)
-                self.assertEqual([Path(c.args[0][3]).name for c in run.call_args_list], ['verify.yml', mode + '.yml'])
+                expected_playbooks = ['verify.yml', mode + '.yml']
+                if mode == 'docker-host':
+                    expected_playbooks.append('verify-docker.yml')
+                self.assertEqual([Path(c.args[0][3]).name for c in run.call_args_list], expected_playbooks)
                 for overlay in overlays:
                     host = overlay['all']['hosts']['fixture']
                     self.assertEqual(host['ansible_user'], 'ansible')
@@ -179,7 +182,7 @@ class DockerTests(unittest.TestCase):
 
     def test_daemon_configuration_converges_and_only_changed_copy_notifies(self):
         config = yaml.safe_load((ROOT / 'roles/docker_host/defaults/main.yml').read_text())['docker_host_daemon_config']
-        original = next(t for t in self.tasks if 'ansible.builtin.copy' in t)
+        original = next(t for t in self.tasks if t.get('name') == 'Install validated bounded container logging configuration')
         self.assertEqual(original['ansible.builtin.copy']['validate'], '/usr/bin/dockerd --validate --config-file %s')
         self.assertEqual(original['notify'], 'Restart Docker after validated configuration changes')
         self.assertEqual(sum('notify' in t for t in self.tasks), 1)
@@ -226,9 +229,89 @@ class DockerTests(unittest.TestCase):
                 self.assertIs(task['changed_when'], False)
                 self.assertTrue(task['become'])
         smoke = tasks[-1]
-        self.assertEqual(smoke['always'][0]['ansible.builtin.command']['argv'][:3], ['docker', 'rm', '--force'])
+        cleanup_argv = smoke['always'][0]['ansible.builtin.command']['argv']
+        self.assertEqual(cleanup_argv[:3], ['docker', 'rm', '--force'])
         self.assertIn('verify_docker_container.rc | default(1) == 0', smoke['always'][0]['when'])
-        self.assertEqual(smoke['block'][0]['ansible.builtin.command']['argv'][2:4], ['--network', 'none'])
+        create = smoke['block'][0]
+        self.assertEqual(create['ansible.builtin.command']['argv'],
+                         ['timeout', '--kill-after=10s', '120s', 'docker', 'create', '--network', 'none',
+                          'hello-world:latest'])
+        self.assertIn('verify_docker_container.rc != 0', create['failed_when'])
+        self.assertIn('^[0-9a-f]{64}$', create['failed_when'])
+        self.assertEqual(smoke['rescue'][0]['ansible.builtin.fail']['msg'].split()[0], 'Docker')
+        self.assertEqual(cleanup_argv, ['docker', 'rm', '--force', "{{ verify_docker_container.stdout | trim }}"])
+
+    def test_smoke_block_executes_with_fake_docker_and_gated_cleanup(self):
+        source = yaml.safe_load((ROOT / 'playbooks/verify-docker.yml').read_text())[0]['tasks']
+        smoke = next(task for task in source if task.get('name') == 'Run a disposable runtime smoke test')
+        fake_docker = self.directory / 'docker-fixture'
+        fake_docker.write_text(f'#!{ROOT / ".venv/bin/python"}\n' + '''import json, os, signal, sys, time
+event = {'argv': sys.argv[1:]}
+with open(os.environ['DOCKER_EVENTS'], 'a') as stream:
+    stream.write(json.dumps(event) + '\\n')
+if sys.argv[1] == 'create':
+    mode = os.environ['DOCKER_MODE']
+    if mode == 'hang':
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        print(os.environ['DOCKER_ID'], flush=True)
+        while True: time.sleep(1)
+    if mode == 'nonzero':
+        print(os.environ['DOCKER_ID'], flush=True)
+        sys.exit(7)
+    if mode == 'malformed':
+        print(os.environ.get('DOCKER_ID', ''), flush=True)
+        sys.exit(0)
+    print(os.environ['DOCKER_ID'], flush=True)
+    sys.exit(0)
+if sys.argv[1] == 'start':
+    sys.exit(9 if os.environ['DOCKER_MODE'] == 'start-fail' else 0)
+if sys.argv[1:3] == ['rm', '--force']:
+    sys.exit(0)
+sys.exit(2)
+''')
+        fake_docker.chmod(0o700)
+        fake_sudo = self.directory / 'sudo-fixture'
+        fake_sudo.write_text(f'#!{ROOT / ".venv/bin/python"}\n' + '''import os, sys
+args = sys.argv[1:]
+while args and args[0].startswith('-'):
+    option = args.pop(0)
+    if option in ('-u', '-g') and args:
+        args.pop(0)
+os.execv(args[0], args)
+''')
+        fake_sudo.chmod(0o700)
+        events = self.directory / 'docker-events.jsonl'
+        block = yaml.safe_load(yaml.safe_dump(smoke))
+        create_argv = block['block'][0]['ansible.builtin.command']['argv']
+        create_argv[1:3] = ['--kill-after=0.1s', '2s']
+        create_argv[3] = str(fake_docker)
+        start_argv = block['block'][1]['ansible.builtin.command']['argv']
+        start_argv[1:3] = ['--kill-after=0.1s', '2s']
+        start_argv[3] = str(fake_docker)
+        block['always'][0]['ansible.builtin.command']['argv'][0] = str(fake_docker)
+
+        valid_id = 'a' * 64
+        cases = (
+            ('success', valid_id, 0, [['create', '--network', 'none', 'hello-world:latest'],
+                                     ['start', '--attach', valid_id], ['rm', '--force', valid_id]]),
+            ('start-fail', valid_id, 1, [['create', '--network', 'none', 'hello-world:latest'],
+                                        ['start', '--attach', valid_id], ['rm', '--force', valid_id]]),
+            ('hang', valid_id, 1, [['create', '--network', 'none', 'hello-world:latest']]),
+            ('malformed', 'bad-id', 1, [['create', '--network', 'none', 'hello-world:latest']]),
+            ('nonzero', valid_id, 1, [['create', '--network', 'none', 'hello-world:latest']]),
+            ('malformed', '', 1, [['create', '--network', 'none', 'hello-world:latest']]),
+        )
+        for mode, container_id, expected_rc, expected_events in cases:
+            with self.subTest(mode=mode, container_id=container_id):
+                events.unlink(missing_ok=True)
+                with patch.dict(os.environ, {'DOCKER_EVENTS': str(events), 'DOCKER_MODE': mode,
+                                             'DOCKER_ID': container_id}):
+                    result = self.local_ansible([block], {'ansible_become_exe': str(fake_sudo)})
+                self.assertEqual(result.returncode == 0, expected_rc == 0, result.stdout + result.stderr)
+                if expected_rc:
+                    self.assertIn('STOP and inspect before retrying', result.stdout)
+                actual = [json.loads(line)['argv'] for line in events.read_text().splitlines()]
+                self.assertEqual(actual, expected_events)
 
 
 if __name__ == '__main__':
