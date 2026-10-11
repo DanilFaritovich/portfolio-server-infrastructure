@@ -498,10 +498,12 @@ class Stand:
         print(f'Open another terminal: virsh -c {URI} console {self.state["uuid"]}\n'
               'Log in as root. Run cloud-init status --wait (must finish successfully), '
               'systemctl is-active ssh.socket, ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub.\n'
-              'Retain the fingerprint for first-use trust. Test console recovery, then run poweroff. '
-              'Leave console with Ctrl+]. No SSH trust is accepted automatically.', flush=True)
-        confirm('Have cloud-init/SSH and console recovery been verified and the guest powered off?')
-        self.wait_stopped('Guest must be shut off before baseline creation; shutdown wait timed out.')
+              'Retain the fingerprint for first-use trust. Test console recovery. '
+              'Leave console with Ctrl+], then confirm below to shut down the guest and create the baseline. '
+              'No SSH trust is accepted automatically.', flush=True)
+        confirm('Have cloud-init/SSH and console recovery been verified? Shut down the guest and create the baseline?')
+        self.resources()
+        self.stop()
         self.resources()
         snapshot = ET.Element('domainsnapshot')
         ET.SubElement(snapshot, 'name').text = 'baseline'
@@ -538,7 +540,8 @@ class Stand:
         state = virsh('domstate', self.state['uuid'])
         if state == 'running':
             virsh('shutdown', self.state['uuid'])
-            self.wait_stopped('VM not stopped; use console to shut down. No forced stop/revert.')
+        if state in ('running', 'in shutdown'):
+            self.wait_stopped('VM not stopped; shutdown wait timed out. Use console to shut down. No forced stop/revert.')
         require(virsh('domstate', self.state['uuid']) == 'shut off', 'VM not stopped; use console to shut down. No forced stop/revert.')
 
     def reset(self):

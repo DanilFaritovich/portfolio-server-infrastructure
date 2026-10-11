@@ -398,6 +398,16 @@ class StandTests(unittest.TestCase):
     def test_prepare_shutdown_timeout_retains_partial_fixture_without_baseline(self):
         self.fresh_prepare('ubuntu-24.04', shutdown_timeout=True)
 
+    def test_prepare_decline_keeps_running_guest_without_shutdown_or_baseline(self):
+        self.fresh_prepare('ubuntu-24.04', decline=True)
+
+    def test_stop_observes_shutdown_in_progress_without_second_request(self):
+        with patch.object(e2e, 'virsh', side_effect=['in shutdown', 'in shutdown', 'shut off', 'shut off']) as run, \
+                patch.object(e2e.time, 'sleep') as sleep:
+            self.stand.stop()
+        sleep.assert_called_once_with(2)
+        self.assertTrue(all(call.args[0] == 'domstate' for call in run.call_args_list))
+
     def test_wait_stopped_rejects_ambiguous_state_without_mutation(self):
         self.vm_state = 'paused'
         with self.assertRaisesRegex(ValueError, 'Unexpected guest state'), patch.object(e2e.time, 'sleep') as sleep:
@@ -448,7 +458,7 @@ class StandTests(unittest.TestCase):
         with patch.object(Path, 'stat', wrong_group), self.assertRaisesRegex(ValueError, 'ownership/mode'):
             self.stand.disk_file()
 
-    def fresh_prepare(self, distro, *, shutdown_timeout=False):
+    def fresh_prepare(self, distro, *, shutdown_timeout=False, decline=False):
         # All host tools, download and hypervisor operations are synthetic.
         self.stand.delete()
         self.stand.storage.mkdir(mode=0o700)
@@ -481,6 +491,11 @@ class StandTests(unittest.TestCase):
             return ''
         shutdown = []
         def hypervisor(*args):
+            if args[0] == 'shutdown':
+                self.assertEqual(self.vm_state, 'running')
+                self.calls.append(args)
+                shutdown.extend(['running', 'in shutdown', 'shut off'] if not shutdown_timeout else ['running'])
+                return ''
             if args[0] == 'domstate' and shutdown:
                 self.vm_state = shutdown.pop(0)
             if args[0] == 'define':
@@ -497,8 +512,11 @@ class StandTests(unittest.TestCase):
                 self.snapshots = ['baseline']
             return self.virsh(*args)
         def confirmation(message):
-            if 'powered off' in message:
-                shutdown.extend(['running', 'in shutdown', 'shut off'] if not shutdown_timeout else ['running'])
+            if 'create the baseline?' in message:
+                self.assertEqual(self.vm_state, 'running')
+                self.assertNotIn('poweroff', message)
+                if decline:
+                    raise e2e.E2EError('E2E operation declined.')
         with patch.object(Path, 'exists', exists), patch.object(e2e.e2e_host, 'prepare'), \
                 patch.object(e2e.getpass, 'getpass', return_value='disposable-test-password'), \
                 patch.object(self.stand, 'download', side_effect=download), \
@@ -507,11 +525,12 @@ class StandTests(unittest.TestCase):
                 patch.object(e2e.time, 'sleep') as sleep, \
                 patch.object(e2e.time, 'monotonic', side_effect=[0, 121] if shutdown_timeout else [0, 1, 2]), \
                 patch.dict(os.environ, E2E_DISTRO=distro, E2E_CPUS='', E2E_MEMORY='', E2E_DISK_GB='', E2E_SUBNET=''):
-            if shutdown_timeout:
-                with self.assertRaisesRegex(ValueError, 'shutdown wait timed out'):
+            if shutdown_timeout or decline:
+                with self.assertRaisesRegex(ValueError, 'declined' if decline else 'shutdown wait timed out'):
                     self.stand.prepare()
                 self.assertEqual(self.stand.load()['phase'], 'preparing')
-                self.assertEqual([c[0] for c in self.mutations()], ['net-define', 'net-start', 'define', 'start'])
+                expected = ['net-define', 'net-start', 'define', 'start'] + ([] if decline else ['shutdown'])
+                self.assertEqual([c[0] for c in self.mutations()], expected)
                 self.assertFalse(self.stand.inventory.exists())
                 self.assertFalse(self.snapshots)
                 sleep.assert_not_called()
@@ -523,7 +542,7 @@ class StandTests(unittest.TestCase):
         self.assertEqual(self.stand.state['distro'], distro)
         self.assertEqual(self.stand.load()['distro'], distro)
         self.stand.check_inventory(self.stand.inventory)
-        self.assertEqual([c[0] for c in self.mutations()], ['net-define', 'net-start', 'define', 'start', 'snapshot-create', 'start'])
+        self.assertEqual([c[0] for c in self.mutations()], ['net-define', 'net-start', 'define', 'start', 'shutdown', 'snapshot-create', 'start'])
         for source in self.domain.findall('devices/disk/source'):
             self.assertEqual(source.find('seclabel').attrib, {'model': 'dac', 'relabel': 'no'})
         self.assertIsNone(self.domain.find('seclabel'))

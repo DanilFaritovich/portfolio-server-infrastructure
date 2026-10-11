@@ -223,11 +223,15 @@ console), log in as root, and:
    and confirm both are `yes`. Check `systemctl is-active ssh.socket` or
    `systemctl is-active ssh.service` for the stock listener mode.
 3. Run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`; retain its fingerprint.
-   Prove root console login works independently of SSH, then run `poweroff`.
-4. Return to prepare and confirm these checks. The wrapper waits up to 120
-   seconds for the guest to reach `shut off`, without requesting or forcing
-   shutdown. Timeout, an unexpected state or a query error stops preparation
-   with the partial fixture retained.
+   Prove root console login works independently of SSH, then leave the console
+   with Ctrl+]. Manual `poweroff` is not required.
+4. Return to prepare and confirm both these checks and consent to shut down the
+   guest and create the baseline. The wrapper revalidates the owned resources,
+   requests graceful shutdown with `virsh shutdown` and waits up to 120 seconds
+   for `shut off`. An already stopped guest needs no shutdown request; a guest
+   already shutting down is only observed. No forced shutdown is attempted.
+   Declining confirmation leaves the guest running. Timeout, an unexpected state
+   or a query error stops preparation with the partial fixture retained.
    The wrapper creates/verifies an internal **baseline** snapshot, marks the
    fixture ready and starts it again. Wait for DHCP before testing.
 

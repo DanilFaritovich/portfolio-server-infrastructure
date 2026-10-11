@@ -308,8 +308,10 @@ the read-only seed uses 0640. Only the exact owned qcow2 may pass the group-writ
 exception; legacy fixtures are not rewritten or repaired.
 Successful list queries alone establish absence; query errors and partial state
 never authorize recreation. Prepare journals `preparing` before artifacts and
-marks `ready` only after a console-verified stopped baseline. Baseline creation
-waits up to 120 seconds for operator shutdown. Destructive actions validate
+marks `ready` only after a console-verified stopped baseline. After explicit
+console-check and shutdown consent, prepare revalidates resources, requests
+graceful shutdown and waits up to 120 seconds before baseline creation.
+Destructive actions validate
 paths/snapshots and foreign users before and after default-deny consent,
 use graceful shutdown and never force unsupported restoration.
 
