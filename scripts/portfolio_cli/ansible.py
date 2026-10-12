@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 
-from .common import ROOT, require
+from .common import PASSWORD_CONNECTION, ROOT, require
 
 
 @contextlib.contextmanager
@@ -69,6 +69,11 @@ def run_playbook(path, alias, variables, playbook, ask_pass=False, ask_become=Fa
     if diff:
         command.append('--diff')
     environment = os.environ.copy()
+    if connection.get('ansible_connection') == PASSWORD_CONNECTION:
+        # Isolate only the password child. Later key-only verification inherits
+        # the invoking shell's agent, including its selected encrypted identity.
+        environment.pop('SSH_AUTH_SOCK', None)
+        environment.pop('SSH_AGENT_PID', None)
     for name in ('ANSIBLE_PARAMIKO_LOOK_FOR_KEYS', 'ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD',
                  'ANSIBLE_PARAMIKO_RECORD_HOST_KEYS'):
         environment.pop(name, None)
