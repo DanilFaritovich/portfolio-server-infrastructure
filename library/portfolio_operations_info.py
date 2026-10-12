@@ -27,6 +27,7 @@ ready:
   type: bool
   returned: always
 '''
+import hashlib
 import glob
 import json
 import os
@@ -562,10 +563,56 @@ def safe_inspect(verify=False):
         return {'ready': False, 'report': 'FAIL  operations inspection unavailable; review manually'}
 
 
+def operations_plan(expected):
+    """Exact managed output comparison and stable read-only plan evidence."""
+    files = {}
+    for path in (APT, JOURNAL, '/etc/systemd/journald.conf.d'):
+        p = Path(path)
+        if not p.exists():
+            files[path] = None
+            continue
+        info = p.lstat()
+        files[path] = [info.st_dev, info.st_ino, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode),
+                       p.read_text() if p.is_file() else None]
+    changes = {path: files[path] is None or files[path][2:5] != [0, 0, 0o644] or files[path][5] != content
+               for path, content in expected.items()}
+    directory = files['/etc/systemd/journald.conf.d']
+    changes['journal_directory'] = directory is None or directory[2:5] != [0, 0, 0o755]
+    checks = {}
+    queries = [['dpkg-query', '-W', '-f=${Status}', 'unattended-upgrades', 'logrotate'],
+               ['apt-config', 'dump'], ['systemd-analyze', 'cat-config', 'systemd/journald.conf']]
+    for unit in ('apt-daily.timer', 'apt-daily-upgrade.timer', 'logrotate.timer'):
+        queries.extend([['systemctl', 'is-enabled', unit], ['systemctl', 'is-active', unit]])
+    for argv in queries:
+        rc, output = command(argv)
+        if argv[0] == 'dpkg-query' and rc not in (0, 1):
+            raise ValueError('Package plan query failed')
+        if argv[0] == 'systemctl' and rc not in (0, 1, 3, 4):
+            raise ValueError('Timer plan query failed')
+        checks[' '.join(argv)] = [rc, output]
+        # Missing packages/timers are an explicit allowed output of preflight.
+        if argv[0] in ('apt-config', 'systemd-analyze') and rc != 0:
+            raise ValueError('Plan inspection failed')
+    packages = checks[' '.join(queries[0])]
+    changes['packages'] = packages[0] != 0 or packages[1].count('install ok installed') != 2
+    for unit in ('apt-daily.timer', 'apt-daily-upgrade.timer', 'logrotate.timer'):
+        enabled = checks['systemctl is-enabled ' + unit]
+        active = checks['systemctl is-active ' + unit]
+        changes[unit] = not (enabled[0] == active[0] == 0 and enabled[1].strip() == 'enabled' and active[1].strip() == 'active')
+    token = hashlib.sha256(json.dumps([files, checks], sort_keys=True).encode()).hexdigest()
+    return {'changes': changes, 'token': token}
+
+
 def inspect_stream(params):
     if os.geteuid() != 0:
         raise ValueError('Root inspection required')
-    print(json.dumps(safe_inspect(params.get('verify', False))))
+    result = safe_inspect(params.get('verify', False))
+    if result['ready'] and 'plan_expected' in params:
+        try:
+            result['plan'] = operations_plan(params['plan_expected'])
+        except (OSError, ValueError, KeyError, TypeError):
+            result = {'ready': False, 'report': 'FAIL  operations plan unavailable; STOP'}
+    print(json.dumps(result))
 
 
 def main():

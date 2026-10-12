@@ -26,6 +26,12 @@ SPEC.loader.exec_module(access)
 
 class AccessTests(unittest.TestCase):
     def setUp(self):
+        prompt = patch('builtins.input', return_value='y')
+        prompt.start()
+        self.addCleanup(prompt.stop)
+        terminal = patch.object(access.sys.stdin, 'isatty', return_value=True)
+        terminal.start()
+        self.addCleanup(terminal.stop)
         output = patch('builtins.print')
         output.start()
         self.addCleanup(output.stop)
@@ -202,7 +208,7 @@ class AccessTests(unittest.TestCase):
                     patch.object(access.sys.stdin, 'isatty', return_value=True), \
                     patch('builtins.input', side_effect=type(answer) if isinstance(answer, BaseException) else None,
                           return_value=answer):
-                with self.assertRaisesRegex(ValueError, 'Reboot declined'):
+                with self.assertRaisesRegex(ValueError, 'Plan declined'):
                     access.live('reboot-host', self.inventory, self.key)
                 self.assertEqual([call.args[3] for call in run.call_args_list], ['verify.yml'])
 
@@ -633,7 +639,7 @@ class HostTrustTests(unittest.TestCase):
     def test_confirmation_precedes_key_generation_and_bootstrap(self):
         def prepare(path):
             self.assertTrue(self.path.exists())
-            self.prompt.assert_called_once()
+            self.assertEqual(self.prompt.call_count, 2)
 
         with patch.object(access, 'prerequisites'), \
                 patch.object(access, 'load_host', return_value=('portfolio', self.host, 22, 'root', '/usr/bin/python3')), \

@@ -105,14 +105,17 @@ make init-server INIT_FROM=bootstrap HUMAN_USER=operator HUMAN_SUDO=admin \
 
 This is **LIVE / MUTATING**: bootstrap → Docker → SSH/UFW hardening → human access
 → final SSH security → separately confirmed server operations, with mandatory
-verification between stages. Existing registration, recovery, password/trust and
-operations prompts remain. No application deployment, reboot or automatic recovery.
+verification between stages. One preliminary plan and default-deny confirmation
+cover the listed changes for this invocation, including the tested provider-console
+recovery attestation. Native password/passphrase, sudo and host-trust prompts remain
+separate. No application deployment, reboot or automatic recovery.
 
 `INIT_FROM` chooses the first stage authorized for application: `bootstrap`,
 `docker`, `hardening`, `human`, `ssh`, `operations`; omit it for interactive selection
 with no default. Earlier stages are skipped only after successful server verification.
 Remaining stages run existing idempotent wrappers and explicit verification; completed
-stages beyond the selected frontier are not auto-detected. `INIT_FROM=verify` verifies
+hardening, final SSH policy, operations and managed-key registration can skip
+application only after exact read-only evidence shows no changes are needed. `INIT_FROM=verify` verifies
 the entire pipeline without provisioning; Docker's disposable smoke test may change
 the image cache.
 
@@ -134,11 +137,22 @@ Inventory, identities, keys, passwords, exception text and subprocess output are
 never captured. Log-write errors stop later dispatch and may leave the last record
 incomplete. Terminal errors include the active command and an allowlisted static
 cause or safe process/I/O category, without arbitrary exception text or raw stderr.
-Ctrl+D at stage selection or plan confirmation cancels before host contact without
+Ctrl+D at stage selection or plan confirmation cancels before mutation without
 traceback. Stage diagnostics remain in the terminal. Offline checks do not prove
 live access, repeat-run idempotency or provider recovery.
 
 ## Access and security
+
+Mutating commands show a preliminary plan with target, actions and required rights,
+then ask `Apply this plan? [y/N]`. Enter, refusal, EOF and interruption deny approval.
+`init-server` and `e2e-test` reuse one approval only for their listed operations in
+the current invocation. Input or server snapshot drift stops execution. Native
+authentication and host-trust decisions remain separate; preflight may contact the
+host before mutation consent. Terminal public-key registration confirms before
+host contact; explicit public-file automation remains supported.
+Exact no-op evidence skips application and its prompt where supported; Docker's
+disposable smoke test still changes runtime/image cache. Local `setup`/`deps` skip
+downloads and confirmation when pinned tooling and the requested inventory are ready.
 
 The standard path is **bootstrap_login_user + interactive SSH password →
 ansible_user + dedicated SSH key + NOPASSWD sudo**. The initial login is used only
@@ -821,7 +835,7 @@ offer a LIVE host-only handshake when the inventory port differs from the JSON p
 `copy-public-key`: Wayland (`wl-copy`), X11 (`xclip`/`xsel`) or macOS (`pbcopy`).
 Only the JSON is copied; server, port, fingerprints and success confirmation stay
 in the terminal. On Ubuntu/Debian, a missing utility offers APT installation with
-`Install now? [Y/n]:` (Enter/Y accepts; N cancels installation and copying).
+`Apply this plan? [y/N]` (Y/yes accepts; Enter/N cancels installation and copying).
 Headless sessions fail with guidance to use `show-server-trust`; non-interactive
 calls never install packages. Copy or installation errors never report success.
 A VM needs a configured shared clipboard or another reviewed transfer channel.
@@ -940,8 +954,9 @@ operator checks; offline tests do not prove production access.
 
 ### Agent loading and a new computer with one encrypted key
 
-After creating a new pair, `generate-user-key` asks `Add private key to ssh-agent? [Y/n]:`.
-Enter/Y loads the selected key through native OpenSSH `ssh-add`; N skips loading.
+Before creating a new pair, `generate-user-key` shows one plan for generation and
+optional loading into the existing agent. Only Y/yes accepts `Apply this plan? [y/N]`;
+Enter/N declines before generation. OpenSSH `ssh-add` loads only the selected key.
 OpenSSH owns passphrase input: Python never reads it. Successful loading prints only
 the selected public fingerprint. Generation stays successful if agent loading fails;
 the key is preserved. `load-user-key` reports failure with a nonzero exit status.
@@ -959,8 +974,10 @@ eval "$(ssh-agent -s)"
 make load-user-key HUMAN_USER=portfolio_laptop2
 ```
 
-`AGENT_LOAD=ask` (default), `yes` or `no` controls loading during generation. `yes`
-omits confirmation; `no` skips agent access. New key generation still requires a TTY
+`AGENT_LOAD=ask` (default) includes loading a new key when SSH_AUTH_SOCK is set;
+`yes` requests loading, including for an existing pair; `no` skips agent access.
+Loading is part of the generation plan, or has its own default-deny plan for an
+existing unloaded key. Already loaded identities need no mutation confirmation. New key generation still requires a TTY
 for native passphrase input. Without a TTY there is no confirmation or passphrase
 prompt: `load-user-key` can confirm an already loaded identity, but refuses to add
 an unloaded key. Even `AGENT_LOAD=yes` cannot bypass that rule. Generation preserves
@@ -995,9 +1012,9 @@ and `KEY_NAME`, and copies the complete `.pub` contents, including the comment.
 It needs only the public file and never inspects the private member, contacts a host,
 or loads an agent. In a Wayland session it prefers `wl-copy` (package `wl-clipboard`);
 in X11 it uses `xclip` or `xsel` (matching packages). macOS uses built-in `pbcopy`.
-On Ubuntu/Debian, a missing utility offers `Install now? [Y/n]:` in a terminal:
-Enter/Y installs `wl-clipboard` or `xclip` through APT (with sudo unless root), checks
-availability and retries copying. N declines without installing or copying.
+On Ubuntu/Debian, a missing utility shows an installation plan in a terminal:
+Y/yes installs `wl-clipboard` or `xclip` through APT (with sudo unless root), checks
+availability and retries copying. Enter/N declines without installing or copying.
 `make setup` does not install clipboard packages. Non-interactive calls never prompt
 or install; headless Linux calls suggest `make show-public-key`. Other Linux systems
 require manual installation. Success reports the SHA256 fingerprint; installation
@@ -1047,7 +1064,7 @@ mode without password fallback. Final SSH security still requires a distinct pro
 human administrator; `verify-user` cannot target the current inventory controller.
 
 For an isolated Ubuntu 24.04 VM, first run `make check` offline. Then test local key
-creation, Y/Enter/N, `AGENT_LOAD=no`, repeated generation, agent absence and repeated
+creation, Y acceptance and Enter/N denial, `AGENT_LOAD=no`, repeated generation, agent absence and repeated
 `load-user-key`. Stop the disposable agent or unset `SSH_AUTH_SOCK` to test refusal;
 never stop a shared desktop agent. Fresh SSH and Ansible checks against the disposable
 VM require separate approval and a registered key/trusted host. Test that unrelated
@@ -1376,7 +1393,7 @@ make check              # offline regressions, lint and example-inventory syntax
 make inspect-operations
 make setup-operations   # explicitly confirm in the terminal
 make verify-operations
-make setup-operations   # confirm again; expect changed=0 with no drift
+make setup-operations   # exact no-op skips application and confirmation
 make verify-operations
 ```
 
@@ -1575,7 +1592,7 @@ local operator actions and are never run by `make check` or CI.
 Read [host prerequisites, preparation, scenarios and recovery](docs/local-vm-e2e.md)
 before running `make e2e-prepare`, `make e2e-status`, `make e2e-test`,
 `make e2e-reset` or `make e2e-delete`. Preparation and destructive operations
-require explicit consent; tests retain all native stage confirmations. The
+require explicit consent; tests use one bounded scenario plan and retain native authentication/trust prompts. The
 scenario covers installation, final verification, repeat provisioning and reboot
 persistence. Failures preserve the guest for console diagnosis, without auto-reset.
 

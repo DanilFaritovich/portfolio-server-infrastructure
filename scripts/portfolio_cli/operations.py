@@ -3,12 +3,27 @@
 import subprocess
 import sys
 
+import yaml
+
 from .ansible import prerequisites, run_playbook
-from .common import SSH_BASE, require
+from .common import ROOT, SSH_BASE, require
 from .host_trust import known_host
 from .inspection import operations_probe
 from .inventory import hardening_inputs, load_host, managed_access
 from .keys import check_key
+from .plans import PLAN_NOOP_MESSAGES, stage_consent
+
+
+def operations_expected():
+    defaults = yaml.safe_load((ROOT / 'roles/server_operations/defaults/main.yml').read_text())
+    journal = (ROOT / 'roles/server_operations/templates/journald.j2').read_text()
+    for name, value in defaults.items():
+        journal = journal.replace('{{ ' + name + ' }}', str(value))
+    require('{{' not in journal, 'Unsupported operations template inputs; STOP.')
+    return {
+        '/etc/apt/apt.conf.d/99zz-portfolio-security': (ROOT / 'roles/server_operations/templates/apt-security.j2').read_text(),
+        '/etc/systemd/journald.conf.d/99-portfolio.conf': journal,
+    }
 
 
 def operations(mode, inventory, key=None):
@@ -24,17 +39,29 @@ def operations(mode, inventory, key=None):
         'tcp_ports': inputs['firewall_allowed_tcp_ports'], 'verify': True,
         'refresh_rules': False, 'socket_candidate': False, 'report_only': True,
     }, managed_user)
-    operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py',
-                     {'verify': mode == 'verify-operations'}, managed_user)
+    expected = operations_expected()
+    planning = mode in ('setup-operations', 'apply-apt-policy')
+    params = {'verify': mode == 'verify-operations'} | ({'plan_expected': expected} if planning else {})
+    before = operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py', params, managed_user)
+    if planning:
+        require(isinstance(before, dict) and isinstance(before.get('plan'), dict), 'Operations plan unavailable; STOP.')
+        changes = before['plan']['changes']
+        require(isinstance(changes, dict) and all(type(value) is bool for value in changes.values()), 'Invalid operations plan; STOP.')
+        needed = changes['/etc/apt/apt.conf.d/99zz-portfolio-security'] if mode == 'apply-apt-policy' else any(changes.values())
+        if not needed:
+            print(PLAN_NOOP_MESSAGES.get(mode, 'Managed configuration already matches; no changes required.'))
+            return
+        print('Planned changes: ' + ', '.join(name for name, changed in changes.items() if changed and
+              (mode == 'setup-operations' or name == '/etc/apt/apt.conf.d/99zz-portfolio-security')))
+    def revalidate():
+        current = operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py', params, managed_user)
+        require(current['plan'] == before['plan'], 'Operations plan changed; STOP before mutation.')
     if mode in ('preview-apt-policy', 'apply-apt-policy'):
         preview = mode == 'preview-apt-policy'
         if not preview:
             require(sys.stdin.isatty(), 'APT-only application requires an interactive terminal.')
-            try:
-                answer = input('Apply only the single missing APT policy line? [y/N] ')
-            except (EOFError, KeyboardInterrupt):
-                answer = ''
-            require(answer.strip().lower() in ('y', 'yes'), 'APT-only application declined; no change requested.')
+            stage_consent(mode, inventory, key)
+            revalidate()
         variables = {
             'ansible_user': managed_user, 'ansible_connection': 'ssh',
             'ansible_private_key_file': str(key), 'ansible_host_key_checking': True,
@@ -57,11 +84,8 @@ def operations(mode, inventory, key=None):
     require(sys.stdin.isatty(), 'Operations setup requires an interactive terminal; no changes requested.')
     print('LIVE / MUTATING: security update policy, bounded journald retention and timers. '
           'Keep provider recovery access. No automatic reboot.', flush=True)
-    try:
-        answer = input('Apply server operations configuration? [y/N] ')
-    except (EOFError, KeyboardInterrupt):
-        answer = ''
-    require(answer.strip().lower() in ('y', 'yes'), 'Operations setup declined; no changes requested.')
+    stage_consent(mode, inventory, key)
+    revalidate()
     run_playbook(inventory, alias, {
         'ansible_user': managed_user, 'ansible_connection': 'ssh',
         'ansible_private_key_file': str(key), 'ansible_host_key_checking': True,

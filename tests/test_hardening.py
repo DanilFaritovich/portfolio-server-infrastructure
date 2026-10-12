@@ -33,6 +33,15 @@ adoption = load('ssh_adoption', 'library/portfolio_ssh_adopt.py')
 
 class HardeningTests(unittest.TestCase):
     def setUp(self):
+        planner = patch.object(access, 'hardening_plan', return_value={'changes_required': True, 'token': 'fixed'})
+        planner.start()
+        self.addCleanup(planner.stop)
+        prompt = patch('builtins.input', return_value='y')
+        prompt.start()
+        self.addCleanup(prompt.stop)
+        terminal = patch.object(access.sys.stdin, 'isatty', return_value=True)
+        terminal.start()
+        self.addCleanup(terminal.stop)
         import tempfile
         previous_umask = os.umask(0o022)
         self.addCleanup(os.umask, previous_umask)

@@ -29,6 +29,9 @@ human_info = load('human_info_module', 'library/portfolio_human_info.py')
 
 class HumanWrapperTests(unittest.TestCase):
     def setUp(self):
+        planner = patch.object(access, 'hardening_plan', return_value={'changes_required': True, 'token': 'fixed'})
+        planner.start()
+        self.addCleanup(planner.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
@@ -158,7 +161,7 @@ class HumanWrapperTests(unittest.TestCase):
     def test_add_user_preflight_creation_and_fresh_verification(self):
         with patch('builtins.input', side_effect=[self.public_key.strip(), 'yes']):
             access.human_access('add-user', self.inventory, self.automation)
-        self.assertEqual(self.events, ['automation', 'user_probe:preflight-add-user', 'add-user.yml',
+        self.assertEqual(self.events, ['automation', 'user_probe:preflight-add-user', 'user_probe:preflight-add-user', 'add-user.yml',
                                        'user_probe:show-user', 'user_probe:add-user-key'])
         variables = self.run_playbook.call_args.args[2]
         self.assertFalse(Path(variables['human_access_user_public_key_path']).exists())
@@ -170,7 +173,7 @@ class HumanWrapperTests(unittest.TestCase):
         imported_key.write_text(self.public_key)
         with patch.dict(os.environ, {'HUMAN_PUBLIC_KEY': str(imported_key)}):
             access.human_access('add-user', self.inventory, self.automation)
-        self.assertEqual(self.events, ['automation', 'user_probe:preflight-add-user', 'add-user.yml',
+        self.assertEqual(self.events, ['automation', 'user_probe:preflight-add-user', 'user_probe:preflight-add-user', 'add-user.yml',
                                        'user_probe:show-user', 'user_probe:add-user-key'])
         self.prepare_key.assert_not_called()
         self.verify_human.assert_not_called()
@@ -251,7 +254,7 @@ class HumanWrapperTests(unittest.TestCase):
     def test_secure_order_and_post_activation_failure_stops_later_checks(self):
         with patch('builtins.input', return_value='yes'):
             access.human_access('secure-ssh', self.inventory, self.automation)
-        self.assertEqual(self.events, ['automation', 'human', 'secure-ssh.yml', 'automation', 'human',
+        self.assertEqual(self.events, ['automation', 'human', 'human', 'secure-ssh.yml', 'automation', 'human',
                                        'verify-ssh-security.yml'])
         self.assertEqual(self.verify_auth_methods.call_count, 4)
         self.events.clear()
@@ -259,7 +262,7 @@ class HumanWrapperTests(unittest.TestCase):
         self.run_playbook.side_effect = subprocess.CalledProcessError(1, ['fixture'])
         with patch('builtins.input', return_value='yes'), self.assertRaisesRegex(ValueError, 'may already be installed'):
             access.human_access('secure-ssh', self.inventory, self.automation)
-        self.assertEqual(self.events, ['automation', 'human'])
+        self.assertEqual(self.events, ['automation', 'human', 'human'])
         self.verify_auth_methods.assert_not_called()
 
     def test_independent_verification_covers_every_selected_port(self):

@@ -251,7 +251,7 @@ class StandTests(unittest.TestCase):
                 patch.object(e2e, 'confirm') as consent, patch.object(e2e, 'command', side_effect=remove) as run:
             self.domains = []
             self.stand.delete()
-        self.assertEqual(consent.call_count, 2)
+        self.assertEqual(consent.call_count, 1)
         self.assertEqual(parents.call_count, 2)
         run.assert_called_once()
         self.assertFalse(self.stand.root.exists())
@@ -260,7 +260,7 @@ class StandTests(unittest.TestCase):
         with patch.object(e2e.os, 'access', return_value=False), \
                 patch.object(e2e.e2e_host, 'storage_parents'), \
                 patch.object(e2e.e2e_host.shutil, 'which', return_value='/usr/bin/sudo'), \
-                patch.object(e2e, 'confirm', side_effect=[None, ValueError('declined')]):
+                patch.object(e2e, 'confirm', side_effect=ValueError('declined')):
             with self.assertRaisesRegex(ValueError, 'declined'):
                 self.stand.delete()
         self.assertFalse(self.mutations())
@@ -318,6 +318,15 @@ class StandTests(unittest.TestCase):
         self.assertEqual(env['HOME'], str(self.stand.root / 'home'))
 
     def test_test_failure_stops_without_reset(self):
+        public = self.stand.root / 'home/.ssh/human/admin_ed25519.pub'
+        public.parent.mkdir(parents=True, exist_ok=True)
+        public.write_text('synthetic public identity')
+        prompt = patch('builtins.input', return_value='y')
+        prompt.start()
+        self.addCleanup(prompt.stop)
+        frontier = patch.dict(os.environ, E2E_FROM='bootstrap')
+        frontier.start()
+        self.addCleanup(frontier.stop)
         e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
         def command(args, **kwargs):
             if args[:4] == ['ip', '-j', 'route', 'get']:
@@ -360,7 +369,16 @@ class StandTests(unittest.TestCase):
                 self.stand.reset()
         self.assertFalse(self.mutations())
 
-    def test_test_sequence_retains_all_existing_confirmations(self):
+    def test_test_sequence_uses_one_bound_plan(self):
+        public = self.stand.root / 'home/.ssh/human/admin_ed25519.pub'
+        public.parent.mkdir(parents=True, exist_ok=True)
+        public.write_text('synthetic public identity')
+        prompt = patch('builtins.input', return_value='y')
+        prompt.start()
+        self.addCleanup(prompt.stop)
+        frontier = patch.dict(os.environ, E2E_FROM='bootstrap')
+        frontier.start()
+        self.addCleanup(frontier.stop)
         e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
         def run(args, **kwargs):
             return '[{"dev":"virbr-e2e"}]' if args[:4] == ['ip', '-j', 'route', 'get'] else ''
@@ -596,6 +614,30 @@ class StandTests(unittest.TestCase):
                 else:
                     e2e.convergence_command(['synthetic'], {})
 
+    def test_repeat_accepts_exact_noops_and_rejects_missing_evidence(self):
+        docker = yaml.safe_load((e2e.ROOT / 'playbooks/docker-host.yml').read_text())[0]['name']
+        smoke = yaml.safe_load((e2e.ROOT / 'playbooks/verify-docker.yml').read_text())[0]['name']
+        recaps = f'PLAY [{docker}] ***\ne2e : ok=10 changed=0 failed=0\nPLAY [{smoke}] ***\ne2e : ok=10 changed=3 failed=0\n'
+        for missing in (False, True):
+            messages = list(e2e.PLAN_NOOP_MESSAGES.values())
+            if missing:
+                messages.pop()
+            output = recaps + '\n'.join(messages) + '\n'
+            class Process:
+                stdout = io.BufferedReader(io.BytesIO(output.encode()))
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    pass
+                def wait(self):
+                    return 0
+            with patch.object(e2e.subprocess, 'Popen', return_value=Process()), contextlib.redirect_stdout(io.StringIO()):
+                if missing:
+                    with self.assertRaisesRegex(ValueError, 'changed=0'):
+                        e2e.convergence_command(['synthetic'], {})
+                else:
+                    e2e.convergence_command(['synthetic'], {})
+
     def test_child_guard_validates_args_environment_and_pins_trust(self):
         e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
         (self.stand.root / 'home/.ssh').mkdir(mode=0o700, parents=True)
@@ -603,6 +645,7 @@ class StandTests(unittest.TestCase):
         (self.stand.root / 'tmp').mkdir(mode=0o700)
         env = self.stand.child_env()
         env['ANSIBLE_SSH_EXECUTABLE'] = '/foreign'
+        env['PORTFOLIO_E2E_PLAN_FD'] = '123'
         argv = ['access.py', 'init-server', '--inventory', str(self.stand.inventory), '--key', '']
         with patch.object(e2e, 'Stand', return_value=self.stand), \
                 patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.base))), \
@@ -611,6 +654,7 @@ class StandTests(unittest.TestCase):
             e2e.configure_child()
             self.assertIn('UserKnownHostsFile="' + str(self.stand.root / 'home/.ssh/known_hosts'), e2e.common.SSH_BASE)
             self.assertNotIn('ANSIBLE_SSH_EXECUTABLE', os.environ)
+            self.assertEqual(os.environ['PORTFOLIO_E2E_PLAN_FD'], '123')
         argv[3] = '/production/never-read.yml'
         with patch.object(e2e, 'Stand', return_value=self.stand), \
                 patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.base))), \

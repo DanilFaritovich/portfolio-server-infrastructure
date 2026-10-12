@@ -17,6 +17,7 @@ the same commands, arguments, output formats and exit codes.
 | --- | --- |
 | `cli.py` | Argument parsing, locked server command dispatch, umask and sanitized failure/interruption errors. |
 | `common.py` | Repository root, default automation key path, SSH policy constants and validation guards. |
+| `plans.py` | Default-deny plans, snapshots of inputs/implementation, bounded nested consent and anonymous E2E child grants. |
 | `inventory.py` | Exclusive inventory creation, static inventory validation, access selection and hardening port inputs. |
 | `keys.py` | Key path/metadata validation, public key parsing and identity comparison, locked non-overwriting generation and temporary public snapshots. |
 | `local_keys.py` | Local human key selection, generation/show/copy/load commands and loading the selected identity into the invoking shell's existing agent. |
@@ -33,9 +34,10 @@ the same commands, arguments, output formats and exit codes.
 | `compat.py` | Isolated flat helper namespaces for legacy file-based imports of `access.py`. |
 
 Dependencies are explicit relative imports and form an acyclic graph. `common`
-has no package dependencies. `keys`, `ansible` and `inspection` depend only on
-`common`; `inventory` adds `keys`. `clipboard` uses `keys`; `host_trust` uses
-`inventory`, `keys` and `clipboard`. `local_keys` uses `keys` and `clipboard`;
+has no package dependencies. `plans` depends on `common`. `keys`, `ansible` and
+`inspection` depend only on `common`; `inventory` adds `keys`. `clipboard` uses
+`keys` and `plans`; `host_trust` uses `inventory`, `keys` and `clipboard`.
+`local_keys` uses `keys`, `clipboard` and `plans`;
 `ssh` uses `inventory`, `keys`, `local_keys` and `host_trust`. `verification`
 uses `ansible` and `keys`.
 
@@ -68,8 +70,11 @@ absence or authorizes mutation. Remaining stages use existing preflight/postflig
 and an explicit verifier at every dependency boundary; Stage 3 also runs its streamed
 inspector before application. No provisioning roles or recovery logic are duplicated.
 
-Initialization requires a TTY, prepared human admin key and default-deny plan
-confirmation. Stage-specific registration/recovery/operations confirmations remain.
+Initialization requires a TTY and prepared human admin key. One default-deny plan
+confirmation covers the listed remaining stages in this invocation, including the
+provider-console recovery attestation for final SSH policy. Read-only preflight
+may precede consent; confirmation occurs before the first planned change. Native
+password/passphrase, sudo and host-trust prompts remain separate.
 Errors, pending state, interruptions and log-write failures stop later dispatch.
 Continuation requires recovery diagnosis and explicit frontier selection, never
 log-based checkpoints, retry or rollback. Exclusive temporary JSONL files (0600)
@@ -79,10 +84,21 @@ stage (`run` events use whole-run time). Applying stages emit `applying` then
 Logs exclude output, exception text, inventory and identities. Terminal failures
 retain exact allowlisted static causes or safe process/I/O categories and the active
 command, never arbitrary exception text or raw stderr. EOF at frontier selection
-or plan confirmation cancels before host contact without traceback.
+or plan confirmation cancels before mutation without traceback; preflight may
+already have contacted the host.
 These are diagnostic records,
 not authority over server state. The terminal shows progress and verified stages
-while retaining existing stage diagnostics and prompts.
+while retaining existing stage diagnostics and native authentication prompts.
+
+`plans.py` stores authority only in a ContextVar for the active call stack. Nested
+plans can narrow authority and bind additional snapshots, never expand it. Input
+or implementation drift stops dispatch; errors reset the scope. Standalone changes
+use the same `Apply this plan? [y/N]` prompt. Exact read-only evidence permits
+hardening, final SSH policy, operations and managed-key registration to skip
+application when unchanged. Terminal public-key registration still confirms before
+host contact; explicit public-file automation retains its existing contract.
+Local setup compares pinned tool/collection readiness before offering downloads
+and inventory creation. Existing inventories are preserved without reading them.
 
 Other commands dispatch only their existing stage sequence. Initial password
 bootstrap uses `bootstrap_login_user`; managed paths select `ansible_user` and
@@ -337,10 +353,14 @@ The scenario launches existing `make init-server` and `make reboot-host` childre
 Before importing CLI transports, `access.py` invokes the E2E guard for these
 children: revalidate resources, bridge route/DHCP, exact inventory and fixed child
 inputs, then pin OpenSSH fixture trust. Paramiko uses isolated HOME. Production
-execution and legacy imports do not activate this guard. No roles, verifiers,
-password prompts or security/recovery confirmations are replaced. Numeric Ansible
-recaps prove repeat provisioning is unchanged (with the verifier's exact three
-Docker smoke changes); independent SSH probes and boot IDs cover persistence.
+execution and legacy imports do not activate this guard. The scenario's single
+plan covers key generation, selected initialization, repeat convergence and guest
+reboot. An inherited anonymous pipe transfers consent to exactly one guarded child
+invocation, bound to its mode/frontier and input snapshot; no persistent receipt or
+general environment yes switch exists. Roles, independent proofs and native
+authentication/host-trust prompts remain. Numeric Ansible recaps or exact managed
+no-op evidence prove repeat provisioning is unchanged (with the verifier's exact
+three Docker smoke changes); independent SSH probes and boot IDs cover persistence.
 Errors preserve state and diagnostic snapshots; continuation remains explicit.
 Offline mocked lifecycle tests join the existing unittest discovery; check/CI
 never depend on VM targets. Real compatibility/idempotency remain operator tests.

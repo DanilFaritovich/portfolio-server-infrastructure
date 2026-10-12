@@ -34,7 +34,7 @@ class AgentTests(unittest.TestCase):
                      patch.object(access.Path, 'home', return_value=self.home),
                      patch.object(access.shutil, 'which', return_value='/fixture/tool'),
                      patch.object(access.sys.stdin, 'isatty', return_value=False),
-                     patch('builtins.input', side_effect=AssertionError('Unexpected terminal prompt')),
+                     patch('builtins.input', return_value='y'),
                      patch.object(access.subprocess, 'run', side_effect=self.fingerprint)):
             mock.start()
             self.addCleanup(mock.stop)
@@ -88,33 +88,50 @@ class AgentTests(unittest.TestCase):
         return calls, prompt, output.getvalue() + errors.getvalue()
 
     def test_generation_policy_agent_and_terminal_matrix(self):
-        before = (self.key.stat().st_mtime_ns, self.public.read_text())
+        content = self.public.read_text()
         for policy in ('ask', 'yes', 'no'):
             for tty in (True, False):
                 for created in (True, False):
                     for state in ('unavailable', 'empty', 'loaded', 'add-error'):
-                        with self.subTest(policy=policy, tty=tty, created=created, state=state), \
-                                patch.object(access, 'prepare_human_key', return_value=created):
-                            calls, prompt, output = self.run_local_key(
-                                'yes', policy=policy, tty=tty, existing=state == 'loaded',
-                                available=state != 'unavailable', add_result=1 if state == 'add-error' else 0)
-                            requested = policy == 'yes' or (policy == 'ask' and created and tty)
-                            added = requested and tty and state in ('empty', 'add-error')
-                            self.assertEqual(prompt.call_count, int(policy == 'ask' and created and tty))
-                            self.assertEqual(any(cmd[:2] == ['ssh-add', '-l'] for cmd, _ in calls), requested)
-                            self.assertEqual(any(cmd[:2] == ['ssh-add', '-q'] for cmd, _ in calls), added)
-                            failed = requested and (state == 'unavailable' or
-                                                    (state != 'loaded' and (not tty or state == 'add-error')))
-                            self.assertEqual('agent loading failed' in output, failed)
-                            self.assertEqual((self.key.stat().st_mtime_ns, self.public.read_text()), before)
+                        with self.subTest(policy=policy, tty=tty, created=created, state=state):
+                            if created:
+                                self.key.unlink(missing_ok=True)
+                                self.public.unlink(missing_ok=True)
+                            def prepare(*args, **kwargs):
+                                if created:
+                                    self.key.touch(mode=0o600)
+                                    self.public.write_text(content)
+                                self.public.chmod(0o644)
+                                return created
+                            try:
+                                with patch.object(access, 'prepare_human_key', side_effect=prepare):
+                                    if created and not tty:
+                                        with self.assertRaisesRegex(ValueError, 'interactive terminal'):
+                                            self.run_local_key('yes', policy=policy, tty=tty)
+                                        continue
+                                    calls, prompt, output = self.run_local_key(
+                                        'yes', policy=policy, tty=tty, existing=state == 'loaded',
+                                        available=state != 'unavailable', add_result=1 if state == 'add-error' else 0)
+                                requested = policy == 'yes' or (policy == 'ask' and created)
+                                added = requested and tty and state in ('empty', 'add-error')
+                                prompts = int(created or (requested and tty and state in ('empty', 'add-error')))
+                                self.assertEqual(prompt.call_count, prompts)
+                                self.assertEqual(any(cmd[:2] == ['ssh-add', '-l'] for cmd, _ in calls), requested)
+                                self.assertEqual(any(cmd[:2] == ['ssh-add', '-q'] for cmd, _ in calls), added)
+                                self.assertEqual(self.public.read_text(), content)
+                            finally:
+                                if not self.key.exists():
+                                    self.key.touch(mode=0o600)
+                                if not self.public.exists():
+                                    self.public.write_text(content)
+                                self.public.chmod(0o644)
 
     def test_generation_without_agent_socket_preserves_key(self):
         for socket in (None, '', str(self.home / 'nonexistent.sock')):
             with self.subTest(socket=socket), patch.object(access, 'prepare_human_key', return_value=True):
                 calls, prompt, output = self.run_local_key('yes', socket=socket, available=False)
-                prompt.assert_called_once()
-                self.assertIn('SSH agent unavailable', output)
-                self.assertIn('Key preserved', output)
+                prompt.assert_not_called()
+                self.assertIn('Agent loading skipped', output)
                 self.assertFalse(any(cmd[:2] == ['ssh-add', '-q'] for cmd, _ in calls))
                 self.assertEqual(self.key.stat().st_mode & 0o777, 0o600)
 
@@ -139,20 +156,30 @@ class AgentTests(unittest.TestCase):
                         self.assertRaisesRegex(ValueError, 'SSH agent unavailable'):
                     access.local_key('load-user-key')
 
-    def test_new_pair_yes_enter_and_no_prompt_choices(self):
-        for answer, wants_add in [('Y', True), ('', True), ('N', False)]:
-            with self.subTest(answer=answer):
-                self.key.unlink()
-                self.public.unlink()
+    def test_new_pair_requires_default_deny_plan_before_generation(self):
+        content = self.public.read_text()
+        for answer in ('', 'N', 'Y'):
+            self.key.unlink(missing_ok=True)
+            self.public.unlink(missing_ok=True)
+            def prepare(*args, **kwargs):
                 self.key.touch(mode=0o600)
-                self.public.write_text(PUBLIC + ' test\n')
+                self.public.write_text(content)
                 self.public.chmod(0o644)
-                with patch.object(access, 'prepare_human_key', return_value=True):
-                    calls, prompt, output = self.run_local_key(answer)
-                self.assertEqual(any(command[0] == 'ssh-add' and command[1] != '-l'
-                                     for command, _ in calls), wants_add)
-                self.assertEqual(prompt.call_count, 1)
-                self.assertEqual('SSH key added to ssh-agent successfully.' in output, wants_add)
+                return True
+            try:
+                with patch.object(access, 'prepare_human_key', side_effect=prepare) as create:
+                    if answer != 'Y':
+                        with self.assertRaisesRegex(ValueError, 'declined'):
+                            self.run_local_key(answer)
+                        create.assert_not_called()
+                    else:
+                        calls, prompt, output = self.run_local_key(answer)
+                        self.assertEqual(prompt.call_count, 1)
+                        self.assertTrue(any(cmd[:2] == ['ssh-add', '-q'] for cmd, _ in calls))
+            finally:
+                self.key.touch(mode=0o600)
+                self.public.write_text(content)
+                self.public.chmod(0o644)
 
     def test_no_tty_never_prompts_or_loads_but_loaded_identity_succeeds(self):
         with patch.object(access, 'prepare_human_key', return_value=True):
@@ -167,19 +194,14 @@ class AgentTests(unittest.TestCase):
     def test_agent_load_policy_and_generation_prompt_validation(self):
         for policy in ('yes', 'no'):
             with self.subTest(policy=policy), patch.object(access, 'prepare_human_key', return_value=True):
-                calls, prompt, _ = self.run_local_key('n', policy=policy)
+                calls, prompt, _ = self.run_local_key('y', policy=policy)
                 self.assertEqual(any(command[0] == 'ssh-add' and command[1] != '-l'
                                      for command, _ in calls), policy == 'yes')
-                prompt.assert_not_called()
+                self.assertEqual(prompt.call_count, int(policy == 'yes'))
         with patch.object(access, 'prepare_human_key', return_value=True), \
                 self.assertRaisesRegex(ValueError, 'AGENT_LOAD'):
             with patch.dict(os.environ, {**self.env, 'AGENT_LOAD': 'maybe'}, clear=True):
                 access.local_key('generate-user-key')
-        with patch.object(access, 'prepare_human_key', return_value=True), \
-                patch.dict(os.environ, {**self.env, 'AGENT_LOAD': 'ask'}, clear=True), \
-                patch.object(access.sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value='?'), \
-                self.assertRaisesRegex(ValueError, 'Answer Y or N'):
-            access.local_key('generate-user-key')
 
     def test_load_errors_fingerprint_selection_and_post_add_confirmation(self):
         for code in (1, 2):

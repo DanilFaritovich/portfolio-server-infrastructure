@@ -26,6 +26,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
+from .plans import PLAN_NOOP_MESSAGES, plan_code_snapshot, plan_scope, e2e_plan_pipe
 from . import common, e2e_host, e2e_images, e2e_readiness
 from .e2e_images import E2EError, require
 from .common import ROOT
@@ -74,7 +75,7 @@ def agent_failure_reason(stderr):
     return 'unrecognized guest-agent transport failure; inspect libvirt and guest-agent locally'
 
 
-def command(argv, *, capture=True, input=None, timeout=60, env=None, agent_boot=False):
+def command(argv, *, capture=True, input=None, timeout=60, env=None, agent_boot=False, pass_fds=()):
     """Never echo arguments/output on failure (cloud-init and prompts are private)."""
     if agent_boot:
         require(argv[:4] == ['virsh', '--connect', URI, 'qemu-agent-command'] and capture,
@@ -91,7 +92,7 @@ def command(argv, *, capture=True, input=None, timeout=60, env=None, agent_boot=
         for name in ('PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV'):
             child_env.pop(name, None)
     result = subprocess.run(argv, input=input, text=True, capture_output=capture,
-                            timeout=timeout, env=child_env, check=False)
+                            timeout=timeout, env=child_env, check=False, **({"pass_fds": pass_fds} if pass_fds else {}))
     if agent_boot:
         # This exact boot condition is expected. Other libvirt failures are blockers.
         if result.returncode != 0 and (result.stderr or '').strip() in AGENT_DISCONNECTED_ERRORS:
@@ -107,11 +108,13 @@ def virsh(*args):
     return command(['virsh', '--connect', URI, *args]).strip()
 
 
-def convergence_command(argv, env):
+def convergence_command(argv, env, pass_fds=()):
     """Stream interactive output; retain only numeric recap counts, never a log."""
     smoke = yaml.safe_load((ROOT / 'playbooks/verify-docker.yml').read_text())[0]['name']
     required = {yaml.safe_load((ROOT / 'playbooks' / name).read_text())[0]['name'] for name in
                 ('docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml')}
+    noops = {message: yaml.safe_load((ROOT / 'playbooks' / (mode + '.yml')).read_text())[0]['name']
+             for mode, message in PLAN_NOOP_MESSAGES.items()}
     seen, failed, play = set(), False, None
     # Keep stdin/stderr on the invoking terminal. input() flushes its prompt,
     # but line iteration hides it until a newline arrives. read1() instead
@@ -122,6 +125,8 @@ def convergence_command(argv, env):
 
     def recap_line(line):
         nonlocal play, failed
+        if line.strip() in noops:
+            seen.add(noops[line.strip()])
         title = re.match(r'^PLAY \[(.+)\]', line)
         if title:
             play = title[1] if title[1] in required | {smoke} else None
@@ -148,7 +153,7 @@ def convergence_command(argv, env):
                     recap_line(pending)
                 pending, oversized = '', False
 
-    with subprocess.Popen(argv, stdout=subprocess.PIPE, env=child_env) as process:
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, env=child_env, **({"pass_fds": pass_fds} if pass_fds else {})) as process:
         try:
             while chunk := process.stdout.read1(4096):
                 forward(decoder.decode(chunk))
@@ -173,7 +178,8 @@ def convergence_command(argv, env):
 def confirm(message):
     require(sys.stdin.isatty(), 'E2E requires a TTY for this operation.')
     try:
-        answer = input(message + ' [y/N] ')
+        print('Plan:\n  - ' + message, flush=True)
+        answer = input('Apply this plan? [y/N] ')
     except EOFError:
         answer = ''
     require(answer.strip().lower() in ('y', 'yes'), 'E2E operation declined.')
@@ -524,18 +530,42 @@ class Stand:
             return
         require(not self.root.exists() and not self.root.is_symlink(), 'Existing E2E directory without state; inspect manually.')
         profile = e2e_images.select(os.environ.get('E2E_DISTRO'))
-        result = e2e_host.prepare(self.storage, command=command, confirm=confirm, safe_path=safe_path)
-        if result is e2e_host.PreparationResult.REBOOT_REQUIRED:
-            return result
-        require(not list(self.storage.iterdir()), 'E2E storage must be empty; no disk will be overwritten.')
         config = {'subnet': os.environ.get('E2E_SUBNET') or '192.168.231.0/24',
                   'cpus': int(os.environ.get('E2E_CPUS') or '2'), 'memory': int(os.environ.get('E2E_MEMORY') or '4096'),
                   'size': int(os.environ.get('E2E_DISK_GB') or '25')}
         self.validate_config(config)
         self.state = dict(config, schema=2, distro=profile['id'], phase='preparing', uuid=str(uuid.uuid4()), network_uuid=str(uuid.uuid4()),
                           mac='52:54:00:' + ':'.join(f'{b:02x}' for b in os.urandom(3)))
+        creation_plan = (f'Create the local {profile["name"]} E2E VM: {config["cpus"]} CPUs, '
+                         f'{config["memory"]} MiB RAM, {config["size"]} GiB disk; dedicated NAT {config["subnet"]}; '
+                         f'write fixture files under {self.root} and disks under {self.storage}; '
+                         'download/check the official cloud image; refresh guest APT indexes and install/start '
+                         'only qemu-guest-agent, enable initial root/password console/SSH access. '
+                         'Rights: controller filesystem writes and root-equivalent system libvirt access. '
+                         'Console recovery/readiness and baseline shutdown require a later concrete plan.')
+        creation_approved = False
+        selected = tuple(os.environ.get(name) for name in ('E2E_DISTRO', 'E2E_CPUS', 'E2E_MEMORY', 'E2E_DISK_GB', 'E2E_SUBNET', 'E2E_IMAGE_SHA256'))
+        def host_confirm(message):
+            nonlocal creation_approved
+            if message.startswith(('Create the new dedicated', 'Finish this empty')):
+                self.no_overlap()
+                confirm(message + ' ' + creation_plan)
+                creation_approved = True
+            else:
+                confirm(message)
+            require(selected == tuple(os.environ.get(name) for name in ('E2E_DISTRO', 'E2E_CPUS', 'E2E_MEMORY', 'E2E_DISK_GB', 'E2E_SUBNET', 'E2E_IMAGE_SHA256')),
+                    'E2E plan inputs changed; STOP.')
+        result = e2e_host.prepare(self.storage, command=command, confirm=host_confirm, safe_path=safe_path)
+        if result is e2e_host.PreparationResult.REBOOT_REQUIRED:
+            self.state = None
+            return result
+        require(not list(self.storage.iterdir()), 'E2E storage must be empty; no disk will be overwritten.')
         self.no_overlap()
-        confirm(f'Create the local E2E VM/NAT, download {profile["name"]} official cloud image and install qemu-guest-agent in the guest?')
+        if not creation_approved:
+            host_confirm(creation_plan)
+        self.no_overlap()
+        require(not self.root.exists() and not self.root.is_symlink() and not list(self.storage.iterdir()),
+                'E2E creation paths changed; STOP before fixture creation.')
         password = disposable_password()
         hashed = command(['openssl', 'passwd', '-6', '-stdin'], input=password + '\n').strip()
         require(re.fullmatch(r'\$6\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{86}', hashed), 'Invalid password hash; preparation stopped.')
@@ -673,9 +703,9 @@ class Stand:
         snapshots = self.snapshots() if domain else []
         self.deletion_paths()  # All path checks precede the first mutation.
         self.no_foreign_users()
-        confirm('Delete only the owned E2E VM, snapshots, NAT, disks and local fixture files?')
-        if sudo_rmdir:
-            confirm('Use sudo only to remove the empty dedicated E2E disk directory after deleting owned resources?')
+        confirm('Gracefully stop and delete only the owned E2E VM, snapshots, NAT, disks and local fixture files.' +
+                (' Use sudo only to remove the empty dedicated E2E disk directory.' if sudo_rmdir else
+                 ' Rights: current controller with system libvirt access.'))
         require((domain, network) == self.resources(), 'Resources changed during confirmation; STOP.')
         self.no_foreign_users()
         if domain:
@@ -797,10 +827,12 @@ class Stand:
         if frontier:
             env['INIT_FROM'] = frontier
         argv = ['make', '--no-print-directory', mode]
-        if unchanged:
-            convergence_command(argv, env)
-        else:
-            command(argv, capture=False, timeout=None, env=env)
+        with e2e_plan_pipe(self.inventory, env, mode) as (child_env, descriptors):
+            if unchanged:
+                convergence_command(argv, child_env, **({'pass_fds': descriptors} if descriptors else {}))
+            else:
+                command(argv, capture=False, timeout=None, env=child_env,
+                        **({'pass_fds': descriptors} if descriptors else {}))
 
     def independent(self):
         self.ready(running=True)
@@ -843,24 +875,50 @@ class Stand:
         self.check_inventory(self.inventory)
         self.ready(running=True)
         require(sys.stdin.isatty(), 'E2E test is interactive; no automatic confirmations.')
-        # Generate the human identity using the existing local-only key workflow.
         env = self.child_env()
         env['AGENT_LOAD'] = 'ask'
-        command(['make', '--no-print-directory', 'generate-user-key'], capture=False, timeout=None, env=env)
         frontier = os.environ.get('E2E_FROM', '')
-        require(frontier in ('', 'bootstrap', 'docker', 'hardening', 'human', 'ssh', 'operations', 'verify'), 'Invalid E2E_FROM.')
-        self.cli('init-server', frontier or None)
-        self.cli('init-server', 'verify')
-        self.independent()
-        confirm('Run convergence again from docker, retaining all existing stage confirmations?')
-        self.cli('init-server', 'docker', unchanged=True)
-        self.cli('init-server', 'verify')
-        before = self.independent()
-        self.cli('reboot-host')  # Existing recovery and explicit reboot confirmation remain.
-        self.cli('init-server', 'verify')
-        after = self.independent()
-        require(before != after, 'Reboot did not produce a new independently observed boot ID; STOP.')
-        print('E2E passed: installation/verification/repeat changed=0/reboot.')
+        if not frontier:
+            frontier = input('E2E_FROM (bootstrap/docker/hardening/human/ssh/operations/verify; no default): ').strip()
+        require(frontier in ('bootstrap', 'docker', 'hardening', 'human', 'ssh', 'operations', 'verify'), 'Invalid E2E_FROM.')
+        print('E2E plan: initialize from ' + frontier + '; verify all stages; repeat convergence from docker '
+              'and require provisioning changed=0; reboot this owned guest; verify again and prove a new boot ID. '
+              'No reset/delete or host installation. Retain guest console recovery.')
+        print('Human key path: ' + env['HUMAN_KEY'] + '; admin account: e2e_admin; sudo: unrestricted NOPASSWD.')
+        modes = ['docker-host', 'harden', 'add-user', 'secure-ssh', 'setup-operations', 'reboot-host']
+        if frontier == 'bootstrap':
+            modes.insert(0, 'bootstrap-user')
+        public = Path(env['HUMAN_PUBLIC_KEY'])
+        private = Path(env['HUMAN_KEY'])
+        missing = not public.exists() and not private.exists()
+        if missing:
+            modes.insert(0, 'generate-user-key')
+        identity = public.read_bytes() if public.exists() else None
+        expected_inventory = self.inventory.read_bytes()
+        def snapshot():
+            self.ready(running=True)
+            self.check_inventory(self.inventory)
+            require((public.read_bytes() if public.exists() else None) == identity,
+                    'Human public identity changed; STOP.')
+            return self.inventory.read_bytes(), tuple(sorted(env.items())), plan_code_snapshot()
+        with plan_scope(modes, snapshot):
+            with e2e_plan_pipe(self.inventory, env, 'generate-user-key') as (child_env, descriptors):
+                command(['make', '--no-print-directory', 'generate-user-key'], capture=False, timeout=None, env=child_env,
+                        **({'pass_fds': descriptors} if descriptors else {}))
+            # A generated identity is an explicit planned output, not discovery/adoption.
+            identity = public.read_bytes()
+            require(self.inventory.read_bytes() == expected_inventory, 'E2E inventory changed during key preparation; STOP.')
+            self.cli('init-server', frontier)
+            self.cli('init-server', 'verify')
+            self.independent()
+            self.cli('init-server', 'docker', unchanged=True)
+            self.cli('init-server', 'verify')
+            before = self.independent()
+            self.cli('reboot-host')
+            self.cli('init-server', 'verify')
+            after = self.independent()
+            require(before != after, 'Reboot did not produce a new independently observed boot ID; STOP.')
+            print('E2E passed: installation/verification/repeat changed=0/reboot.')
 
 
 def configure_child():
@@ -887,7 +945,7 @@ def configure_child():
     env = stand.child_env()
     for name in ('HUMAN_KEY', 'HUMAN_PUBLIC_KEY', 'HUMAN_USER', 'HUMAN_SUDO', 'ANSIBLE_CONFIG', 'TMPDIR'):
         require(os.environ.get(name) == env[name], 'Foreign E2E identity/configuration forbidden.')
-    for name in ('INIT_FROM', 'AGENT_LOAD'):
+    for name in ('INIT_FROM', 'AGENT_LOAD', 'PORTFOLIO_E2E_PLAN_FD'):
         if name in os.environ:
             env[name] = os.environ[name]
     # Native Ansible and local-key children must not inherit arbitrary injected

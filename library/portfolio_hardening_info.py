@@ -923,6 +923,29 @@ def inspect(module):
                                'Configured TCP ports must be allowed at runtime for IPv4 and IPv6.')
 
     summary = checks.result()
+    if module.params.get('plan_requested', False):
+        summary['plan'] = {
+            'changes_required': any(item['status'] != 'PASS' for item in checks.items),
+            'token': hashlib.sha256(json.dumps(
+                [result, checks.items, status, sorted(rules) if rules is not None else None,
+                 sorted(effective_ports) if effective_ports is not None else None,
+                 sorted(live_ports) if live_ports is not None else None], sort_keys=True).encode()).hexdigest(),
+        }
+        if module.params.get('security_plan') and summary['ready']:
+            security = {'__name__': 'portfolio_security_plan'}
+            exec(SECURITY_PLAN_SOURCE, security)
+            module.params['sources'] = sources
+            module.params['ssh_ports'] = ssh_ports
+            original = security['snapshot'](module)
+            updated = security['candidate'](original)
+            pending = Path(security['PENDING'])
+            require(not pending.exists() and not pending.is_symlink(), 'Pending final SSH activation; STOP.')
+            needed = updated != original[security['MAIN']]
+            if not needed:
+                security['policy_valid'](security['effective'](module), ssh_ports)
+            security['unchanged'](original)
+            summary['plan']['changes_required'] = needed
+        return summary
     if module.params.get('report_only', False):
         # Public inspection exposes only fixed diagnoses, never fingerprints,
         # adoption source paths/records or command/configuration contents.

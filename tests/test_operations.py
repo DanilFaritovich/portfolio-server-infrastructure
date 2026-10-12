@@ -44,6 +44,8 @@ Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
 
 class OperationsInspectorTests(unittest.TestCase):
     def setUp(self):
+        previous_umask = os.umask(0o022)
+        self.addCleanup(os.umask, previous_umask)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -234,6 +236,25 @@ class OperationsInspectorTests(unittest.TestCase):
     def test_converged_is_ready_without_writes(self):
         result = info.inspect(True)
         self.assertTrue(result['ready'], result['report'])
+
+    def test_plan_exact_noop_and_configuration_change_token(self):
+        expected = {path: (self.root / path.lstrip('/')).read_text() for path in (info.APT, info.JOURNAL)}
+        before = info.operations_plan(expected)
+        self.assertFalse(any(before['changes'].values()))
+        self.write(info.JOURNAL, expected[info.JOURNAL].replace('256M', '128M'))
+        after = info.operations_plan(expected)
+        self.assertTrue(after['changes'][info.JOURNAL])
+        self.assertNotEqual(before['token'], after['token'])
+
+    def test_plan_query_failures_never_become_missing_packages_or_timers(self):
+        expected = {path: (self.root / path.lstrip('/')).read_text() for path in (info.APT, info.JOURNAL)}
+        for argv in (('dpkg-query', '-W', '-f=${Status}', 'unattended-upgrades', 'logrotate'),
+                     ('systemctl', 'is-active', 'logrotate.timer'), ('apt-config', 'dump')):
+            with self.subTest(argv=argv):
+                self.overrides[argv] = (99, 'synthetic failure')
+                with self.assertRaises(ValueError):
+                    info.operations_plan(expected)
+                del self.overrides[argv]
 
     def test_missing_policy_warns_before_setup_and_fails_verification(self):
         self.overrides[('apt-config', 'dump')] = (0, '\n'.join(line for line in SECURE_APT_DUMP.splitlines() if line.startswith('Dir')) + '\n')
@@ -590,7 +611,7 @@ class OperationsWrapperTests(unittest.TestCase):
         self.stack.enter_context(patch.object(access, 'load_host', return_value=('fixture', 'fixture.example.test', 2222, 'root', '/usr/bin/python3')))
         self.stack.enter_context(patch.object(access, 'hardening_inputs', return_value={'ssh_listen_ports': [2222], 'firewall_allowed_tcp_ports': [80, 443]}))
         self.real_probe = access.operations_probe
-        self.probe = self.stack.enter_context(patch.object(access, 'operations_probe'))
+        self.probe = self.stack.enter_context(patch.object(access, 'operations_probe', return_value={'plan': {'changes': {'/etc/apt/apt.conf.d/99zz-portfolio-security': True}, 'token': 'fixed'}}))
         self.playbook = self.stack.enter_context(patch.object(access, 'run_playbook'))
         self.stack.enter_context(patch('builtins.print'))
 

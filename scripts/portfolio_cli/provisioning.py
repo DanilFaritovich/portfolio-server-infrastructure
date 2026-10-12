@@ -6,9 +6,10 @@ import sys
 from .ansible import prerequisites, run_playbook
 from .common import PASSWORD_CONNECTION, SSH_BASE, require
 from .host_trust import known_host
-from .inspection import inspect_host
+from .inspection import inspect_host, hardening_plan
 from .inventory import hardening_inputs, load_host, managed_access
 from .keys import check_key, prepare_key
+from .plans import PLAN_NOOP_MESSAGES, stage_consent
 from .verification import verify_hardening
 
 
@@ -22,6 +23,10 @@ def live(mode, inventory, key=None):
             raise ValueError('Managed access is not ready. Run make bootstrap-user first; check the dedicated key pair.') from None
     alias, host, port, user, interpreter = load_host(inventory, validate_hardening=mode != 'inspect-hardening')
     inputs = hardening_inputs(inventory, alias, port, validate=mode != 'inspect-hardening') if mode in ('harden', 'verify-hardening', 'inspect-hardening', 'reboot-host') else {}
+    if mode in ('bootstrap-user', 'docker-host', 'harden', 'reboot-host'):
+        print(f'Target: {host}:{port}; managed account: {managed_user}; key path: {key}.')
+        if inputs:
+            print('SSH listeners: ' + str(inputs['ssh_listen_ports']) + '; allowed TCP: ' + str(inputs['firewall_allowed_tcp_ports']))
     if mode == 'reboot-host':
         require(sys.stdin.isatty(), 'Reboot requires an interactive terminal; no reboot was requested.')
     if mode == 'bootstrap-user':
@@ -33,6 +38,7 @@ def live(mode, inventory, key=None):
     if mode == 'bootstrap-user':
         require(sys.stdin.isatty(), 'Bootstrap requires an interactive terminal for the Ansible password prompt.')
         print(f'LIVE / MUTATING: configures {managed_user} and approves unrestricted NOPASSWD sudo.', flush=True)
+        stage_consent(mode, inventory, key)
         prepare_key(key)
     else:
         check_key(key)
@@ -67,11 +73,7 @@ def live(mode, inventory, key=None):
     if mode == 'reboot-host':
         print(f'LIVE / MUTATING: reboot {host}:{port}. Keep provider console/recovery access. '
               'Docker verification afterward may change the image cache.', flush=True)
-        try:
-            answer = input('Reboot this host now? [y/N] ')
-        except (EOFError, KeyboardInterrupt):
-            answer = ''
-        require(answer.strip().lower() in ('y', 'yes'), 'Reboot declined; no reboot was requested.')
+        stage_consent(mode, inventory, key)
         stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
         stage['ansible_become_flags'] = '-n'
         phase = 'reboot and bounded SSH recovery'
@@ -93,6 +95,8 @@ def live(mode, inventory, key=None):
               'LIVE / VERIFY: Docker checks and disposable runtime smoke test (image cache may change).', flush=True)
         # Host-level ansible_become=False would override task-level become=True.
         stage = {name: value for name, value in managed.items() if name != 'ansible_become'}
+        if mode == 'docker-host':
+            stage_consent(mode, inventory, key)
         run_playbook(inventory, alias, stage | {'ansible_become_flags': '-n'}, mode + '.yml')
         if mode == 'docker-host':
             run_playbook(inventory, alias, stage | {'ansible_become_flags': '-n'}, 'verify-docker.yml')
@@ -101,6 +105,13 @@ def live(mode, inventory, key=None):
         stage['ansible_become_flags'] = '-n'
         if mode == 'harden':
             print('LIVE / MUTATING: UFW and SSH listening ports. Keep provider recovery console access.', flush=True)
-            run_playbook(inventory, alias, stage | inputs, 'harden.yml')
+            before = hardening_plan(host, port, interpreter, key, inputs, managed_user)
+            if before['changes_required']:
+                stage_consent(mode, inventory, key)
+                require(hardening_plan(host, port, interpreter, key, inputs, managed_user) == before,
+                        'Hardening plan changed; STOP before mutation.')
+                run_playbook(inventory, alias, stage | inputs, 'harden.yml')
+            else:
+                print(PLAN_NOOP_MESSAGES[mode])
         verify_hardening(inventory, alias, host, port, stage, inputs)
     print('Requested stage completed. STOP.')

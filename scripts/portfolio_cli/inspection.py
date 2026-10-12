@@ -75,6 +75,9 @@ def operations_probe(host, port, interpreter, key, module, params, user):
     login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False, timeout=30)
     require(login.returncode == 0 and login.stdout.strip() == user, 'Managed key-only SSH access failed.')
     payload = '__name__ = "portfolio_inspection"\n' + (ROOT / 'library' / module).read_text()
+    if params.get('security_plan'):
+        source = (ROOT / 'library/portfolio_ssh_security.py').read_text().replace('from ansible.module_utils.basic import AnsibleModule', '')
+        payload += '\nSECURITY_PLAN_SOURCE = ' + repr(source) + '\n'
     payload += '\ninspect_stream(json.loads(' + repr(json.dumps(params)) + '))\n'
     process = subprocess.run(ssh + ['sudo -n ' + shlex.quote(interpreter) + ' -I -B -'],
                              input=payload, capture_output=True, text=True, check=False, timeout=300)
@@ -86,3 +89,15 @@ def operations_probe(host, port, interpreter, key, module, params, user):
         raise ValueError('Managed sudo or read-only inspection failed; review manually.') from None
     print(result['report'])
     require(result['ready'], 'Resolve FAIL findings manually before proceeding.')
+    return result
+
+
+def hardening_plan(host, port, interpreter, key, inputs, user, security=False):
+    params = {'current_port': port, 'ssh_ports': inputs['ssh_listen_ports'],
+              'tcp_ports': inputs['firewall_allowed_tcp_ports'], 'verify': security,
+              'refresh_rules': False, 'socket_candidate': False, 'report_only': True,
+              'plan_requested': True, 'security_plan': security}
+    result = operations_probe(host, port, interpreter, key, 'portfolio_hardening_info.py', params, user)
+    plan = result['plan']
+    require(type(plan['changes_required']) is bool and isinstance(plan['token'], str), 'Invalid hardening plan; STOP.')
+    return plan

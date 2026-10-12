@@ -491,7 +491,7 @@ class WrapperTests(unittest.TestCase):
     def test_remove_proves_recovery_before_confirmation_and_verifies_after(self):
         with patch('builtins.input', side_effect=lambda *args: self.events.append('confirm') or 'yes'):
             access.user_management('remove-user', Path('/synthetic/inventory'))
-        self.assertEqual(['managed-proof', 'inspect', 'inspect', 'recovery-proof', 'confirm', 'mutate', 'managed-proof'], self.events)
+        self.assertEqual(['managed-proof', 'inspect', 'inspect', 'recovery-proof', 'confirm', 'inspect', 'mutate', 'managed-proof'], self.events)
 
     def test_existing_user_import_skips_account_role_and_never_needs_import_private_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -502,11 +502,11 @@ class WrapperTests(unittest.TestCase):
                     patch.object(access, 'public_fingerprint', return_value='SHA256:synthetic'), \
                     patch.object(access, 'public_key_file', side_effect=lambda value: Path(value)), \
                     patch.object(access, 'verify_hardening'), \
-                    patch.object(access, 'user_probe', return_value={'existing': True, 'token': 'fresh'}) as probe, \
+                    patch.object(access, 'user_probe', return_value={'existing': True, 'token': 'fresh', 'keys': []}) as probe, \
                     patch.object(access, 'run_playbook') as playbook:
                 access.human_access('add-user', Path('/synthetic/inventory'))
             playbook.assert_not_called()
-            self.assertEqual(['preflight-add-user', 'add-user-key'], [call.args[-1]['action'] for call in probe.call_args_list])
+            self.assertEqual(['preflight-add-user', 'show-user', 'preflight-add-user', 'add-user-key'], [call.args[-1]['action'] for call in probe.call_args_list])
             self.assertEqual(key(2), probe.call_args.args[-1]['key'])
         self.assertNotIn('recovery-proof', self.events)
 

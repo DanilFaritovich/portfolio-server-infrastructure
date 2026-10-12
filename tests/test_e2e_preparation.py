@@ -177,7 +177,7 @@ class HostTests(unittest.TestCase):
         self.run.assert_not_called()
 
     def test_install_only_missing_then_reprobe(self):
-        self.missing.side_effect = [['virtinst'], []]
+        self.missing.side_effect = [['virtinst'], ['virtinst'], []]
         self.prepare()
         apt = [call.args[0] for call in self.run.call_args_list if call.args[0][0] == 'sudo']
         self.assertEqual(apt, [['sudo', '--', 'apt-get', 'update'],

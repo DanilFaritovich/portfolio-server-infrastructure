@@ -22,7 +22,7 @@ class SetupTests(unittest.TestCase):
         self.bin.mkdir()
         (self.root / 'scripts').mkdir()
         (self.root / 'inventories').mkdir()
-        for name in ('setup.sh', 'install-uv.sh', 'install-actionlint.sh', 'access.py'):
+        for name in ('setup.sh', 'install-uv.sh', 'install-actionlint.sh', 'access.py', 'setup-ready.py'):
             shutil.copy(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         shutil.copytree(
             ROOT / 'scripts' / 'portfolio_cli',
@@ -40,7 +40,8 @@ class SetupTests(unittest.TestCase):
         for name in ('ssh', 'ssh-keygen', 'ssh-keyscan', 'scp', 'sftp'):
             self.executable(self.bin / name, 'exit 99')
         self.executable(self.bin / 'uname', 'case "$1" in -s) echo Linux ;; -m) echo "${FIXTURE_ARCH:-x86_64}" ;; esac')
-        self.executable(self.bin / 'sha256sum', '''cat >/dev/null
+        self.executable(self.bin / 'sha256sum', '''case "$1" in -c|--check) ;; *) exec /usr/bin/sha256sum "$@" ;; esac
+cat >/dev/null
 printf 'checksum\n' >> "$CALL_LOG"
 [ "${CHECKSUM_FAIL:-0}" != 1 ]''')
         self.executable(self.bin / 'curl', '''printf 'download\n' >> "$CALL_LOG"
@@ -98,7 +99,7 @@ exec "$FIXTURE_PYTHON" "$@"''')
 
     def run_setup(self, mode='setup'):
         result = subprocess.run(['/bin/sh', 'scripts/setup.sh', mode], cwd=self.root,
-                                env=self.env, capture_output=True, text=True)
+                                env=self.env, input='y\n', capture_output=True, text=True)
         return result
 
     def calls(self):

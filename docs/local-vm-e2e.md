@@ -302,11 +302,12 @@ The child pins the fixture known_hosts in OpenSSH and uses isolated HOME for
 Paramiko. Production inventory/private material is never read by E2E.
 
 `e2e-test` uses **real `make init-server`**, existing password bootstrap,
-Ansible roles, independent key-only SSH/sudo, existing stage verifiers and all
-registration/recovery/operations confirmations. It first generates the separate
+Ansible roles, independent key-only SSH/sudo and existing stage verifiers. One
+preliminary default-deny scenario plan covers the listed operations, including
+provider-console recovery attestation. It first generates the separate
 `e2e_admin` human key with the existing local key workflow. It does not start an
 agent. For encrypted keys, use the invoking shell's existing agent and accept
-its native load prompt; for an existing unloaded identity run in that shell:
+the plan's agent-loading action; for an existing unloaded identity run in that shell:
 
 ```sh
 make load-user-key \
@@ -328,13 +329,14 @@ The scenario performs:
   stock SSH listener, final root/password denial, maintenance timers and journald.
   Existing SSH security verification also probes offered authentication methods
   and independently proves human administrator access.
-- Explicitly confirmed repeat convergence from `docker`, with native stage
-  prompts. Streamed Ansible recaps require provisioning `changed=0`; the existing
+- Repeat convergence from `docker`, included in the same scenario plan.
+  Streamed Ansible recaps or exact managed no-op evidence require provisioning
+  `changed=0`; the existing
   Docker disposable smoke verifier must report exactly its three deliberate
   container create/start/remove changes. No output log is saved by this parser.
-  Missing/changed recaps fail the scenario; human additive behavior remains
+  Missing/changed evidence fails the scenario; human additive behavior remains
   covered by existing verification and offline engine tests.
-- Separately confirmed existing `reboot-host`, full final verification and
+- Existing `reboot-host`, explicitly included in the scenario plan, full final verification and
   independent probes again. Independently obtained boot IDs must differ.
 
 Failures stop immediately, retain guest/local state and never reset/retry.
@@ -453,7 +455,7 @@ It never deletes shared pools/default networks, follows symlinks, uses wildcards
 or `rm -rf`. The dedicated storage directory is also removed; a new preparation offers
 its creation again with separate consent. The sibling lock inode is retained.
 When its root-owned parent prevents unprivileged removal, delete requests an
-additional default-deny sudo-rmdir confirmation before any mutation. Only the
+sudo-rmdir action in the preliminary default-deny deletion plan before any mutation. Only the
 validated empty dedicated directory is removed through sudo. Controller files
 and state are retained until storage removal succeeds; no parent permissions
 are changed and no extra shell command is required.

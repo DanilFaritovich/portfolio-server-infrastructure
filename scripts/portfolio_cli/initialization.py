@@ -15,10 +15,11 @@ import time
 
 from .common import require
 from .human_access import human_access, human_inputs
-from .inventory import managed_access
+from .inventory import managed_access, load_host, hardening_inputs
 from .keys import check_key, human_key_path
 from .operations import operations
 from .provisioning import live
+from .plans import plan_scope, plan_snapshot, validate_current_plan
 
 
 INIT_STAGES = (
@@ -33,6 +34,7 @@ INIT_STAGES = (
 # Exact fixed controller diagnostics only. Validation errors can also originate
 # in remote JSON, so stripping controls or redacting keywords is insufficient.
 INIT_SAFE_REASONS = frozenset({
+    'Initialization cancelled (end of input); no mutation authorized.',
     'Managed access is not ready. Run make bootstrap-user first; check the dedicated key pair.',
     'Managed key-only SSH access failed.',
     'Managed SSH access failed; remaining host checks cannot run safely.',
@@ -82,11 +84,12 @@ def init_input(prompt):
     try:
         return input(prompt)
     except EOFError:
-        raise ValueError('Initialization cancelled (end of input); no host contact requested.') from None
+        raise ValueError('Initialization cancelled (end of input); no mutation authorized.') from None
 
 
 def init_stage(mode, inventory, key):
     """Call directly: the CLI owns the whole-run lock."""
+    validate_current_plan()
     if mode in ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'):
         human_access(mode, inventory, key)
     elif mode in ('setup-operations', 'verify-operations'):
@@ -121,8 +124,17 @@ def init_server(inventory, key=None):
     boundary = choices.index(frontier)
     print('LIVE: earlier stages must verify; mutation begins at ' + frontier +
           '. Keep provider console recovery available. No automatic retry or rollback.', flush=True)
-    answer = init_input('Authorize this initialization plan? [y/N] ')
-    require(answer.strip().lower() in ('y', 'yes'), 'Initialization declined; no host contact requested.')
+    modes = [apply for index, (_, apply, _) in enumerate(INIT_STAGES) if index >= boundary]
+    alias, host, port, _, _ = load_host(inventory)
+    print(f'Target: {host}:{port}; managed account: {managed_user}.')
+    print('SSH/firewall inputs: ' + json.dumps(hardening_inputs(inventory, alias, port), sort_keys=True))
+    print('Selected human policy: ' + json.dumps(human, sort_keys=True))
+    with plan_scope(modes, lambda: plan_snapshot(inventory, key), reader=init_input, lazy=True):
+        return init_execute(inventory, key, boundary)
+
+
+def init_execute(inventory, key, boundary):
+    """Execute under the caller's lock and bounded consent scope."""
     started = time.monotonic()
     completed = []
     current = 'run'

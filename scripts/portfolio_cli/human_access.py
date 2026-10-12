@@ -10,9 +10,10 @@ import sys
 from .ansible import prerequisites, run_playbook
 from .common import SSH_BASE, require
 from .host_trust import known_host
-from .inspection import user_probe
+from .inspection import user_probe, hardening_plan
 from .inventory import hardening_inputs, load_host, managed_access
 from .keys import check_key, human_key_path, public_fingerprint, public_key_file, public_key_identity, public_key_snapshot, read_public_key, require_independent_key
+from .plans import PLAN_NOOP_MESSAGES, plan_scope, plan_snapshot, planned_action, stage_consent
 from .ssh import verify_auth_methods
 from .verification import verify_hardening, verify_human
 
@@ -81,11 +82,10 @@ def human_access(mode, inventory, automation_key=None):
             print('Explicitly approved groups: ' + ', '.join(human['human_access_user_approved_groups']) +
                   '\nMembership grants their configured file/log/device and administrative rights independently of sudo.')
         if sys.stdin.isatty():
-            try:
-                answer = input('LIVE: register this user and public key on the VPS? [y/N] ')
-            except (EOFError, KeyboardInterrupt):
-                answer = ''
-            require(answer.strip().lower() in ('y', 'yes'), 'Registration declined; no VPS changes requested.')
+            # Terminal public-key registration requires consent before host contact.
+            with plan_scope([mode], lambda: (plan_snapshot(inventory, automation_key), public.read_bytes())):
+                planned_action(mode)
+                return human_access_stage(mode, inventory, automation_key, public)
         return human_access_stage(mode, inventory, automation_key, public)
 
 
@@ -104,7 +104,7 @@ def human_access_stage(mode, inventory, automation_key=None, supplied_public=Non
                 'HUMAN_KEY must correspond to HUMAN_PUBLIC_KEY for independent verification.')
     prerequisites(mode)
     check_key(automation_key)
-    alias, host, port, _, _ = load_host(inventory)
+    alias, host, port, _, interpreter = load_host(inventory)
     inputs = hardening_inputs(inventory, alias, port)
     known_host(host, port)
     managed = {
@@ -123,6 +123,19 @@ def human_access_stage(mode, inventory, automation_key=None, supplied_public=Non
             'action': 'preflight-add-user', 'name': name, 'sudo': human['human_access_user_sudo'],
             'groups': human['human_access_user_groups'], 'commands': human['human_access_user_sudo_commands'],
         })
+        if before.get('existing'):
+            existing = user_probe(host, port, interpreter, automation_key, managed_user, {'action': 'show-user', 'name': name})
+            if any(entry.get('managed') is True and entry.get('key') == public.read_text().strip()
+                   for entry in existing['keys']):
+                print('Account policy and exact managed public key already match; no changes required.')
+                return
+        stage_consent(mode, inventory, automation_key, public)
+        # Revalidate the account/controller token after operator interaction.
+        current = user_probe(host, port, interpreter, automation_key, managed_user, {
+            'action': 'preflight-add-user', 'name': name, 'sudo': human['human_access_user_sudo'],
+            'groups': human['human_access_user_groups'], 'commands': human['human_access_user_sudo_commands'],
+        })
+        require(current == before, 'Account plan changed; STOP before mutation.')
         if not before.get('existing'):
             run_playbook(inventory, alias, managed | human | {'human_access_user_public_key_path': str(public)}, 'add-user.yml')
             before = user_probe(host, port, interpreter, automation_key, managed_user, {'action': 'show-user', 'name': name})
@@ -140,11 +153,14 @@ def human_access_stage(mode, inventory, automation_key=None, supplied_public=Non
     if mode == 'secure-ssh':
         print('LIVE / MUTATING: disable root, password and keyboard-interactive SSH login. '
               'Keep an administrator session open and provider console available.', flush=True)
-        try:
-            answer = input('Provider console recovery tested and available; secure SSH now? [y/N] ')
-        except (EOFError, KeyboardInterrupt):
-            answer = ''
-        require(answer.strip().lower() in ('y', 'yes'), 'Final hardening declined; no SSH policy was changed.')
+        before = hardening_plan(host, port, interpreter, automation_key, inputs, managed_user, security=True)
+        if not before['changes_required']:
+            print(PLAN_NOOP_MESSAGES[mode])
+            return
+        stage_consent(mode, inventory, automation_key)
+        require(hardening_plan(host, port, interpreter, automation_key, inputs, managed_user, security=True) == before,
+                'Final SSH plan changed; STOP before mutation.')
+        verify_human(inventory, alias, host, port, managed, inputs, human, key)
         try:
             confirmation = {'ssh_security_confirmed': True, 'human_access_user_private_key_path': str(key),
                             'human_access_user_ssh_args': managed['ansible_ssh_args']}

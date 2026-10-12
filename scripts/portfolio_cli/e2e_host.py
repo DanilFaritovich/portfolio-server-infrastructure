@@ -94,7 +94,8 @@ def offer_reboot():
             print('Choose 1 or 2; press Enter to reboot later.')
         print('After rebooting, run: make e2e-prepare')
         print('Save your work first: rebooting may lose unsaved data.')
-        if input('Reboot this system now? [y/N] ').strip().lower() not in ('y', 'yes'):
+        print('Plan: request a normal local system reboot through the selected session/system backend; save work first. Rights: current user; system authorization and inhibitors remain enforced.')
+        if input('Apply this plan? [y/N] ').strip().lower() not in ('y', 'yes'):
             print(later)
             return
     except (EOFError, KeyboardInterrupt):
@@ -265,6 +266,7 @@ def prepare(storage, *, command, confirm, safe_path):
         print('Missing E2E host packages: ' + ', '.join(missing))
         print('Privileged plan: apt-get update; apt-get install --no-install-recommends --no-upgrade --no-remove ' + ' '.join(missing))
         confirm('Install only these missing E2E host dependencies using sudo/apt?')
+        require(missing == dependency_plan(), 'Dependency plan changed; STOP before installation.')
         privileged(['apt-get', 'update'], command)
         privileged(['apt-get', 'install', '--no-install-recommends', '--no-upgrade', '--no-remove', *missing], command)
         require(not dependency_plan(), 'E2E packages/tools still unavailable after apt; STOP, no automatic retry.')
@@ -282,6 +284,10 @@ def prepare(storage, *, command, confirm, safe_path):
         print('Privileged plan: add controller to groups ' + ', '.join(additions)
               + '. libvirt access is root-equivalent; only trusted administrators should receive it.')
         confirm('Grant these libvirt/KVM host permissions using sudo?')
+        require(all(grp.getgrnam(name) == required_groups[name] for name in required_groups)
+                and pwd.getpwuid(os.getuid()) == account
+                and (set(os.getgroups()) | {os.getgid()}) == effective,
+                'Host permission plan changed; STOP.')
         privileged(['usermod', '-aG', ','.join(additions), '--', account.pw_name], command)
     if pending:
         # Successful usermod alone is insufficient evidence of configured membership.

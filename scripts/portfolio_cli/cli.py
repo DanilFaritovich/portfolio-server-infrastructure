@@ -7,6 +7,7 @@ import subprocess
 import sys
 from contextlib import nullcontext
 
+from .plans import e2e_child_plan
 from .ansible import pipeline_lock
 from .common import ROOT
 from .host_trust import TRUST_GUIDANCE, server_trust
@@ -33,7 +34,8 @@ def main():
                    'show-controller', 'connect-controller', 'connect-user')
     try:
         with nullcontext() if args.mode in local_modes else pipeline_lock():
-            return dispatch(args, inventory)
+            with e2e_child_plan(inventory, args.mode):
+                return dispatch(args, inventory)
     except KeyboardInterrupt:
         if args.mode in local_modes:
             print('Command interrupted; no success was confirmed. Inspect its state before retrying.', file=sys.stderr)
