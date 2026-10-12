@@ -80,7 +80,8 @@ exit 0
                     'AUTOMATION_KEY': ''})
         env.update({key: str(value) for key, value in extra.items()})
         return subprocess.run(['make', '--no-print-directory', target], cwd=ROOT, env=env,
-                              text=True, capture_output=True, check=False)
+                              # These wrappers deliberately exercise non-interactive CLI paths.
+                              stdin=subprocess.DEVNULL, text=True, capture_output=True, check=False)
 
     def test_generate_existing_pair_preserves_metadata_without_terminal(self):
         before = (self.key.stat().st_mode, self.key.stat().st_mtime_ns,
