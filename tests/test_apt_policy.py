@@ -14,6 +14,7 @@ from unittest.mock import patch
 import yaml
 from ansible.parsing.dataloader import DataLoader
 from ansible.plugins.loader import init_plugin_loader
+from ansible.utils.collection_loader import AnsibleCollectionConfig
 from ansible.template import Templar
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -286,7 +287,8 @@ class AptPolicyWrapperTests(unittest.TestCase):
         self.assertIn('playbooks/apt-policy.yml', (ROOT / 'Makefile').read_text())
 
     def test_template_lookup_equivalent_preserves_final_newline(self):
-        init_plugin_loader()
+        if not AnsibleCollectionConfig.collection_finder:
+            init_plugin_loader()
         loader = DataLoader()
         loader.set_basedir(str(ROOT / 'playbooks'))
         templar = Templar(loader=loader, variables={})

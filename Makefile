@@ -145,7 +145,15 @@ verify-operations:
 	@$(VENV)/bin/python scripts/access.py verify-operations --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
 
 # Strictly offline, including wrapper tests with temporary fixtures and mocked processes.
-check: lint-yaml lint-ansible syntax-check lint-workflows test-access
+# Recursive make still exposes every offline command under make -n.
+CHECK_STEP = CHECK_DRY_RUN=$(if $(findstring n,$(filter-out --%,$(firstword $(MAKEFLAGS)))),1,0) sh scripts/check-step.sh
+check:
+	@$(CHECK_STEP) 'YAML lint' $(MAKE) --no-print-directory lint-yaml
+	@$(CHECK_STEP) 'Ansible lint' $(MAKE) --no-print-directory lint-ansible
+	@$(CHECK_STEP) 'Syntax check' $(MAKE) --no-print-directory syntax-check
+	@$(CHECK_STEP) 'Actions lint' $(MAKE) --no-print-directory lint-workflows
+	@$(CHECK_STEP) 'Unit tests' $(MAKE) --no-print-directory test-access
+	@printf '\nmake check: PASSED\n'
 
 ci: check
 
@@ -174,4 +182,4 @@ lint-workflows:
 	@$(ACTIONLINT) -shellcheck="" .github/workflows/ci.yml
 
 test-access:
-	@$(VENV)/bin/python -m unittest discover -s tests -q
+	@$(VENV)/bin/python -m unittest discover -s tests -b -q

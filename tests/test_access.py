@@ -15,6 +15,7 @@ from ansible import constants as ansible_constants
 from ansible.errors import AnsibleAuthenticationFailure, AnsibleConnectionFailure
 from ansible.playbook.play_context import PlayContext
 from ansible.plugins.loader import connection_loader, init_plugin_loader
+from ansible.utils.collection_loader import AnsibleCollectionConfig
 import paramiko
 import yaml
 
@@ -492,7 +493,8 @@ class AccessTests(unittest.TestCase):
         self.assertNotIn('synthetic prompt result', output)
 
     def test_password_bootstrap_refuses_missing_password_and_explicit_keys(self):
-        init_plugin_loader()
+        if not AnsibleCollectionConfig.collection_finder:
+            init_plugin_loader()
         connection_loader.add_directory(str(access.ROOT / 'plugins/connection'))
         with patch.object(paramiko, 'SSHClient') as client:
             for password in (None, ''):
@@ -524,7 +526,8 @@ class AccessTests(unittest.TestCase):
 
     def test_pinned_paramiko_plugin_password_and_host_key_behavior(self):
         # Simulate Ansible's in-memory prompt result; never use a real credential or network.
-        init_plugin_loader()
+        if not AnsibleCollectionConfig.collection_finder:
+            init_plugin_loader()
         connection_loader.add_directory(str(access.ROOT / 'plugins/connection'))
         with patch.dict(os.environ, {}, clear=True), \
                 patch.object(paramiko, 'SSHClient') as client:
