@@ -1603,6 +1603,45 @@ Guarded CLI calls for user-management commands use the fixture's isolated `HOME`
 `known_hosts`; strict host-key checking remains enabled. SSH transport failures report
 their exit status separately from invalid inspector JSON.
 
+User management on an existing, running and provisioned fixture is available through
+the following wrappers. They reuse the fixture lock, VM ownership/DHCP/route guard,
+generated inventory and existing CLI. They never start, prepare or reset the VM.
+Mutations retain native TTY confirmations and independent recovery proofs; they
+receive no approval from `e2e-test`. Keep the VM console available.
+
+Prepare separate test-only key pairs first. These examples assume Alice's key and
+an additional public key exist at the paths shown, and `e2e_admin` is an independently
+verified administrator created by a successful scenario:
+
+```bash
+stand_keys="$HOME/.local/share/portfolio-e2e/home/.ssh"
+make e2e-list-users
+make e2e-show-user HUMAN_USER=e2e_admin
+make e2e-list-user-keys HUMAN_USER=e2e_admin
+make e2e-add-user HUMAN_USER=alice HUMAN_SUDO=none \
+  HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_ed25519.pub"
+make e2e-verify-user HUMAN_USER=alice HUMAN_SUDO=none \
+  HUMAN_KEY="$stand_keys/portfolio-infra/alice_ed25519"
+make e2e-add-user-key HUMAN_USER=alice \
+  HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519.pub"
+make e2e-list-user-keys HUMAN_USER=alice
+# Copy the exact fingerprint from the listing; destructive commands require a TTY.
+make e2e-revoke-user-key HUMAN_USER=alice KEY_FINGERPRINT='SHA256:REPLACE_FROM_LISTING' \
+  RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+make e2e-remove-user HUMAN_USER=alice \
+  RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+```
+
+The explicit input allowlist is `HUMAN_USER`, `HUMAN_SUDO`, `HUMAN_GROUPS`,
+`HUMAN_GROUPS_APPROVED`, `HUMAN_SUDO_COMMANDS`, `HUMAN_KEY`, `HUMAN_PUBLIC_KEY`,
+`RECOVERY_USER`, `RECOVERY_KEY`, `KEY_NAME`, `KEY_FINGERPRINT` and `AGENT_LOAD`.
+Only explicitly selected key paths cross into the child; relative paths and `~`
+are expanded in the operator environment first. Omitted keys use the existing CLI
+defaults under the isolated fixture HOME; omitted sudo policy is `none`.
+`INVENTORY`, `AUTOMATION_KEY`, Ansible settings and production trust are not
+forwarded. Recovery must remain a separate managed administrator with disjoint
+authorized keys and fresh key-only SSH/sudo proof. Failure stops without retries.
+
 `make e2e-list-distros` lists the local image registry. For a new fixture select
 `make e2e-prepare E2E_DISTRO=ubuntu-22.04`. Host checks use Linux x86_64/KVM/libvirt
 capabilities without a Ubuntu version allowlist. Compatible Ubuntu/Debian apt environments offer missing-package

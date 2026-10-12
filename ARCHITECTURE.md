@@ -350,6 +350,12 @@ paths/snapshots and foreign users before and after default-deny consent,
 use graceful shutdown and never force unsupported restoration.
 
 The scenario launches existing `make init-server` and `make reboot-host` children.
+The eight `e2e-` user-management Make wrappers dispatch the existing access CLI
+under the same fixture lock and guard. An explicit allowlist forwards human policy,
+selected key paths and recovery inputs; operator key paths become absolute before
+switching HOME. Inventory/controller identity and trust remain fixture-owned.
+User operations retain native confirmations and recovery proofs, without scenario
+consent grants or VM lifecycle actions.
 Before importing CLI transports, `access.py` invokes the E2E guard for these
 children: revalidate resources, bridge route/DHCP, exact inventory and fixed child
 inputs, then pin OpenSSH fixture trust. Paramiko uses isolated HOME. Production

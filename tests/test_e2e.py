@@ -317,6 +317,53 @@ class StandTests(unittest.TestCase):
         self.assertNotIn('/production', json.dumps(env))
         self.assertEqual(env['HOME'], str(self.stand.root / 'home'))
 
+    def test_user_commands_forward_only_explicit_inputs_without_plan_grants(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        inputs = dict(HUMAN_USER='alice', HUMAN_SUDO='restricted', HUMAN_GROUPS='readers',
+                      HUMAN_GROUPS_APPROVED='readers', HUMAN_SUDO_COMMANDS='/usr/bin/id',
+                      HUMAN_KEY='keys/alice', HUMAN_PUBLIC_KEY='keys/alice.pub',
+                      RECOVERY_USER='bob', RECOVERY_KEY='keys/bob', KEY_NAME='alice',
+                      KEY_FINGERPRINT='SHA256:' + 'a' * 43, AGENT_LOAD='no')
+        poison = dict(INVENTORY='/production', AUTOMATION_KEY='/production/key',
+                      ANSIBLE_SSH_EXECUTABLE='/foreign', HUMAN_UNKNOWN='unsafe',
+                      RECOVERY_UNKNOWN='unsafe', PORTFOLIO_E2E_PLAN_FD='123', INIT_FROM='verify')
+        for mode in e2e.USER_MODES:
+            with self.subTest(mode=mode), patch.dict(os.environ, dict(inputs, **poison), clear=True), \
+                    patch.object(e2e, 'command', side_effect=self.command) as run:
+                self.stand.user_command(mode)
+                args = run.call_args.args[0]
+                self.assertEqual(args[2:], [mode, '--inventory', str(self.stand.inventory), '--key', ''])
+                env = run.call_args.kwargs['env']
+                for name, value in inputs.items():
+                    expected = str(Path(value).absolute()) if name in e2e.USER_KEY_INPUTS else value
+                    self.assertEqual(env[name], expected)
+                self.assertEqual(env['HOME'], str(self.stand.root / 'home'))
+                self.assertEqual(env['INVENTORY'], str(self.stand.inventory))
+                self.assertEqual(env['AUTOMATION_KEY'], '')
+                self.assertEqual(env['INIT_FROM'], '')
+                for name in ('ANSIBLE_SSH_EXECUTABLE', 'HUMAN_UNKNOWN', 'RECOVERY_UNKNOWN', 'PORTFOLIO_E2E_PLAN_FD'):
+                    self.assertNotIn(name, env)
+                self.assertFalse(run.call_args.kwargs['capture'])
+                self.assertIsNone(run.call_args.kwargs['timeout'])
+
+    def test_user_commands_stop_before_dispatch_on_fixture_drift(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        for failure in ('uuid', 'route', 'stopped', 'inventory'):
+            with self.subTest(failure=failure), patch.object(e2e, 'command', side_effect=self.command) as run:
+                if failure == 'uuid':
+                    self.domain.find('uuid').text = 'foreign'
+                elif failure == 'route':
+                    run.side_effect = lambda *args, **kwargs: '[{"dev":"foreign"}]'
+                elif failure == 'stopped':
+                    self.vm_state = 'shut off'
+                else:
+                    self.stand.inventory.write_text('foreign: inventory\n')
+                with self.assertRaises(ValueError):
+                    self.stand.user_command('remove-user')
+                self.assertFalse(any(call.args[0][0] == sys.executable for call in run.call_args_list))
+                self.domain.find('uuid').text = self.state['uuid']
+                self.vm_state = 'running'
+
     def test_test_failure_stops_without_reset(self):
         public = self.stand.root / 'home/.ssh/human/admin_ed25519.pub'
         public.parent.mkdir(parents=True, exist_ok=True)
@@ -646,7 +693,7 @@ class StandTests(unittest.TestCase):
         env = self.stand.child_env()
         env['ANSIBLE_SSH_EXECUTABLE'] = '/foreign'
         env['PORTFOLIO_E2E_PLAN_FD'] = '123'
-        argv = ['access.py', 'list-users', '--inventory', str(self.stand.inventory), '--key', '']
+        argv = ['access.py', 'init-server', '--inventory', str(self.stand.inventory), '--key', '']
         from portfolio_cli import inspection
         with patch.object(e2e, 'Stand', return_value=self.stand), \
                 patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.base))), \
@@ -664,6 +711,91 @@ class StandTests(unittest.TestCase):
                 patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', argv):
             with self.assertRaisesRegex(ValueError, 'arguments forbidden'):
                 e2e.configure_child()
+
+    def test_user_guard_accepts_allowlist_and_keeps_fixture_trust(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        (self.stand.root / 'home/.ssh').mkdir(mode=0o700, parents=True)
+        (self.stand.root / 'home').chmod(0o700)
+        (self.stand.root / 'tmp').mkdir(mode=0o700)
+        inputs = dict(HUMAN_USER='alice', HUMAN_KEY=str(self.base / 'alice'),
+                      HUMAN_PUBLIC_KEY=str(self.base / 'alice.pub'), RECOVERY_USER='bob',
+                      RECOVERY_KEY=str(self.base / 'bob'), HUMAN_GROUPS_APPROVED='readers')
+        for mode in e2e.USER_MODES:
+            env = self.stand.child_env(inputs)
+            env.update(ANSIBLE_SSH_EXECUTABLE='/foreign', PORTFOLIO_E2E_PLAN_FD='123')
+            argv = ['access.py', mode, '--inventory', str(self.stand.inventory), '--key', '']
+            with self.subTest(mode=mode), patch.object(e2e, 'Stand', return_value=self.stand), \
+                    patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.base))), \
+                    patch.object(e2e.common, 'SSH_BASE', e2e.common.SSH_BASE), \
+                    patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', argv):
+                e2e.configure_child()
+                for name, value in inputs.items():
+                    self.assertEqual(os.environ[name], value)
+                self.assertNotIn('ANSIBLE_SSH_EXECUTABLE', os.environ)
+                self.assertNotIn('PORTFOLIO_E2E_PLAN_FD', os.environ)
+                self.assertIn(str(self.stand.root / 'home/.ssh/known_hosts'), e2e.common.SSH_BASE)
+                for name, value in (('HOME', '/production'), ('AUTOMATION_KEY', '/production/key'),
+                                    ('HUMAN_UNKNOWN', 'unsafe'), ('RECOVERY_UNKNOWN', 'unsafe'),
+                                    ('HUMAN_KEY', 'relative/key')):
+                    with patch.dict(os.environ, {name: value}), self.assertRaises(ValueError):
+                        e2e.configure_child()
+
+    def test_user_entrypoints_hold_fixture_lock_and_stop_on_failure(self):
+        for mode in e2e.USER_MODES:
+            events = []
+
+            @contextlib.contextmanager
+            def lock(root):
+                self.assertEqual(root, self.stand.root)
+                events.append('lock')
+                yield
+                events.append('unlock')
+
+            with self.subTest(mode=mode), patch.object(e2e, 'Stand', return_value=self.stand), \
+                    patch.object(e2e, 'stand_lock', side_effect=lock), patch.object(os, 'getuid', return_value=1000), \
+                    patch.object(os, 'umask'), patch.dict(os.environ, E2E_INVENTORY=''), \
+                    patch.object(sys, 'argv', ['e2e.py', mode]), \
+                    patch.object(self.stand, 'user_command', side_effect=lambda selected: events.append(selected)):
+                self.assertEqual(e2e.main(), 0)
+                self.assertEqual(events, ['lock', mode, 'unlock'])
+                with patch.object(e2e, 'stand_lock', side_effect=e2e.E2EError('Lock busy.')), \
+                        patch.object(self.stand, 'user_command') as dispatch, contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(e2e.main(), 1)
+                    dispatch.assert_not_called()
+                with patch.object(self.stand, 'user_command', side_effect=subprocess.CalledProcessError(1, ['private'])), \
+                        contextlib.redirect_stderr(io.StringIO()) as output:
+                    self.assertEqual(e2e.main(), 1)
+                    self.assertNotIn('private', output.getvalue())
+
+    def test_make_user_targets_forward_parameters_as_environment(self):
+        # Exercise the public Make recipes with a recorder, never the live CLI.
+        work = self.base / 'make-wrapper'
+        binary = work / '.venv/bin/python'
+        binary.parent.mkdir(parents=True)
+        (work / 'Makefile').write_text((e2e.ROOT / 'Makefile').read_text())
+        record = work / 'record.json'
+        binary.write_text('#!' + sys.executable + '\nimport json, os, sys\n'
+                          'from pathlib import Path\n'
+                          'Path(os.environ["RECORD"]).write_text(json.dumps([sys.argv[1:], dict(os.environ)]))\n')
+        binary.chmod(0o700)
+        for mode in e2e.USER_MODES:
+            with self.subTest(mode=mode):
+                result = subprocess.run(['make', '--no-print-directory', 'e2e-' + mode,
+                                         'HUMAN_USER=alice; touch SHOULD_NOT_EXIST', 'HUMAN_GROUPS_APPROVED=readers',
+                                         'HUMAN_KEY=/explicit/key with spaces', 'RECOVERY_USER=bob',
+                                         'RECOVERY_KEY=/explicit/recovery', 'KEY_FINGERPRINT=SHA256:example'],
+                                        cwd=work, env=dict(os.environ, RECORD=str(record)),
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args, env = json.loads(record.read_text())
+                self.assertEqual(args, ['scripts/e2e.py', mode])
+                self.assertEqual(env['HUMAN_USER'], 'alice; touch SHOULD_NOT_EXIST')
+                self.assertEqual(env['HUMAN_GROUPS_APPROVED'], 'readers')
+                self.assertEqual(env['HUMAN_KEY'], '/explicit/key with spaces')
+                self.assertEqual(env['RECOVERY_USER'], 'bob')
+                self.assertEqual(env['RECOVERY_KEY'], '/explicit/recovery')
+                self.assertEqual(env['KEY_FINGERPRINT'], 'SHA256:example')
+                self.assertFalse((work / 'SHOULD_NOT_EXIST').exists())
 
     def test_access_guard_foreign_root_never_dispatches_cli(self):
         env = dict(os.environ, PORTFOLIO_E2E_ROOT='/foreign')

@@ -1625,6 +1625,47 @@ Guarded CLI-команды управления пользователями и�
 `known_hosts` стенда; строгая проверка host key остаётся включённой. Ошибки SSH
 отделены от некорректного JSON-ответа инспектора.
 
+Для управления пользователями существующего, запущенного и настроенного стенда
+доступны обёртки ниже. Они используют lock стенда, guard принадлежности VM/DHCP/
+маршрута, сгенерированный inventory и существующий CLI. Команды не запускают,
+не подготавливают и не сбрасывают VM. Изменения сохраняют штатные TTY-подтверждения
+и независимые recovery-проверки; согласие от `e2e-test` им не передаётся.
+Сохраняйте доступ к консоли VM.
+
+Заранее подготовьте отдельные тестовые пары ключей. Примеры предполагают, что ключ
+Alice и дополнительный публичный ключ существуют по указанным путям, а `e2e_admin`
+создан успешным сценарием и его административный доступ независимо проверен:
+
+```bash
+stand_keys="$HOME/.local/share/portfolio-e2e/home/.ssh"
+make e2e-list-users
+make e2e-show-user HUMAN_USER=e2e_admin
+make e2e-list-user-keys HUMAN_USER=e2e_admin
+make e2e-add-user HUMAN_USER=alice HUMAN_SUDO=none \
+  HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_ed25519.pub"
+make e2e-verify-user HUMAN_USER=alice HUMAN_SUDO=none \
+  HUMAN_KEY="$stand_keys/portfolio-infra/alice_ed25519"
+make e2e-add-user-key HUMAN_USER=alice \
+  HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519.pub"
+make e2e-list-user-keys HUMAN_USER=alice
+# Подставьте точный fingerprint из списка; разрушительные команды требуют TTY.
+make e2e-revoke-user-key HUMAN_USER=alice KEY_FINGERPRINT='SHA256:REPLACE_FROM_LISTING' \
+  RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+make e2e-remove-user HUMAN_USER=alice \
+  RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+```
+
+Явный allowlist параметров: `HUMAN_USER`, `HUMAN_SUDO`, `HUMAN_GROUPS`,
+`HUMAN_GROUPS_APPROVED`, `HUMAN_SUDO_COMMANDS`, `HUMAN_KEY`, `HUMAN_PUBLIC_KEY`,
+`RECOVERY_USER`, `RECOVERY_KEY`, `KEY_NAME`, `KEY_FINGERPRINT`, `AGENT_LOAD`.
+В дочерний процесс передаются только явно выбранные пути ключей; относительные
+пути и `~` заранее раскрываются в окружении оператора. Без указания ключей CLI
+использует штатные пути внутри изолированного HOME стенда; sudo по умолчанию `none`.
+`INVENTORY`, `AUTOMATION_KEY`, настройки Ansible и production trust не передаются.
+Recovery должен оставаться отдельным управляемым администратором с непересекающимися
+наборами авторизованных ключей и свежим доказательством key-only SSH/sudo.
+Ошибка останавливает выполнение без повторных попыток.
+
 `make e2e-list-distros` показывает локальный реестр образов. Для нового стенда:
 `make e2e-prepare E2E_DISTRO=ubuntu-22.04`. Хост проверяется по возможностям
 Linux x86_64/KVM/libvirt без ограничения версий Ubuntu. В совместимом apt-окружении Ubuntu/Debian предлагается установка только

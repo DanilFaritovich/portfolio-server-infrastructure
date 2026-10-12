@@ -33,7 +33,13 @@ from .common import ROOT
 
 URI = 'qemu:///system'
 NS = 'urn:portfolio:local-e2e:1'
-MODES = ('prepare', 'status', 'test', 'reset', 'delete', 'list-distros')
+USER_MODES = ('list-users', 'show-user', 'list-user-keys', 'add-user', 'verify-user',
+              'add-user-key', 'revoke-user-key', 'remove-user')
+USER_INPUTS = ('HUMAN_USER', 'HUMAN_SUDO', 'HUMAN_GROUPS', 'HUMAN_GROUPS_APPROVED',
+               'HUMAN_SUDO_COMMANDS', 'HUMAN_KEY', 'HUMAN_PUBLIC_KEY',
+               'RECOVERY_USER', 'RECOVERY_KEY', 'KEY_NAME', 'KEY_FINGERPRINT', 'AGENT_LOAD')
+USER_KEY_INPUTS = ('HUMAN_KEY', 'HUMAN_PUBLIC_KEY', 'RECOVERY_KEY')
+MODES = ('prepare', 'status', 'test', 'reset', 'delete', 'list-distros', *USER_MODES)
 # The libvirt daemon can translate its error even with client LC_ALL=C.
 # Only these exact, verified disconnected-agent replies permit boot polling.
 AGENT_DISCONNECTED_ERRORS = frozenset({
@@ -814,7 +820,7 @@ class Stand:
                     files.append(path)
         return files, directories
 
-    def child_env(self):
+    def child_env(self, user_inputs=None):
         # Do not inherit arbitrary Ansible configuration, inventory, identities or sudo policy.
         env = {k: v for k, v in os.environ.items() if k in ('PATH', 'TERM', 'LANG', 'LC_ALL', 'SSH_AUTH_SOCK')}
         env.update(HOME=str(self.root / 'home'), TMPDIR=str(self.root / 'tmp'),
@@ -825,9 +831,30 @@ class Stand:
                    RECOVERY_USER='', RECOVERY_KEY='', HUMAN_SUDO_COMMANDS='',
                    HUMAN_KEY=str(self.root / 'home/.ssh/human/admin_ed25519'),
                    HUMAN_PUBLIC_KEY=str(self.root / 'home/.ssh/human/admin_ed25519.pub'))
+        if user_inputs is not None:
+            # User operations retain native CLI defaults in the isolated HOME.
+            env.update(HUMAN_USER='', HUMAN_SUDO='none', HUMAN_KEY='', HUMAN_PUBLIC_KEY='')
+            env.update({name: user_inputs[name] for name in USER_INPUTS if name in user_inputs})
         # Materialize Make's exported empty/default policy inputs before binding
         # the grant. Missing and empty values remain distinct in plan_snapshot.
         return env
+
+    def user_command(self, mode):
+        require(mode in USER_MODES, 'Unsupported E2E user operation.')
+        self.load()
+        self.check_inventory(self.inventory)
+        self.ready(running=True)
+        inputs = {name: os.environ[name] for name in USER_INPUTS if name in os.environ}
+        # Resolve explicit operator paths before switching HOME. Do not read keys;
+        # the existing CLI owns key validation and independent access proofs.
+        for name in USER_KEY_INPUTS:
+            if inputs.get(name):
+                path = Path(inputs[name]).expanduser().absolute()
+                common.validate_cli_path(path)
+                inputs[name] = str(path)
+        command([sys.executable, str(ROOT / 'scripts/access.py'), mode,
+                 '--inventory', str(self.inventory), '--key', ''],
+                capture=False, timeout=None, env=self.child_env(inputs))
 
     def cli(self, mode, frontier=None, unchanged=False):
         self.load()
@@ -949,22 +976,28 @@ def configure_child():
     # access.py accepts exactly the inventory owned by the stand. Explicit argv
     # checks prevent --inventory/--key overrides before argparse dispatch.
     local = sys.argv[1:] == ['generate-user-key', '--inventory', str(stand.inventory)]
-    user_management = ('list-users', 'show-user', 'list-user-keys', 'add-user-key',
-                       'revoke-user-key', 'remove-user')
     require(local or (len(sys.argv) == 6 and sys.argv[2:4] == ['--inventory', str(stand.inventory)]
             and sys.argv[4:] == ['--key', ''] and
-            sys.argv[1] in ('init-server', 'reboot-host', *user_management)),
+            sys.argv[1] in ('init-server', 'reboot-host', *USER_MODES)),
             'Foreign E2E CLI arguments forbidden.')
-    env = stand.child_env()
+    user_operation = sys.argv[1] in USER_MODES
+    env = stand.child_env(os.environ if user_operation else None)
+    if user_operation:
+        for name in USER_KEY_INPUTS:
+            value = env[name]
+            if value:
+                require(Path(value).is_absolute() and '~' not in value,
+                        'E2E user key paths must be absolute.')
+                common.validate_cli_path(Path(value))
     for name in ('HOME', 'INVENTORY', 'AUTOMATION_KEY', 'HUMAN_KEY', 'HUMAN_PUBLIC_KEY',
                  'HUMAN_USER', 'HUMAN_SUDO', 'HUMAN_GROUPS', 'HUMAN_GROUPS_APPROVED',
                  'HUMAN_SUDO_COMMANDS', 'KEY_NAME', 'KEY_FINGERPRINT', 'RECOVERY_USER',
                  'RECOVERY_KEY', 'AGENT_LOAD', 'ANSIBLE_CONFIG', 'TMPDIR'):
         require(os.environ.get(name) == env[name], 'Foreign E2E identity/configuration forbidden.')
-    require(not any(name.startswith('HUMAN_') and name not in env for name in os.environ),
+    require(not any(name.startswith(('HUMAN_', 'RECOVERY_')) and name not in env for name in os.environ),
             'Foreign E2E policy input forbidden.')
     require('INIT_FROM' in os.environ, 'Missing E2E frontier input; STOP.')
-    for name in ('INIT_FROM', 'PORTFOLIO_E2E_PLAN_FD'):
+    for name in ('INIT_FROM', 'PORTFOLIO_E2E_PLAN_FD') if not user_operation else ():
         if name in os.environ:
             env[name] = os.environ[name]
     # Native Ansible and local-key children must not inherit arbitrary injected
@@ -1012,7 +1045,7 @@ def main():
         phase = 'fixture lock'
         with stand_lock(stand.root):
             phase = args.mode
-            result = getattr(stand, args.mode)()
+            result = stand.user_command(args.mode) if args.mode in USER_MODES else getattr(stand, args.mode)()
         if result is e2e_host.PreparationResult.REBOOT_REQUIRED:
             e2e_host.offer_reboot()
         return 0
