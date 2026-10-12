@@ -949,8 +949,11 @@ def configure_child():
     # access.py accepts exactly the inventory owned by the stand. Explicit argv
     # checks prevent --inventory/--key overrides before argparse dispatch.
     local = sys.argv[1:] == ['generate-user-key', '--inventory', str(stand.inventory)]
+    user_management = ('list-users', 'show-user', 'list-user-keys', 'add-user-key',
+                       'revoke-user-key', 'remove-user')
     require(local or (len(sys.argv) == 6 and sys.argv[2:4] == ['--inventory', str(stand.inventory)]
-            and sys.argv[4:] == ['--key', ''] and sys.argv[1] in ('init-server', 'reboot-host')),
+            and sys.argv[4:] == ['--key', ''] and
+            sys.argv[1] in ('init-server', 'reboot-host', *user_management)),
             'Foreign E2E CLI arguments forbidden.')
     env = stand.child_env()
     for name in ('HOME', 'INVENTORY', 'AUTOMATION_KEY', 'HUMAN_KEY', 'HUMAN_PUBLIC_KEY',

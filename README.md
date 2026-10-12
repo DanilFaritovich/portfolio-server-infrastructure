@@ -1599,6 +1599,9 @@ before running `make e2e-prepare`, `make e2e-status`, `make e2e-test`,
 require explicit consent; tests use one bounded scenario plan and retain native authentication/trust prompts. The
 scenario covers installation, final verification, repeat provisioning and reboot
 persistence. Failures preserve the guest for console diagnosis, without auto-reset.
+Guarded CLI calls for user-management commands use the fixture's isolated `HOME` and
+`known_hosts`; strict host-key checking remains enabled. SSH transport failures report
+their exit status separately from invalid inspector JSON.
 
 `make e2e-list-distros` lists the local image registry. For a new fixture select
 `make e2e-prepare E2E_DISTRO=ubuntu-22.04`. Host checks use Linux x86_64/KVM/libvirt

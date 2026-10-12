@@ -692,6 +692,21 @@ class SafetySurfaceTests(unittest.TestCase):
         self.assertNotIn('from ansible', payload)
         compile(payload, 'stream', 'exec')
 
+    def test_stream_transport_uses_current_trust_policy_and_reports_ssh_failure_safely(self):
+        import subprocess
+        trust = '/synthetic/e2e/home/.ssh/known_hosts'
+        base = access.common.SSH_BASE + ' -o UserKnownHostsFile=' + trust
+        with patch.object(access.common, 'SSH_BASE', base), \
+                patch.object(access.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    [], 255, '', 'Host key verification failed. secret detail')) as run:
+            with self.assertRaisesRegex(ValueError, 'SSH command failed.*exit status 255') as caught:
+                access.user_probe('host.test', 2222, '/usr/bin/python3', Path('/synthetic/controller'),
+                                  'controller', {'action': 'list-users'})
+        command = run.call_args.args[0]
+        self.assertIn('UserKnownHostsFile=' + trust, command)
+        self.assertIn('StrictHostKeyChecking=yes', command)
+        self.assertNotIn('secret', str(caught.exception))
+
     def test_ssh_match_unsupported_include_and_pending_activation_block(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -646,13 +646,16 @@ class StandTests(unittest.TestCase):
         env = self.stand.child_env()
         env['ANSIBLE_SSH_EXECUTABLE'] = '/foreign'
         env['PORTFOLIO_E2E_PLAN_FD'] = '123'
-        argv = ['access.py', 'init-server', '--inventory', str(self.stand.inventory), '--key', '']
+        argv = ['access.py', 'list-users', '--inventory', str(self.stand.inventory), '--key', '']
+        from portfolio_cli import inspection
         with patch.object(e2e, 'Stand', return_value=self.stand), \
                 patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.base))), \
                 patch.object(e2e.common, 'SSH_BASE', e2e.common.SSH_BASE), \
                 patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', argv):
             e2e.configure_child()
             self.assertIn('UserKnownHostsFile="' + str(self.stand.root / 'home/.ssh/known_hosts'), e2e.common.SSH_BASE)
+            self.assertIn('UserKnownHostsFile="' + str(self.stand.root / 'home/.ssh/known_hosts'),
+                          ' '.join(inspection.shlex.split(inspection.common.SSH_BASE)))
             self.assertNotIn('ANSIBLE_SSH_EXECUTABLE', os.environ)
             self.assertEqual(os.environ['PORTFOLIO_E2E_PLAN_FD'], '123')
         argv[3] = '/production/never-read.yml'

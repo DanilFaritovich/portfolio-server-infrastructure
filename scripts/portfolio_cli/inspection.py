@@ -4,12 +4,13 @@ import json
 import shlex
 import subprocess
 
-from .common import ROOT, SSH_BASE, require
+from . import common
+from .common import ROOT, require
 
 
 def inspect_host(host, port, interpreter, key, inputs, user):
     """Read-only SSH transport avoids Ansible's remote payload/tempfile writes."""
-    ssh = ['ssh'] + shlex.split(SSH_BASE) + [
+    ssh = ['ssh'] + shlex.split(common.SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
         '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
         '-o', 'KbdInteractiveAuthentication=no',
@@ -44,7 +45,7 @@ def inspect_host(host, port, interpreter, key, inputs, user):
 
 def user_probe(host, port, interpreter, key, controller, params):
     """Stream a bounded engine with no remote payload files or private-key reads."""
-    ssh = ['ssh'] + shlex.split(SSH_BASE) + [
+    ssh = ['ssh'] + shlex.split(common.SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey',
         '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
         '-i', str(key), '-p', str(port), controller + '@' + host,
@@ -55,18 +56,22 @@ def user_probe(host, port, interpreter, key, controller, params):
     payload += '\nmanage_stream(json.loads(' + repr(json.dumps(params | {'controller': controller})) + '))\n'
     result = subprocess.run(ssh + ['sudo -n ' + shlex.quote(interpreter) + ' -I -B -'],
                             input=payload, capture_output=True, text=True, check=False, timeout=180)
+    if result.returncode:
+        raise ValueError('User management SSH command failed (exit status ' + str(result.returncode) +
+                         '); check key-only access, host trust and sudo -n.')
     try:
         response = json.loads(result.stdout)
-        require(result.returncode == 0 and response.get('ready') is True and isinstance(response['result'], dict),
+        require(response.get('ready') is True and isinstance(response['result'], dict),
                 response.get('error', 'User management SSH/sudo failed; stop and inspect through recovery.'))
         return response['result']
     except (KeyError, TypeError, json.JSONDecodeError):
-        raise ValueError('Invalid user management response; stop and inspect through recovery.') from None
+        raise ValueError('Invalid user management response; remote inspection did not return valid JSON. '
+                         'Stop and inspect through recovery.') from None
 
 
 def operations_probe(host, port, interpreter, key, module, params, user):
     """Strict key-only stream transport; no Ansible remote files or cache writes."""
-    ssh = ['ssh'] + shlex.split(SSH_BASE) + [
+    ssh = ['ssh'] + shlex.split(common.SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
         '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
         '-o', 'KbdInteractiveAuthentication=no',
