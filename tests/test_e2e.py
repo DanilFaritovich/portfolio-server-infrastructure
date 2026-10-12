@@ -582,7 +582,7 @@ class StandTests(unittest.TestCase):
                            'e2e : ok=10 changed=' + str(3 if index == 4 else int(drift)) + ' failed=0\n'
                            for index, name in enumerate(names))
             class Process:
-                stdout = io.StringIO(text)
+                stdout = io.BufferedReader(io.BytesIO(text.encode()))
                 def __enter__(self):
                     return self
                 def __exit__(self, *args):

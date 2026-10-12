@@ -4,6 +4,7 @@ Only owned, static, single-disk BIOS guests on a dedicated NAT are supported.
 A partial preparation is evidence to inspect/delete, never a resumable transaction.
 """
 
+import codecs
 import contextlib
 import errno
 import fcntl
@@ -11,6 +12,7 @@ import getpass
 import hashlib
 import ipaddress
 import json
+import locale
 import os
 from pathlib import Path
 import re
@@ -111,19 +113,60 @@ def convergence_command(argv, env):
     required = {yaml.safe_load((ROOT / 'playbooks' / name).read_text())[0]['name'] for name in
                 ('docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml')}
     seen, failed, play = set(), False, None
-    with subprocess.Popen(argv, stdout=subprocess.PIPE, text=True, env=env) as process:
-        for line in process.stdout:
-            print(line, end='', flush=True)
-            title = re.match(r'^PLAY \[(.+)\]', line)
-            if title:
-                play = title[1]
-            match = re.match(r'^e2e\s*:\s+ok=\d+\s+changed=(\d+)\b', line)
-            if match:
-                seen.add(play)
-                # The existing verifier deliberately creates/runs/removes one
-                # smoke container: exactly three changes, not provisioning drift.
-                failed |= int(match[1]) != (3 if play == smoke else 0)
-        require(process.wait() == 0, 'Repeat initialization failed; state retained, no reset.')
+    # Keep stdin/stderr on the invoking terminal. input() flushes its prompt,
+    # but line iteration hides it until a newline arrives. read1() instead
+    # forwards available bytes without waiting for a full line/block.
+    child_env = dict(env, PYTHONUNBUFFERED='1')
+    decoder = codecs.getincrementaldecoder(locale.getpreferredencoding(False))()
+    pending, oversized = '', False
+
+    def recap_line(line):
+        nonlocal play, failed
+        title = re.match(r'^PLAY \[(.+)\]', line)
+        if title:
+            play = title[1] if title[1] in required | {smoke} else None
+        match = re.match(r'^e2e\s*:\s+ok=\d+\s+changed=(\d+)\b', line)
+        if match:
+            seen.add(play)
+            # The existing verifier deliberately creates/runs/removes one
+            # smoke container: exactly three changes, not provisioning drift.
+            failed |= int(match[1]) != (3 if play == smoke else 0)
+
+    def forward(chunk):
+        nonlocal pending, oversized
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+        for fragment in chunk.splitlines(keepends=True):
+            # Only a bounded current line exists in memory, never a transcript.
+            # Discard oversized lines from analysis, still display every byte.
+            if not oversized:
+                pending += fragment
+                if len(pending) > 8192:
+                    pending, oversized = '', True
+            if fragment.endswith(('\n', '\r')):
+                if not oversized:
+                    recap_line(pending)
+                pending, oversized = '', False
+
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, env=child_env) as process:
+        try:
+            while chunk := process.stdout.read1(4096):
+                forward(decoder.decode(chunk))
+            forward(decoder.decode(b'', final=True))
+            if pending and not oversized:
+                recap_line(pending)
+            require(process.wait() == 0, 'Repeat initialization failed; state retained, no reset.')
+        except BaseException:
+            # Do not leave the local wrapper waiting indefinitely on interrupt
+            # or a forwarding failure. This does not prove remote cancellation.
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            raise
     require(required <= seen and not failed, 'Repeat initialization did not prove provisioning changed=0; inspect recaps without automatic retry.')
 
 
