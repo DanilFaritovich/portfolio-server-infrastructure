@@ -33,7 +33,8 @@ def plan_code_snapshot():
     digest = hashlib.sha256()
     sources = [*(ROOT / 'roles').rglob('*.yml'), *(ROOT / 'roles').rglob('*.j2'),
                *(ROOT / 'playbooks').glob('*.yml'), *(ROOT / 'library').glob('portfolio_*.py'),
-               *(ROOT / 'scripts/portfolio_cli').glob('*.py'), ROOT / 'scripts/user_management.py']
+               *(ROOT / 'scripts/portfolio_cli').glob('*.py'), ROOT / 'scripts/user_management.py',
+               ROOT / 'Makefile']
     for path in sorted(sources):
         require(not path.is_symlink(), 'Plan implementation source changed; STOP.')
         digest.update(str(path.relative_to(ROOT)).encode())
@@ -45,7 +46,7 @@ def plan_snapshot(inventory, key=None):
     """Bind consent to inventory bytes, policy inputs and PUBLIC identity only."""
     environment = tuple(sorted((name, value) for name, value in os.environ.items()
                                if name.startswith('HUMAN_') or name in ('AUTOMATION_KEY', 'RECOVERY_USER',
-                                                                       'RECOVERY_KEY', 'KEY_FINGERPRINT',
+                                                                       'RECOVERY_KEY', 'KEY_FINGERPRINT', 'KEY_NAME',
                                                                        'SSH_AUTH_SOCK', 'AGENT_LOAD', 'INIT_FROM')))
     path = Path(inventory)
     digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None

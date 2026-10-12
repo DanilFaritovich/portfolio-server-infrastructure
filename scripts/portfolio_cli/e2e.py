@@ -821,8 +821,12 @@ class Stand:
                    PORTFOLIO_E2E_ROOT=str(self.root), INVENTORY=str(self.inventory), AUTOMATION_KEY='',
                    ANSIBLE_CONFIG=str(ROOT / 'ansible.cfg'), ANSIBLE_HOME=str(self.root / 'home/.ansible'),
                    HUMAN_USER='e2e_admin', HUMAN_SUDO='admin', HUMAN_GROUPS='', HUMAN_GROUPS_APPROVED='',
+                   INIT_FROM='', AGENT_LOAD='ask', KEY_NAME='', KEY_FINGERPRINT='',
+                   RECOVERY_USER='', RECOVERY_KEY='', HUMAN_SUDO_COMMANDS='',
                    HUMAN_KEY=str(self.root / 'home/.ssh/human/admin_ed25519'),
                    HUMAN_PUBLIC_KEY=str(self.root / 'home/.ssh/human/admin_ed25519.pub'))
+        # Materialize Make's exported empty/default policy inputs before binding
+        # the grant. Missing and empty values remain distinct in plan_snapshot.
         return env
 
     def cli(self, mode, frontier=None, unchanged=False):
@@ -944,14 +948,20 @@ def configure_child():
     stand.check_inventory(Path(os.environ.get('INVENTORY', '')))
     # access.py accepts exactly the inventory owned by the stand. Explicit argv
     # checks prevent --inventory/--key overrides before argparse dispatch.
-    local = sys.argv[1:] == ['generate-user-key']
+    local = sys.argv[1:] == ['generate-user-key', '--inventory', str(stand.inventory)]
     require(local or (len(sys.argv) == 6 and sys.argv[2:4] == ['--inventory', str(stand.inventory)]
             and sys.argv[4:] == ['--key', ''] and sys.argv[1] in ('init-server', 'reboot-host')),
             'Foreign E2E CLI arguments forbidden.')
     env = stand.child_env()
-    for name in ('HUMAN_KEY', 'HUMAN_PUBLIC_KEY', 'HUMAN_USER', 'HUMAN_SUDO', 'ANSIBLE_CONFIG', 'TMPDIR'):
+    for name in ('HOME', 'INVENTORY', 'AUTOMATION_KEY', 'HUMAN_KEY', 'HUMAN_PUBLIC_KEY',
+                 'HUMAN_USER', 'HUMAN_SUDO', 'HUMAN_GROUPS', 'HUMAN_GROUPS_APPROVED',
+                 'HUMAN_SUDO_COMMANDS', 'KEY_NAME', 'KEY_FINGERPRINT', 'RECOVERY_USER',
+                 'RECOVERY_KEY', 'AGENT_LOAD', 'ANSIBLE_CONFIG', 'TMPDIR'):
         require(os.environ.get(name) == env[name], 'Foreign E2E identity/configuration forbidden.')
-    for name in ('INIT_FROM', 'AGENT_LOAD', 'PORTFOLIO_E2E_PLAN_FD'):
+    require(not any(name.startswith('HUMAN_') and name not in env for name in os.environ),
+            'Foreign E2E policy input forbidden.')
+    require('INIT_FROM' in os.environ, 'Missing E2E frontier input; STOP.')
+    for name in ('INIT_FROM', 'PORTFOLIO_E2E_PLAN_FD'):
         if name in os.environ:
             env[name] = os.environ[name]
     # Native Ansible and local-key children must not inherit arbitrary injected

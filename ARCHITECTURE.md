@@ -357,7 +357,14 @@ execution and legacy imports do not activate this guard. The scenario's single
 plan covers key generation, selected initialization, repeat convergence and guest
 reboot. An inherited anonymous pipe transfers consent to exactly one guarded child
 invocation, bound to its mode/frontier and input snapshot; no persistent receipt or
-general environment yes switch exists. Roles, independent proofs and native
+general environment yes switch exists. Child policy inputs explicitly include
+Make's exported empty values and defaults before snapshotting; missing and empty
+remain distinct. Key generation receives the fixture inventory explicitly. The
+guard rejects changed fixed policy inputs before sanitizing the environment, and
+snapshots bind key selection and the Make recipes as well as CLI/role code.
+Offline regression tests traverse GNU Make, the inherited descriptor and the real
+CLI guard/plan receiver with VM proofs and operation dispatch mocked.
+Roles, independent proofs and native
 authentication/host-trust prompts remain. Numeric Ansible recaps or exact managed
 no-op evidence prove repeat provisioning is unchanged (with the verifier's exact
 three Docker smoke changes); independent SSH probes and boot IDs cover persistence.

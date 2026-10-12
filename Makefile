@@ -43,7 +43,11 @@ setup:
 	@sh scripts/setup.sh setup
 
 # LOCAL only: generate/load the selected key or display its public member/fingerprint.
-generate-user-key load-user-key show-public-key copy-public-key:
+generate-user-key:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY"
+
+load-user-key show-public-key copy-public-key:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py $@
 

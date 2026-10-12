@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from test_cli_package import load_access
-from portfolio_cli import plans, operations
+from portfolio_cli import plans, operations, e2e
 
 
 class PlanTests(unittest.TestCase):
@@ -121,6 +121,160 @@ class PlanTests(unittest.TestCase):
                 with patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(ValueError, 'operation changed'):
                     with plans.e2e_child_plan(self.inventory, 'reboot-host'):
                         self.fail('Foreign operation authorized')
+
+
+class E2EMakePlanTests(unittest.TestCase):
+    """Real repository Make recipes/FD/CLI guard; no hypervisor or host dispatch."""
+
+    def setUp(self):
+        PlanTests.setUp(self)
+        self.stand = e2e.Stand(Path(self.temp) / '.local/share/portfolio-e2e')
+        (self.stand.root / 'home/.ssh').mkdir(parents=True, mode=0o700)
+        (self.stand.root / 'home').chmod(0o700)
+        (self.stand.root / 'tmp').mkdir(mode=0o700)
+        self.stand.inventory.write_text('synthetic E2E inventory')
+        self.inventory = self.stand.inventory
+        self.venv = Path(self.temp) / 'probe-venv'
+        (self.venv / 'bin').mkdir(parents=True)
+        probe = self.venv / 'bin/python'
+        # Replace only the interpreter boundary. Run the actual access.py guard,
+        # parser and grant receiver, mocking VM proofs and operation dispatch.
+        probe.write_text('#!' + sys.executable + '\n' + r'''import contextlib
+import json
+import os
+from pathlib import Path
+import runpy
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+sys.path.insert(0, str(Path.cwd() / 'scripts'))
+from portfolio_cli import cli, e2e, plans
+expected = json.loads(Path(os.environ['TEST_SNAPSHOT']).read_text())
+inventory = Path(os.environ['INVENTORY'])
+fd = int(os.environ['PORTFOLIO_E2E_PLAN_FD'])
+# Check Make's exports before the guard can sanitize them.
+if os.environ.get('TEST_EXPECT_MATCH') == 'yes':
+    assert json.dumps(plans.plan_snapshot(inventory), sort_keys=True) == expected
+stand = e2e.Stand(Path(os.environ['PORTFOLIO_E2E_ROOT']))
+def check_inventory(selected):
+    assert selected == inventory == stand.inventory
+    assert selected.read_text() == 'synthetic E2E inventory'
+def dispatch(args, selected):
+    assert selected == inventory
+    assert 'PORTFOLIO_E2E_PLAN_FD' not in os.environ
+    try:
+        os.fstat(fd)
+    except OSError:
+        pass
+    else:
+        raise AssertionError('consumed grant FD is still open')
+    assert json.dumps(plans.plan_snapshot(selected), sort_keys=True) == expected
+    stages = {'generate-user-key': ['generate-user-key'],
+              'init-server': ['bootstrap-user', 'docker-host', 'harden', 'add-user',
+                              'secure-ssh', 'setup-operations'],
+              'reboot-host': ['reboot-host']}
+    for stage in stages[args.mode]:
+        assert plans.planned_action(stage)
+    try:
+        plans.planned_action('apply-apt-policy')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('grant widened authority')
+    os.environ['HUMAN_SUDO'] = 'changed-after-receipt'
+    try:
+        plans.validate_current_plan()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('grant accepted changed inputs')
+    print('OFFLINE DISPATCH ' + args.mode)
+    return 0
+sys.argv = sys.argv[1:]
+with contextlib.ExitStack() as stack:
+    stack.enter_context(patch.object(e2e, 'Stand', return_value=stand))
+    stack.enter_context(patch.object(stand, 'ready'))
+    stack.enter_context(patch.object(stand, 'check_inventory', side_effect=check_inventory))
+    stack.enter_context(patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(stand.root.parents[2]))))
+    stack.enter_context(patch.object(e2e, 'command', side_effect=AssertionError('unexpected external command')))
+    stack.enter_context(patch.object(cli, 'pipeline_lock', side_effect=contextlib.nullcontext))
+    stack.enter_context(patch.object(cli, 'dispatch', side_effect=dispatch))
+    runpy.run_path('scripts/access.py', run_name='__main__')
+''')
+        probe.chmod(0o700)
+        self.modes = ['generate-user-key', 'bootstrap-user', 'docker-host', 'harden',
+                      'add-user', 'secure-ssh', 'setup-operations', 'reboot-host']
+
+    def make_child(self, mode, *, target=None, overrides=None, change=None):
+        env = self.stand.child_env()
+        if mode == 'init-server':
+            env['INIT_FROM'] = 'bootstrap'
+        with plans.plan_scope(self.modes, lambda: 'fixed'):
+            with plans.e2e_plan_pipe(self.inventory, env, mode) as (child_env, descriptors):
+                expected_file = Path(self.temp) / 'expected-snapshot.json'
+                with patch.dict(os.environ, env, clear=True):
+                    expected_file.write_text(json.dumps(json.dumps(plans.plan_snapshot(self.inventory), sort_keys=True)))
+                child_env['TEST_SNAPSHOT'] = str(expected_file)
+                child_env['TEST_EXPECT_MATCH'] = 'no' if overrides or change else 'yes'
+                if change:
+                    change()
+                return subprocess.run(
+                    ['make', '--no-print-directory', mode if target is None else target,
+                     'VENV=' + str(self.venv),
+                     *(name + '=' + value for name, value in (overrides or {}).items())],
+                    cwd=e2e.ROOT, env=child_env, pass_fds=descriptors,
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
+
+    def test_real_make_preserves_exact_policy_environment_and_consumes_fd(self):
+        # The ambient parent's policy must never leak into the isolated child.
+        with patch.dict(os.environ, {'INIT_FROM': 'operations', 'AGENT_LOAD': 'no',
+                                     'RECOVERY_USER': 'foreign', 'KEY_NAME': 'foreign',
+                                     'HUMAN_SUDO_COMMANDS': 'foreign', 'HUMAN_EXTRA': 'foreign'}), \
+                plans.plan_scope(self.modes, lambda: 'one approved E2E scenario'):
+            for mode in ('generate-user-key', 'init-server', 'reboot-host'):
+                with self.subTest(mode=mode):
+                    result = self.make_child(mode)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('OFFLINE DISPATCH ' + mode, result.stdout)
+        self.answer.assert_called_once()
+
+    def test_real_make_rejects_substituted_operation_and_frontier(self):
+        for mode in ('generate-user-key', 'init-server', 'reboot-host'):
+            for target, overrides in [('reboot-host' if mode != 'reboot-host' else 'init-server', {}),
+                                      (mode, {'INIT_FROM': 'verify'})]:
+                with self.subTest(mode=mode, target=target, overrides=overrides):
+                    result = self.make_child(mode, target=target, overrides=overrides)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('E2E child operation changed; STOP.', result.stderr)
+                    self.assertNotIn('OFFLINE DISPATCH', result.stdout)
+
+    def test_real_make_rejects_substituted_policy_inputs_before_dispatch(self):
+        inputs = ['AUTOMATION_KEY', 'HUMAN_USER', 'HUMAN_KEY', 'HUMAN_PUBLIC_KEY',
+                  'HUMAN_GROUPS', 'HUMAN_GROUPS_APPROVED', 'HUMAN_SUDO', 'HUMAN_SUDO_COMMANDS',
+                  'KEY_NAME', 'KEY_FINGERPRINT', 'RECOVERY_USER', 'RECOVERY_KEY', 'AGENT_LOAD',
+                  'HUMAN_EXTRA', 'SSH_AUTH_SOCK', 'INVENTORY', 'HOME', 'TMPDIR', 'ANSIBLE_CONFIG']
+        for mode in ('generate-user-key', 'init-server', 'reboot-host'):
+            for name in inputs:
+                with self.subTest(mode=mode, input=name):
+                    result = self.make_child(mode, overrides={name: 'foreign'})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn('OFFLINE DISPATCH', result.stdout)
+                    self.assertIn('guard failed' if name != 'SSH_AUTH_SOCK' else 'plan inputs changed', result.stderr)
+
+    def test_real_make_rejects_inventory_and_public_identity_drift(self):
+        public = Path(self.stand.child_env()['HUMAN_PUBLIC_KEY'])
+        public.parent.mkdir(parents=True)
+        public.write_text('synthetic public identity')
+        for mode in ('generate-user-key', 'init-server', 'reboot-host'):
+            with self.subTest(mode=mode):
+                result = self.make_child(mode, change=lambda: public.write_text('changed public identity'))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('plan inputs changed', result.stderr)
+                self.assertNotIn('OFFLINE DISPATCH', result.stdout)
+                public.write_text('synthetic public identity')
+        result = self.make_child('init-server', change=lambda: self.inventory.write_text('changed inventory'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('OFFLINE DISPATCH', result.stdout)
 
 
 class OperationsPlanTests(unittest.TestCase):
