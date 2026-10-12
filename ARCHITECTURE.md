@@ -150,6 +150,16 @@ their server-side responsibilities. The CLI package is never uploaded as a
 replacement for those payloads. SSH daemon/socket activation, firewall policy,
 Docker preflight and operations policy remain implemented in those components.
 
+The Stage 3 socket inspector distinguishes the effective on-disk candidate,
+PID 1's loaded properties, inherited live descriptors and desired routes.
+On disk, a supported generated `addresses.conf` resets the package listeners;
+without it, only the two reviewed Ubuntu port-22 package defaults are accepted.
+The package's binding policy normalizes disk routes independently of loaded
+state. Candidate validation requires desired disk routes before restart;
+postflight and reload scheduling compare all normalized IPv4/IPv6 route sets.
+Read-only findings expose the selected source and normalized wildcard routes,
+never raw configurations or command output. Receipt handling is unchanged.
+
 ## State and security invariants
 
 Server CLI commands hold a non-blocking exclusive `flock` on the current user's

@@ -343,6 +343,48 @@ JSONL logs remain in the fixture's `tmp/`; they do not authorize continuation.
 If output/probes fail, inspect console and the existing native read-only
 inspectors. Do not clear pending activation markers/receipts or infer cancellation.
 
+## SSH socket diagnosis (read-only)
+
+Ubuntu Noble's generator deliberately removes
+`/run/systemd/generator/ssh.socket.d/addresses.conf` when the effective SSH
+configuration matches the package's default port 22. Original Noble uses one
+dual-stack `ListenStream=22`; Noble updates use `0.0.0.0:22`, `[::]:22` and
+`BindIPv6Only=ipv6-only`. An absent drop-in alone is therefore not an activation
+failure. See the Ubuntu source
+[original generator](https://git.launchpad.net/ubuntu/+source/openssh/tree/debian/patches/sshd-socket-generator.patch?h=ubuntu/noble),
+[updated generator](https://git.launchpad.net/ubuntu/+source/openssh/tree/debian/patches/sshd-socket-generator.patch?h=ubuntu/noble-updates)
+and [updated package unit](https://git.launchpad.net/ubuntu/+source/openssh/tree/debian/systemd/ssh.socket?h=ubuntu/noble-updates).
+
+After separately authorizing a read-only inspection of the exact fixture, use
+the existing Stage 3 inspector with its isolated inventory, selected controller
+key and fixture trust. Its report shows `SSH socket route source` and normalized
+`on-disk`, `loaded`, `live` and `desired` routes. For this E2E inventory each must
+cover `ipv4:22` and `ipv6:22`; socket reload is unnecessary once they agree.
+Inspection still returns NOT READY for a pending activation receipt, while
+collecting the independent route diagnostics. It never clears the receipt.
+
+To identify the VM's package and loaded binding variant without another
+provisioning run, the operator can collect these read-only results in the
+existing guest serial console:
+
+```sh
+dpkg-query -W -f='${Version}\n' openssh-server
+systemctl show ssh.socket --property=FragmentPath,DropInPaths,Listen,BindIPv6Only,ActiveState,UnitFileState
+cat /proc/sys/net/ipv6/bindv6only
+sudo /usr/sbin/sshd -t
+sudo /usr/sbin/sshd -T | awk '$1 == "port" || $1 == "addressfamily" || $1 == "listenaddress"'
+sudo ss -H -ltnp 'sport = :22'
+```
+
+Retain the sanitized inspector report, package version, `sshd -t` exit status
+and these listener/binding properties. Do not share full SSH configuration,
+credentials or private keys. Those results distinguish legitimate default
+drop-in absence from generation failure, loaded-state drift or missing address
+families. Offline fixtures reproduce the former, but do not identify the actual
+VM's package/state or prove live access. After diagnosis, any activation/retry,
+receipt reconciliation or repeat-idempotency run needs separate authorization;
+do not restart listeners, clear markers or reset the fixture as a diagnostic step.
+
 ## Failure/recovery experiments (operator controlled)
 
 Destructive experiments are intentionally manual: there is no auto-answer,

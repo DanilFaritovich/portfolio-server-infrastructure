@@ -552,13 +552,26 @@ listeners продолжают работать как безопасный subs
 key-only SSH и `sudo -n` на каждом порту из `ssh_verify_ports`. Runtime mismatch завершает
 запуск ошибкой. Preflight проверяет
 фактические зависимости socket/service и `KillMode=process` для сохранения
-установленных сессий. Несовпадение generated ports останавливает выполнение до
+установленных сессий. Несовпадение on-disk ports останавливает выполнение до
 restart listeners; перед повторной попыткой согласуйте конфигурацию через recovery
-access. При socket drift handlers запускаются и с неизменённым установленным SSH
-block, чтобы завершить прерванный transition за один `make harden`. Безопасный
-pre-transition drift generated/loaded/live даёт WARN в `make inspect-hardening`,
+access. При безопасном socket drift без pending receipt handlers запускаются и с
+неизменённым установленным SSH block, обеспечивая convergence за один `make harden`.
+Безопасный pre-transition drift on-disk/loaded/live даёт WARN в `make inspect-hardening`,
 который остаётся READY; после convergence эти проверки дают PASS. Повторный запуск после convergence
-не выполняет reload/restart SSH. См.
+не выполняет reload/restart SSH.
+On-disk socket candidate объединяет проверенный пакетный unit и поддерживаемый
+generated `addresses.conf`. Генератор Ubuntu намеренно не создаёт этот drop-in
+для штатного порта 22. Поддерживаются оба проверенных пакетных варианта:
+один dual-stack `ListenStream=22` и отдельные IPv4/IPv6 listeners с
+`BindIPv6Only=ipv6-only`. Инспектор читает binding policy с диска независимо от
+возможно устаревших loaded properties; отсутствие drop-in не означает, что
+настроены нестандартные desired ports. Candidate, runtime и решение о reload
+сравнивают одинаково нормализованные wildcard IPv4/IPv6 routes. Pending activation
+по-прежнему блокирует обычные preflight/verification. Read-only отчёт показывает
+источник socket routes и нормализованные on-disk, loaded, live и desired routes;
+сырое содержимое units и команд не выводится. См.
+[диагностику E2E socket](docs/local-vm-e2e.md#ssh-socket-diagnosis-read-only).
+См.
 [Ubuntu socket activation](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189),
 [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
 и [OpenSSH configuration](https://man.openbsd.org/sshd_config).

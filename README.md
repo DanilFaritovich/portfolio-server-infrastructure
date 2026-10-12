@@ -553,14 +553,24 @@ ordered transaction. The role then strictly verifies generated, loaded and live
 routes, effective SSH ports, Docker/containerd and the active UFW with exact desired
 IPv4/IPv6 TCP rules. The wrapper verifies fresh key-only SSH and `sudo -n` on every
 `ssh_verify_ports` entry. Runtime mismatch is a hard failure. Preflight checks the actual socket/service dependencies and
-`KillMode=process` to preserve established sessions. A generated-port mismatch
+`KillMode=process` to preserve established sessions. An on-disk port mismatch
 stops before listener restart; use recovery access to reconcile configuration
-before retrying. Socket drift also schedules these handlers when the installed
-SSH block is unchanged, allowing an interrupted transition to converge in one
-`make harden` run. Safe pre-transition generated/loaded/live drift is reported as
+before retrying. Safe socket drift without a pending receipt also schedules these
+handlers when the installed SSH block is unchanged, converging in one
+`make harden` run. Safe pre-transition on-disk/loaded/live drift is reported as
 WARN by `make inspect-hardening`, which remains READY; it becomes PASS after
-convergence. A converged
-repeat run does not reload or restart SSH.
+convergence. A converged repeat run does not reload or restart SSH.
+The on-disk socket candidate combines the validated package unit and any
+supported generated `addresses.conf`. Ubuntu's generator intentionally omits
+that drop-in for stock port 22. Both reviewed package defaults are supported:
+one dual-stack `ListenStream=22`, and separate IPv4/IPv6 listeners with
+`BindIPv6Only=ipv6-only`. The inspector reads their binding policy from disk,
+independently of possibly stale loaded properties; absence never implies that
+nondefault desired ports are configured. Candidate, runtime and reload scheduling
+compare the same normalized wildcard IPv4/IPv6 routes. Pending activation still
+blocks ordinary preflight/verification. The read-only report includes the socket
+route source and normalized on-disk, loaded, live and desired routes; raw unit or
+command contents remain withheld. See [E2E socket diagnosis](docs/local-vm-e2e.md#ssh-socket-diagnosis-read-only).
 See [Ubuntu socket activation](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189).
 See [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
 and [OpenSSH configuration](https://man.openbsd.org/sshd_config).
