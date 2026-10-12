@@ -256,38 +256,130 @@ def storage_parents(storage):
                 and os.access(parent, os.X_OK), 'E2E storage parents require protected root ownership and traversal.')
 
 
-def prepare(storage, *, command, confirm, safe_path):
+def prepare(storage, *, command, confirm, safe_path, ready_plan=None):
     require(os.getuid() != 0, 'Run E2E as the controller user, never with sudo.')
     supported_host()
     require(re.search(r'\b(vmx|svm)\b', Path('/proc/cpuinfo').read_text()),
             'CPU virtualization flags unavailable; enable hardware virtualization before installing E2E dependencies.')
     missing = dependency_plan()
+    account = pwd.getpwuid(os.getuid())
+    require(re.fullmatch(r'[a-z_][a-z0-9_-]*\$?', account.pw_name), 'Unsupported controller account name.')
+    effective = set(os.getgroups()) | {os.getgid()}
+    required_groups = {}
+    for name in ('libvirt', 'kvm'):
+        try:
+            required_groups[name] = grp.getgrnam(name)
+        except KeyError:
+            require(bool(missing), 'Required host group missing; inspect manually.')
+            required_groups[name] = None  # Identity can only be reviewed after package installation.
+    pending = [name for name, group in required_groups.items()
+               if group is None or group.gr_gid not in effective]
+    additions = [name for name in pending if required_groups[name] is not None
+                 and account.pw_name not in required_groups[name].gr_mem
+                 and required_groups[name].gr_gid != account.pw_gid]
+    install_action = ('Install only these missing E2E host dependencies using sudo/apt: '
+                      + ', '.join(missing) + '; apt-get update; apt-get install '
+                      '--no-install-recommends --no-upgrade --no-remove.')
+    group_action = ('Grant these libvirt/KVM host permissions using sudo: ' + ', '.join(additions)
+                    + '; additive usermod only. libvirt access is root-equivalent. '
+                    'Stop for reboot before VM creation.')
+    create_action = 'Create the new dedicated E2E disk directory using sudo?'
+    finish_action = 'Finish this empty E2E disk directory using sudo chmod 2750?'
+    actions = ([install_action] if missing else []) + ([group_action] if additions else [])
+    storage_snapshot = None
+    planned_gid = None
+    # Group activation is a separate invocation boundary. Do not approve a VM
+    # or storage change that this invocation cannot reach safely.
+    if not pending and 'libvirt-daemon-system' not in missing:
+        planned_gid = qemu_group(command=command, confirm=confirm)
+        storage_parents(storage)
+        if not storage.exists() and not storage.is_symlink():
+            storage_snapshot = 'absent'
+            actions.append(create_action)
+            print(f'Directory plan: {storage}, owner UID={os.getuid()}, QEMU GID={planned_gid}, mode=2750.')
+        else:
+            safe_path(storage, directory=True, private=False)
+            info = storage.stat()
+            storage_snapshot = (info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+                                info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
+            if (info.st_gid == planned_gid and stat.S_IMODE(info.st_mode) == 0o750
+                    and not list(storage.iterdir()) and 'system.posix_acl_access' not in os.listxattr(storage)):
+                actions.append(finish_action)
+            else:
+                require(info.st_gid == planned_gid and stat.S_IMODE(info.st_mode) == 0o2750
+                        and os.access(storage, os.R_OK | os.W_OK | os.X_OK),
+                        'Existing disk directory has incompatible QEMU group/mode/access; inspect manually, no chmod/chown repair.')
+
+    if not pending and ready_plan:
+        actions.append(ready_plan)
+
+    qemu_config = Path('/etc/libvirt/qemu.conf')
+    qemu_snapshot = qemu_config.stat() if planned_gid is not None and qemu_config.exists() else None
+
+    def validate_qemu():
+        if qemu_snapshot is not None:
+            require(not qemu_config.is_symlink() and qemu_config.stat() == qemu_snapshot,
+                    'QEMU configuration plan changed; STOP.')
+
+    def current_group(name):
+        try:
+            return grp.getgrnam(name)
+        except KeyError:
+            return None
+
+    def validate_permissions():
+        require(all(current_group(name) == group
+                    for name, group in required_groups.items())
+                and pwd.getpwuid(os.getuid()) == account
+                and (set(os.getgroups()) | {os.getgid()}) == effective,
+                'Host permission plan changed; STOP.')
+
+    def validate_storage():
+        if storage_snapshot is None:
+            return
+        storage_parents(storage)
+        if storage_snapshot == 'absent':
+            require(not storage.exists() and not storage.is_symlink(), 'Disk directory changed during confirmation; STOP.')
+        else:
+            safe_path(storage, directory=True, private=False)
+            current = storage.stat()
+            require(storage_snapshot == (current.st_dev, current.st_ino, current.st_uid, current.st_gid,
+                                         current.st_mode, current.st_mtime_ns, current.st_ctime_ns),
+                    'Disk directory changed during confirmation; STOP.')
+            if finish_action in actions:
+                require(not list(storage.iterdir()) and 'system.posix_acl_access' not in os.listxattr(storage),
+                        'Disk directory changed during confirmation; STOP.')
+
+    if actions:
+        confirm('\n  - '.join(actions))
+        validate_permissions()
+        validate_qemu()
+        validate_storage()
     if missing:
-        print('Missing E2E host packages: ' + ', '.join(missing))
-        print('Privileged plan: apt-get update; apt-get install --no-install-recommends --no-upgrade --no-remove ' + ' '.join(missing))
-        confirm('Install only these missing E2E host dependencies using sudo/apt?')
         require(missing == dependency_plan(), 'Dependency plan changed; STOP before installation.')
         privileged(['apt-get', 'update'], command)
         privileged(['apt-get', 'install', '--no-install-recommends', '--no-upgrade', '--no-remove', *missing], command)
         require(not dependency_plan(), 'E2E packages/tools still unavailable after apt; STOP, no automatic retry.')
+    # Newly installed group identities were unavailable for the preliminary plan.
+    unknown = [name for name, group in required_groups.items() if group is None]
+    require(all(current_group(name) == group for name, group in required_groups.items() if group is not None)
+            and pwd.getpwuid(os.getuid()) == account
+            and (set(os.getgroups()) | {os.getgid()}) == effective, 'Host permission plan changed; STOP.')
+    for name in unknown:
+        required_groups[name] = grp.getgrnam(name)
+    discovered = [name for name in unknown if required_groups[name].gr_gid not in effective
+                  and account.pw_name not in required_groups[name].gr_mem
+                  and required_groups[name].gr_gid != account.pw_gid]
+    if discovered:
+        confirm('Grant newly discovered libvirt/KVM host permissions using sudo: ' + ', '.join(discovered)
+                + '; additive usermod only, root-equivalent libvirt access; stop for reboot.')
+        validate_permissions()
+        additions += discovered
     kvm = Path('/dev/kvm')
     require(kvm.exists() and stat.S_ISCHR(kvm.stat().st_mode),
             'KVM unavailable; enable hardware virtualization/KVM manually. Software emulation is unsupported.')
-    account = pwd.getpwuid(os.getuid())
-    require(re.fullmatch(r'[a-z_][a-z0-9_-]*\$?', account.pw_name), 'Unsupported controller account name.')
-    required_groups = {name: grp.getgrnam(name) for name in ('libvirt', 'kvm')}
-    effective = set(os.getgroups()) | {os.getgid()}
-    pending = [name for name, group in required_groups.items() if group.gr_gid not in effective]
-    additions = [name for name in pending if account.pw_name not in required_groups[name].gr_mem
-                 and required_groups[name].gr_gid != account.pw_gid]
     if additions:
-        print('Privileged plan: add controller to groups ' + ', '.join(additions)
-              + '. libvirt access is root-equivalent; only trusted administrators should receive it.')
-        confirm('Grant these libvirt/KVM host permissions using sudo?')
-        require(all(grp.getgrnam(name) == required_groups[name] for name in required_groups)
-                and pwd.getpwuid(os.getuid()) == account
-                and (set(os.getgroups()) | {os.getgid()}) == effective,
-                'Host permission plan changed; STOP.')
+        validate_permissions()
         privileged(['usermod', '-aG', ','.join(additions), '--', account.pw_name], command)
     if pending:
         # Successful usermod alone is insufficient evidence of configured membership.
@@ -302,11 +394,17 @@ def prepare(storage, *, command, confirm, safe_path):
     capabilities = ET.fromstring(command(['virsh', '--connect', 'qemu:///system', 'capabilities']))
     require(capabilities.find("guest/arch[@name='x86_64']/domain[@type='kvm']") is not None,
             'libvirt does not advertise x86_64 KVM; inspect host configuration manually.')
-    gid = qemu_group(command=command, confirm=confirm)
+    validate_qemu()
+    # Reuse the read-only inspection grant only within this invocation, after
+    # checking the same configuration snapshot; native sudo remains enforced.
+    gid = qemu_group(command=command, confirm=(lambda message: None) if planned_gid is not None else confirm)
+    require(planned_gid is None or gid == planned_gid, 'QEMU group plan changed; STOP.')
+    validate_storage()
     storage_parents(storage)
     if not storage.exists() and not storage.is_symlink():
         print(f'Privileged plan: create only {storage}, owner UID={os.getuid()}, QEMU GID={gid}, mode=2750.')
-        confirm('Create the new dedicated E2E disk directory using sudo?')
+        if create_action not in actions:
+            confirm(create_action)
         storage_parents(storage)
         # mkdir is exclusive: a concurrently appearing directory fails without changing it.
         privileged(['mkdir', '-m', '2750', '--', str(storage)], command)
@@ -329,7 +427,8 @@ def prepare(storage, *, command, confirm, safe_path):
                         info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
             print('Privileged plan: finish the empty dedicated E2E directory by setting mode 2750; '
                   'no ownership/group or VM changes.')
-            confirm('Finish this empty E2E disk directory using sudo chmod 2750?')
+            if finish_action not in actions:
+                confirm(finish_action)
             storage_parents(storage)
             safe_path(storage, directory=True, private=False)
             current = storage.stat()

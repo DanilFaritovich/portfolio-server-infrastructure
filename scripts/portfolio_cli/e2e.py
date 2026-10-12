@@ -545,20 +545,26 @@ class Stand:
                          'Console recovery/readiness and baseline shutdown require a later concrete plan.')
         creation_approved = False
         selected = tuple(os.environ.get(name) for name in ('E2E_DISTRO', 'E2E_CPUS', 'E2E_MEMORY', 'E2E_DISK_GB', 'E2E_SUBNET', 'E2E_IMAGE_SHA256'))
+        def validate_plan():
+            require(selected == tuple(os.environ.get(name) for name in ('E2E_DISTRO', 'E2E_CPUS', 'E2E_MEMORY', 'E2E_DISK_GB', 'E2E_SUBNET', 'E2E_IMAGE_SHA256')),
+                    'E2E plan inputs changed; STOP.')
+
         def host_confirm(message):
             nonlocal creation_approved
-            if message.startswith(('Create the new dedicated', 'Finish this empty')):
-                self.no_overlap()
+            if creation_plan in message:
+                confirm(message)
+                creation_approved = True
+            elif ('Create the new dedicated' in message or 'Finish this empty' in message):
                 confirm(message + ' ' + creation_plan)
                 creation_approved = True
             else:
                 confirm(message)
-            require(selected == tuple(os.environ.get(name) for name in ('E2E_DISTRO', 'E2E_CPUS', 'E2E_MEMORY', 'E2E_DISK_GB', 'E2E_SUBNET', 'E2E_IMAGE_SHA256')),
-                    'E2E plan inputs changed; STOP.')
-        result = e2e_host.prepare(self.storage, command=command, confirm=host_confirm, safe_path=safe_path)
+            validate_plan()
+        result = e2e_host.prepare(self.storage, command=command, confirm=host_confirm, safe_path=safe_path, ready_plan=creation_plan)
         if result is e2e_host.PreparationResult.REBOOT_REQUIRED:
             self.state = None
             return result
+        validate_plan()
         require(not list(self.storage.iterdir()), 'E2E storage must be empty; no disk will be overwritten.')
         self.no_overlap()
         if not creation_approved:

@@ -153,6 +153,9 @@ host contact; explicit public-file automation remains supported.
 Exact no-op evidence skips application and its prompt where supported; Docker's
 disposable smoke test still changes runtime/image cache. Local `setup`/`deps` skip
 downloads and confirmation when pinned tooling and the requested inventory are ready.
+CI uses `make deps-ci` for explicit noninteractive installation of only the same
+pinned project-local dependencies, retaining checksum and plan-input validation.
+It does not create inventory or authorize server/SSH/E2E operations.
 
 The standard path is **bootstrap_login_user + interactive SSH password →
 ansible_user + dedicated SSH key + NOPASSWD sudo**. The initial login is used only
@@ -222,6 +225,7 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | Target | Purpose | Host access |
 | --- | --- | --- |
 | `make setup` | Install local dependencies; create missing local inventory | Dependency registries only |
+| `make deps-ci` | Install pinned local tooling/collections without interactive consent (CI) | Dependency registries only |
 | `make deps` | Install pinned local tooling/collections | Dependency registries only |
 | `make generate-user-key` | Generate a local human Ed25519 keypair and offer agent loading | **LOCAL / key files and optional local agent** |
 | `make load-user-key` | Load the selected existing key into the local SSH agent | **LOCAL / agent only** |
@@ -1600,7 +1604,11 @@ persistence. Failures preserve the guest for console diagnosis, without auto-res
 `make e2e-prepare E2E_DISTRO=ubuntu-22.04`. Host checks use Linux x86_64/KVM/libvirt
 capabilities without a Ubuntu version allowlist. Compatible Ubuntu/Debian apt environments offer missing-package
 installation; other managers require manual setup when tools are missing. Prepare
-offers additive libvirt/kvm groups and a dedicated disk directory with separate `[y/N]` confirmations. Group
+combines known missing packages, additive libvirt/kvm groups and dedicated disk
+preparation into one preliminary plan and one default-deny `[y/N]`. VM creation
+joins that plan when permissions are effective. Plan snapshots are revalidated;
+new identities/storage details discovered only after installation need separate
+consent. Native sudo authentication remains interactive. Group
 changes finish successfully with a Reboot now/later menu only while configured groups
 remain inactive. Reboot now prints the rerun instruction, warns about unsaved data
 and requires a separate `[y/N]`. A complete local non-root GNOME X11/Wayland
@@ -1619,7 +1627,7 @@ If root-owned `qemu.conf` is unreadable, prepare separately offers read-only sud
 inspection of file safety and QEMU identity within the same command, without
 printing configuration or changing file permissions. Failed/declined inspection
 or custom settings stop before disk/VM creation.
-Prepare also offers separately confirmed completion of an empty dedicated disk
+Prepare also includes explicitly approved completion of an empty dedicated disk
 directory left at 0750 by an earlier setgid bug, verifying ownership/group and
 unchanged state before sudo chmod 2750. No extra shell command is needed;
 other directory drift or existing data remains blocking.

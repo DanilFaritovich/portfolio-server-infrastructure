@@ -10,7 +10,13 @@ fail() {
 project_dir=$(CDPATH= cd "${0%/*}/.." && pwd)
 cd "$project_dir"
 mode=${1:-setup}
-case "$mode" in setup|deps) ;; *) fail 'use setup or deps.' ;; esac
+case "$mode" in setup|deps|deps-ci) ;; *) fail 'use setup, deps or deps-ci.' ;; esac
+[ "$#" -le 1 ] || fail 'unexpected setup arguments.'
+noninteractive=false
+if [ "$mode" = deps-ci ]; then
+    noninteractive=true
+    mode=deps
+fi
 
 for tool in sh make cat curl tar gzip sha256sum uname mkdir mktemp chmod mv rm head ssh ssh-keygen ssh-keyscan scp sftp; do
     command -v "$tool" >/dev/null 2>&1 || fail "missing $tool; install this system prerequisite and retry."
@@ -43,9 +49,13 @@ if [ "$mode" = setup ] && [ ! -e "$inventory" ]; then
     echo "  - Exclusively create missing inventory at $inventory (0600) and missing parent directories."
 fi
 echo '  - Rights: current controller user only; no sudo or system package changes.'
-printf 'Apply this plan? [y/N] '
-IFS= read -r answer || fail 'plan declined (end of input); no changes requested.'
-case "$answer" in y|Y|yes|YES) ;; *) fail 'plan declined; no changes requested.' ;; esac
+if [ "$noninteractive" = true ]; then
+    echo 'Noninteractive dependency-only installation authorized by deps-ci.'
+else
+    printf 'Apply this plan? [y/N] '
+    IFS= read -r answer || fail 'plan declined (end of input); no changes requested.'
+    case "$answer" in y|Y|yes|YES) ;; *) fail 'plan declined; no changes requested.' ;; esac
+fi
 [ "$plan_snapshot" = "$(sha256sum requirements-dev.txt collections.yml scripts/setup.sh scripts/setup-ready.py scripts/install-uv.sh scripts/install-actionlint.sh)" ] || fail 'plan inputs changed; STOP.'
 umask 077
 export ANSIBLE_HOME="$project_dir/.ansible"

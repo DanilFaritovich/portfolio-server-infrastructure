@@ -25,7 +25,13 @@ the controller and scenario Ansible commands retain their pinned tooling.
 `make e2e-prepare` checks CPU virtualization flags, installed packages and commands,
 `/dev/kvm` access, effective libvirt/kvm groups, non-sudo `qemu:///system` access,
 x86_64 KVM capabilities and disk directory ownership/mode. Host changes occur only
-for a new fixture, with separate default-deny TTY confirmations:
+for a new fixture. Known package, group and disk changes share one preliminary
+plan and one default-deny TTY confirmation, with snapshot revalidation before
+execution. VM creation joins the plan only when current groups are effective;
+otherwise this invocation stops for reboot. Native sudo authentication remains
+separate. Newly discovered group identities or storage details after installation,
+read-only privileged QEMU discovery, reboot and console recovery/baseline shutdown
+retain their own concrete confirmations. Approval lasts only for this invocation:
 
 1. Missing dependencies are listed before offering `sudo apt-get update` and
    `sudo apt-get install --no-install-recommends --no-upgrade --no-remove` for
@@ -42,7 +48,7 @@ for a new fixture, with separate default-deny TTY confirmations:
    instructions. A manually prepared host may continue without package-manager
    support if all tools and subsequent capability/access/storage checks pass.
    No distribution-specific package names are guessed for unsupported managers.
-2. Missing libvirt/kvm membership is offered separately, using only additive
+2. Known missing libvirt/kvm membership is included in the plan, using only additive
    `usermod -aG`. **libvirt access is root-equivalent**; grant it only to trusted
    local administrators. If configured groups are not effective in this session,
    prepare finishes successfully with a reboot-required result, before disk/VM
@@ -102,13 +108,15 @@ for a new fixture, with separate default-deny TTY confirmations:
    become active.
 
 3. The missing `/var/lib/libvirt/images/portfolio-e2e-<UID>` directory is offered
-   separately. Exclusive `mkdir` refuses a concurrently appearing path; only this
+   in the plan when its QEMU identity and protected parents are known. Exclusive
+   `mkdir` refuses a concurrently appearing path; only this
    new directory receives controller ownership, stock `libvirt-qemu` group and
    mode 2750. The final chmod also uses sudo: an owner outside the QEMU group
    cannot retain setgid with an unprivileged chmod. Parent paths must already
    be protected root-owned directories. Existing ownership/group are never repaired.
    For the empty dedicated directory left by the earlier chmod bug, prepare may
-   separately offer finishing mode 0750 to 2750 within the same command. It requires
+   include finishing mode 0750 to 2750 in the agreed plan within the same command.
+   It requires
    the correct controller/QEMU ownership, no symlinks or access ACL, and an unchanged
    directory snapshot and empty contents after confirmation. No existing fixture,
    VM data, other mode or ownership/group drift receives this exception.

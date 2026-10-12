@@ -203,12 +203,116 @@ class HostTests(unittest.TestCase):
             self.prepare()
         self.assertEqual(self.run.call_count, 2)
 
-    def test_group_grant_requires_separate_consent_and_reboot(self):
+    def test_group_grant_requires_plan_consent_and_reboot(self):
         self.groups['libvirt'] = SimpleNamespace(gr_gid=987654, gr_mem=[])
         self.run.side_effect = lambda *args, **kwargs: self.groups['libvirt'].gr_mem.append('tester')
         self.assertIs(self.prepare(), host.PreparationResult.REBOOT_REQUIRED)
         self.assertEqual(self.run.call_args.args[0], ['sudo', '--', 'usermod', '-aG', 'libvirt', '--', 'tester'])
         self.confirm.assert_called_once()
+
+    def test_packages_and_known_groups_share_one_plan_before_sudo(self):
+        self.missing.side_effect = [['virtinst'], ['virtinst'], []]
+        self.groups['libvirt'] = SimpleNamespace(gr_gid=987654, gr_mem=[])
+        def consent(message):
+            self.run.assert_not_called()
+            self.assertIn('virtinst', message)
+            self.assertIn('libvirt', message)
+            self.assertIn('root-equivalent', message)
+            self.assertNotIn('Create the new dedicated', message)
+        self.confirm.side_effect = consent
+        def execute(argv, **kwargs):
+            self.assertFalse(kwargs['capture'])
+            self.assertIsNone(kwargs['timeout'])
+            if argv[2] == 'usermod':
+                self.groups['libvirt'].gr_mem.append('tester')
+        self.run.side_effect = execute
+        self.assertIs(self.prepare(), host.PreparationResult.REBOOT_REQUIRED)
+        self.confirm.assert_called_once()
+        self.assertEqual([call.args[0][2] for call in self.run.call_args_list],
+                         ['apt-get', 'apt-get', 'usermod'])
+
+    def test_combined_plan_decline_and_group_drift_stop_before_install(self):
+        for drift in (False, True):
+            with self.subTest(drift=drift):
+                self.missing.return_value = ['virtinst']
+                self.groups['libvirt'] = SimpleNamespace(gr_gid=987654, gr_mem=[])
+                self.run.reset_mock()
+                def consent(message):
+                    if drift:
+                        self.groups['libvirt'] = SimpleNamespace(gr_gid=987655, gr_mem=[])
+                    else:
+                        raise images.E2EError('declined')
+                self.confirm.side_effect = consent
+                with self.assertRaisesRegex(ValueError, 'changed|declined'):
+                    self.prepare()
+                self.run.assert_not_called()
+
+    def test_packages_and_empty_directory_finish_share_plan_and_snapshot(self):
+        self.storage.chmod(0o750)
+        self.missing.side_effect = [['virtinst'], ['virtinst'], []]
+        def consent(message):
+            self.run.assert_not_called()
+            self.assertIn('virtinst', message)
+            self.assertIn('Finish this empty', message)
+        self.confirm.side_effect = consent
+        def execute(argv, **kwargs):
+            if argv[0] == 'sudo' and argv[2] == 'chmod':
+                self.storage.chmod(0o2750)
+            return self.run.return_value
+        self.run.side_effect = execute
+        self.assertIs(self.prepare(), host.PreparationResult.READY)
+        self.confirm.assert_called_once()
+
+    def test_ready_stage_plan_joins_package_consent_and_does_not_include_reboot(self):
+        self.missing.side_effect = [['virtinst'], ['virtinst'], []]
+        host.prepare(self.storage, command=self.run, confirm=self.confirm,
+                     safe_path=e2e.safe_path, ready_plan='Create the selected fixture VM.')
+        self.confirm.assert_called_once()
+        self.assertIn('virtinst', self.confirm.call_args.args[0])
+        self.assertIn('Create the selected fixture VM.', self.confirm.call_args.args[0])
+        self.assertNotIn('reboot', self.confirm.call_args.args[0])
+
+    def test_new_package_groups_require_only_new_identity_consent(self):
+        self.missing.side_effect = [['libvirt-daemon-system'], ['libvirt-daemon-system'], []]
+        del self.groups['libvirt']
+        def lookup(name):
+            if name not in self.groups:
+                raise KeyError(name)
+            return self.groups[name]
+        def execute(argv, **kwargs):
+            if argv[2] == 'apt-get' and argv[3] == 'install':
+                self.groups['libvirt'] = SimpleNamespace(gr_gid=987654, gr_mem=[])
+            elif argv[2] == 'usermod':
+                self.groups['libvirt'].gr_mem.append('tester')
+        self.run.side_effect = execute
+        with patch.object(host.grp, 'getgrnam', side_effect=lookup):
+            self.assertIs(self.prepare(), host.PreparationResult.REBOOT_REQUIRED)
+        self.assertEqual(self.confirm.call_count, 2)
+        self.assertIn('dependencies', self.confirm.call_args_list[0].args[0])
+        self.assertIn('newly discovered', self.confirm.call_args_list[1].args[0])
+        self.assertNotIn('dependencies', self.confirm.call_args_list[1].args[0])
+
+    def test_e2e_no_tty_combined_plan_stops_before_sudo(self):
+        self.missing.return_value = ['virtinst']
+        with patch.object(sys.stdin, 'isatty', return_value=False), self.assertRaisesRegex(ValueError, 'TTY'):
+            host.prepare(self.storage, command=self.run, confirm=e2e.confirm, safe_path=e2e.safe_path)
+        self.run.assert_not_called()
+
+    def test_storage_drift_in_combined_plan_stops_before_install(self):
+        self.storage.chmod(0o750)
+        self.missing.return_value = ['virtinst']
+        self.confirm.side_effect = lambda message: self.storage.chmod(0o700)
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            self.prepare()
+        self.run.assert_not_called()
+
+    def test_dependency_drift_in_combined_plan_stops_before_sudo(self):
+        self.missing.side_effect = [['virtinst'], ['qemu-utils']]
+        self.groups['libvirt'] = SimpleNamespace(gr_gid=987654, gr_mem=[])
+        with self.assertRaisesRegex(ValueError, 'Dependency plan changed'):
+            self.prepare()
+        self.confirm.assert_called_once()
+        self.run.assert_not_called()
 
     def test_already_configured_group_requires_reboot_without_usermod(self):
         self.groups['libvirt'] = SimpleNamespace(gr_gid=987654, gr_mem=['tester'])
@@ -816,6 +920,32 @@ class RebootTests(unittest.TestCase):
             confirm.assert_not_called()
             self.assertFalse(stand.root.exists())
             self.assertIsNone(stand.state)
+
+    def test_prepare_reuses_combined_host_and_vm_approval(self):
+        for drift in (False, True):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
+                stand = e2e.Stand(Path(directory) / 'fixture')
+                stand.storage = Path(directory) / 'storage'
+                stand.storage.mkdir()
+                def prepare(storage, **kwargs):
+                    kwargs['confirm']('Install missing packages.\n  - ' + kwargs['ready_plan'])
+                    if drift:
+                        os.environ['E2E_CPUS'] = '3'
+                    return host.PreparationResult.READY
+                with patch.dict(os.environ, E2E_CPUS='2'), \
+                        patch.object(host, 'prepare', side_effect=prepare), \
+                        patch.object(stand, 'no_overlap'), patch.object(e2e, 'confirm') as confirm, \
+                        patch.object(e2e, 'disposable_password', return_value='synthetic'), \
+                        patch.object(e2e, 'command', side_effect=images.E2EError('fixture boundary')) as command:
+                    with self.assertRaisesRegex(ValueError, 'inputs changed' if drift else 'fixture boundary'):
+                        stand.prepare()
+                    confirm.assert_called_once()
+                    self.assertIn('Create the local', confirm.call_args.args[0])
+                    if drift:
+                        command.assert_not_called()
+                    else:
+                        command.assert_called_once()
+                    self.assertFalse(stand.root.exists())
 
     def test_cli_pending_is_success_and_releases_lock_before_menu(self):
         locked = False

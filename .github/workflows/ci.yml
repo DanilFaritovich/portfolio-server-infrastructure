@@ -20,6 +20,6 @@ jobs:
         with:
           persist-credentials: false
       - name: Prepare project-local toolchain and validation dependencies
-        run: make deps
+        run: make deps-ci
       - name: Run offline validation without production credentials
         run: make ci
