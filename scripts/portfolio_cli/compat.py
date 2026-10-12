@@ -13,7 +13,7 @@ from types import FunctionType
 
 
 MODULES = (
-    'common', 'inventory', 'keys', 'clipboard', 'host_trust', 'ansible',
+    'common', 'plans', 'inventory', 'keys', 'clipboard', 'host_trust', 'ansible',
     'inspection', 'verification', 'provisioning', 'human_access',
     'user_management', 'operations', 'initialization', 'local_keys', 'ssh', 'cli',
 )
@@ -27,6 +27,7 @@ def install(namespace):
         exports.update((key, value) for key, value in vars(module).items()
                        if not key.startswith('_'))
     namespace.update(exports)
+    namespace['PLAN_SCOPE'] = namespace['ContextVar']('legacy_plan_scope', default=None)
     # These values were evaluated separately on each legacy module import.
     namespace['DEFAULT_KEY'] = namespace['Path'].home() / '.ssh/portfolio-server-infrastructure/ansible_ed25519'
     for name in ('HARDENING_FIELDS', 'HOST_FIELDS'):
@@ -34,7 +35,7 @@ def install(namespace):
     for name, value in exports.items():
         if not isinstance(value, FunctionType) or not value.__module__.startswith(__package__ + '.'):
             continue
-        decorated = name in ('public_key_snapshot', 'add_user_public_key', 'pipeline_lock')
+        decorated = name in ('public_key_snapshot', 'add_user_public_key', 'pipeline_lock', 'plan_scope', 'e2e_child_plan', 'e2e_plan_pipe')
         original = value.__wrapped__ if decorated else value
         bound = FunctionType(original.__code__, namespace, original.__name__,
                              original.__defaults__, original.__closure__)

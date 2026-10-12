@@ -491,7 +491,7 @@ class WrapperTests(unittest.TestCase):
     def test_remove_proves_recovery_before_confirmation_and_verifies_after(self):
         with patch('builtins.input', side_effect=lambda *args: self.events.append('confirm') or 'yes'):
             access.user_management('remove-user', Path('/synthetic/inventory'))
-        self.assertEqual(['managed-proof', 'inspect', 'inspect', 'recovery-proof', 'confirm', 'mutate', 'managed-proof'], self.events)
+        self.assertEqual(['managed-proof', 'inspect', 'inspect', 'recovery-proof', 'confirm', 'inspect', 'mutate', 'managed-proof'], self.events)
 
     def test_existing_user_import_skips_account_role_and_never_needs_import_private_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -502,11 +502,11 @@ class WrapperTests(unittest.TestCase):
                     patch.object(access, 'public_fingerprint', return_value='SHA256:synthetic'), \
                     patch.object(access, 'public_key_file', side_effect=lambda value: Path(value)), \
                     patch.object(access, 'verify_hardening'), \
-                    patch.object(access, 'user_probe', return_value={'existing': True, 'token': 'fresh'}) as probe, \
+                    patch.object(access, 'user_probe', return_value={'existing': True, 'token': 'fresh', 'keys': []}) as probe, \
                     patch.object(access, 'run_playbook') as playbook:
                 access.human_access('add-user', Path('/synthetic/inventory'))
             playbook.assert_not_called()
-            self.assertEqual(['preflight-add-user', 'add-user-key'], [call.args[-1]['action'] for call in probe.call_args_list])
+            self.assertEqual(['preflight-add-user', 'show-user', 'preflight-add-user', 'add-user-key'], [call.args[-1]['action'] for call in probe.call_args_list])
             self.assertEqual(key(2), probe.call_args.args[-1]['key'])
         self.assertNotIn('recovery-proof', self.events)
 
@@ -691,6 +691,21 @@ class SafetySurfaceTests(unittest.TestCase):
         payload = run.call_args.kwargs['input']
         self.assertNotIn('from ansible', payload)
         compile(payload, 'stream', 'exec')
+
+    def test_stream_transport_uses_current_trust_policy_and_reports_ssh_failure_safely(self):
+        import subprocess
+        trust = '/synthetic/e2e/home/.ssh/known_hosts'
+        base = access.common.SSH_BASE + ' -o UserKnownHostsFile=' + trust
+        with patch.object(access.common, 'SSH_BASE', base), \
+                patch.object(access.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    [], 255, '', 'Host key verification failed. secret detail')) as run:
+            with self.assertRaisesRegex(ValueError, 'SSH command failed.*exit status 255') as caught:
+                access.user_probe('host.test', 2222, '/usr/bin/python3', Path('/synthetic/controller'),
+                                  'controller', {'action': 'list-users'})
+        command = run.call_args.args[0]
+        self.assertIn('UserKnownHostsFile=' + trust, command)
+        self.assertIn('StrictHostKeyChecking=yes', command)
+        self.assertNotIn('secret', str(caught.exception))
 
     def test_ssh_match_unsupported_include_and_pending_activation_block(self):
         with tempfile.TemporaryDirectory() as directory:

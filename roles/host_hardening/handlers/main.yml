@@ -20,7 +20,10 @@
   when: hardening_before.ssh_activation == 'socket'
   listen: Reload SSH after validated configuration changes
 
-- name: Validate effective generated socket before restarting any SSH listener
+# The generator legitimately emits no addresses.conf for stock port 22.
+# Validate the package defaults plus supported generated drop-in, independently
+# of loaded properties and descriptors that may retain the old listeners.
+- name: Validate effective socket configuration before restarting any SSH listener
   portfolio_hardening_info:
     current_port: "{{ ansible_port | int }}"
     ssh_ports: "{{ ssh_listen_ports }}"

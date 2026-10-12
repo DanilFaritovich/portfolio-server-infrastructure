@@ -351,7 +351,7 @@ class PortTrustTests(unittest.TestCase):
                     patch.object(access.platform, 'freedesktop_os_release', return_value={'ID': 'ubuntu'}), \
                     patch.object(access.os, 'geteuid', return_value=0), patch('builtins.input', return_value=answer), \
                     patch.object(access.subprocess, 'run', side_effect=run):
-                if answer == 'n':
+                if answer in ('', 'n'):
                     with self.assertRaisesRegex(ValueError, 'declined'):
                         access.copy_clipboard('{"fixture":true}', 'show-server-trust')
                     self.assertEqual(calls, [])

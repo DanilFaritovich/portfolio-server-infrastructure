@@ -1,0 +1,30 @@
+---
+schema: 1
+default: ubuntu-24.04
+legacy_schema1: ubuntu-24.04
+distros:
+  - id: ubuntu-24.04
+    distribution: ubuntu
+    version: '24.04'
+    name: Ubuntu Server 24.04 LTS
+    architecture: amd64
+    image_url: https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
+    checksum_url: https://cloud-images.ubuntu.com/releases/noble/release/SHA256SUMS
+    # Conservative virtio/BIOS profile also available in Jammy host osinfo-db.
+    osinfo: ubuntu22.04
+    boot: bios
+    disk_format: qcow2
+    cloud_init: ubuntu-root-password
+    ssh: stock-service-or-socket
+  - id: ubuntu-22.04
+    distribution: ubuntu
+    version: '22.04'
+    name: Ubuntu Server 22.04 LTS
+    architecture: amd64
+    image_url: https://cloud-images.ubuntu.com/releases/jammy/release/ubuntu-22.04-server-cloudimg-amd64.img
+    checksum_url: https://cloud-images.ubuntu.com/releases/jammy/release/SHA256SUMS
+    osinfo: ubuntu22.04
+    boot: bios
+    disk_format: qcow2
+    cloud_init: ubuntu-root-password
+    ssh: stock-service-or-socket

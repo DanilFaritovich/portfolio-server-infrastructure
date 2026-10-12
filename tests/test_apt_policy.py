@@ -14,6 +14,7 @@ from unittest.mock import patch
 import yaml
 from ansible.parsing.dataloader import DataLoader
 from ansible.plugins.loader import init_plugin_loader
+from ansible.utils.collection_loader import AnsibleCollectionConfig
 from ansible.template import Templar
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -219,7 +220,7 @@ class AptPolicyWrapperTests(unittest.TestCase):
         self.stack.enter_context(patch.object(access, 'managed_access', return_value=('automation', Path('/synthetic/key'))))
         self.stack.enter_context(patch.object(access, 'load_host', return_value=('fixture', 'example.test', 2222, 'root', '/usr/bin/python3')))
         self.stack.enter_context(patch.object(access, 'hardening_inputs', return_value={'ssh_listen_ports': [2222], 'firewall_allowed_tcp_ports': [80, 443]}))
-        self.probe = self.stack.enter_context(patch.object(access, 'operations_probe'))
+        self.probe = self.stack.enter_context(patch.object(access, 'operations_probe', return_value={'plan': {'changes': {'/etc/apt/apt.conf.d/99zz-portfolio-security': True}, 'token': 'fixed'}}))
         self.playbook = self.stack.enter_context(patch.object(access, 'run_playbook'))
         self.stack.enter_context(patch('builtins.print'))
 
@@ -245,7 +246,7 @@ class AptPolicyWrapperTests(unittest.TestCase):
         self.assertEqual(self.playbook.call_count, 1)
         self.assertEqual(self.playbook.call_args.args[3], 'apt-policy.yml')
         self.assertTrue(self.playbook.call_args.args[2]['portfolio_apt_confirmed'])
-        self.assertEqual(self.probe.call_count, 3)
+        self.assertEqual(self.probe.call_count, 4)
         self.assertTrue(self.probe.call_args.args[5]['verify'])
 
     def test_preflight_and_apply_or_postverification_failure_stop_without_retry(self):
@@ -261,12 +262,12 @@ class AptPolicyWrapperTests(unittest.TestCase):
         self.assertEqual(self.playbook.call_count, 1)
 
     def test_post_apply_verification_failure_stops_without_retry(self):
-        self.probe.side_effect = [None, None, ValueError('verification fixture failure')]
+        self.probe.side_effect = [None, {'plan': {'changes': {'/etc/apt/apt.conf.d/99zz-portfolio-security': True}, 'token': 'fixed'}}, {'plan': {'changes': {'/etc/apt/apt.conf.d/99zz-portfolio-security': True}, 'token': 'fixed'}}, ValueError('verification fixture failure')]
         with patch.object(access.sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value='yes'):
             with self.assertRaisesRegex(ValueError, 'STOP'):
                 access.operations('apply-apt-policy', Path('/synthetic/inventory'), Path('/synthetic/key'))
         self.assertEqual(self.playbook.call_count, 1)
-        self.assertEqual(self.probe.call_count, 3)
+        self.assertEqual(self.probe.call_count, 4)
 
     def test_run_playbook_forwards_check_and_diff_with_mocked_subprocess(self):
         runner = SimpleNamespace(run=unittest.mock.Mock())
@@ -286,7 +287,8 @@ class AptPolicyWrapperTests(unittest.TestCase):
         self.assertIn('playbooks/apt-policy.yml', (ROOT / 'Makefile').read_text())
 
     def test_template_lookup_equivalent_preserves_final_newline(self):
-        init_plugin_loader()
+        if not AnsibleCollectionConfig.collection_finder:
+            init_plugin_loader()
         loader = DataLoader()
         loader.set_basedir(str(ROOT / 'playbooks'))
         templar = Templar(loader=loader, variables={})

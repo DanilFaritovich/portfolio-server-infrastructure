@@ -22,7 +22,7 @@ class SetupTests(unittest.TestCase):
         self.bin.mkdir()
         (self.root / 'scripts').mkdir()
         (self.root / 'inventories').mkdir()
-        for name in ('setup.sh', 'install-uv.sh', 'install-actionlint.sh', 'access.py'):
+        for name in ('setup.sh', 'install-uv.sh', 'install-actionlint.sh', 'access.py', 'setup-ready.py'):
             shutil.copy(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         shutil.copytree(
             ROOT / 'scripts' / 'portfolio_cli',
@@ -40,7 +40,8 @@ class SetupTests(unittest.TestCase):
         for name in ('ssh', 'ssh-keygen', 'ssh-keyscan', 'scp', 'sftp'):
             self.executable(self.bin / name, 'exit 99')
         self.executable(self.bin / 'uname', 'case "$1" in -s) echo Linux ;; -m) echo "${FIXTURE_ARCH:-x86_64}" ;; esac')
-        self.executable(self.bin / 'sha256sum', '''cat >/dev/null
+        self.executable(self.bin / 'sha256sum', '''case "$1" in -c|--check) ;; *) exec /usr/bin/sha256sum "$@" ;; esac
+cat >/dev/null
 printf 'checksum\n' >> "$CALL_LOG"
 [ "${CHECKSUM_FAIL:-0}" != 1 ]''')
         self.executable(self.bin / 'curl', '''printf 'download\n' >> "$CALL_LOG"
@@ -98,7 +99,7 @@ exec "$FIXTURE_PYTHON" "$@"''')
 
     def run_setup(self, mode='setup'):
         result = subprocess.run(['/bin/sh', 'scripts/setup.sh', mode], cwd=self.root,
-                                env=self.env, capture_output=True, text=True)
+                                env=self.env, input='y\n', capture_output=True, text=True)
         return result
 
     def calls(self):
@@ -133,6 +134,57 @@ exec "$FIXTURE_PYTHON" "$@"''')
         result = self.run_setup('deps')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.root / 'inventories/production.yml').exists())
+
+    def test_ci_make_dependencies_without_tty_never_create_inventory(self):
+        shutil.copy(ROOT / 'Makefile', self.root / 'Makefile')
+        result = subprocess.run(['make', '--no-print-directory', 'deps-ci'], cwd=self.root,
+                                env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('Apply this plan?', result.stdout)
+        self.assertIn('checksum', self.calls())
+        self.assertIn('pip install', self.calls())
+        self.assertIn('galaxy collection install -r collections.yml', self.calls())
+        self.assertNotIn('scripts/access.py', self.calls())
+        self.assertFalse((self.root / 'inventories/production.yml').exists())
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        self.assertIn('run: make deps-ci', workflow)
+        self.assertIn('run: make ci', workflow)
+
+    def test_ci_environment_does_not_authorize_interactive_modes(self):
+        self.env.update(CI='true', GITHUB_ACTIONS='true')
+        for mode in ('deps', 'setup'):
+            result = subprocess.run(['/bin/sh', 'scripts/setup.sh', mode], cwd=self.root,
+                                    env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('plan declined', result.stderr)
+            self.assertEqual(self.calls(), '')
+        result = subprocess.run(['/bin/sh', 'scripts/setup.sh', 'deps-ci', 'setup'], cwd=self.root,
+                                env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), '')
+
+    def test_ci_plan_drift_stops_before_dependency_download(self):
+        self.executable(self.bin / 'sha256sum', """if [ ! -e "$FIXTURE_ROOT/hashed-once" ]; then
+    /usr/bin/sha256sum "$@"
+    touch "$FIXTURE_ROOT/hashed-once"
+    printf '\\n# changed fixture\\n' >> requirements-dev.txt
+else
+    exec /usr/bin/sha256sum "$@"
+fi""")
+        (self.bin / 'touch').symlink_to(shutil.which('touch'))
+        result = subprocess.run(['/bin/sh', 'scripts/setup.sh', 'deps-ci'], cwd=self.root,
+                                env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('plan inputs changed', result.stderr)
+        self.assertEqual(self.calls(), '')
+
+    def test_ci_dependency_mode_preserves_checksum_failure_boundary(self):
+        self.env['CHECKSUM_FAIL'] = '1'
+        result = subprocess.run(['/bin/sh', 'scripts/setup.sh', 'deps-ci'], cwd=self.root,
+                                env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('checksum verification failed', result.stderr)
+        self.assertNotIn('python install', self.calls())
 
     def test_archive_checksum_failure_stops_before_uv_execution(self):
         self.env['CHECKSUM_FAIL'] = '1'

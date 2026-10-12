@@ -9,6 +9,18 @@ from pathlib import Path as _Path
 _scripts = str(_Path(__file__).resolve().parent)
 _sys.path.insert(0, _scripts)
 try:
+    if __name__ == '__main__':
+        import os as _os
+        if _os.environ.get('PORTFOLIO_E2E_ROOT'):
+            from portfolio_cli.e2e import configure_child as _configure_e2e, E2EError as _E2EError
+            try:
+                _configure_e2e()
+            except _E2EError as _error:
+                print('E2E guard failed: ' + str(_error) + ' No provisioning dispatched.', file=_sys.stderr)
+                _sys.exit(1)
+            except Exception:
+                print('E2E guard failed; no provisioning dispatched. Inspect the local fixture.', file=_sys.stderr)
+                _sys.exit(1)
     from portfolio_cli import cli as _cli
     from portfolio_cli.compat import install as _install
 finally:

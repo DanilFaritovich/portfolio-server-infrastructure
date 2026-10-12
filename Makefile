@@ -1,6 +1,6 @@
 VENV := .venv
 ACTIONLINT := .tools/bin/actionlint
-YAML_FILES := .yamllint.yml .ansible-lint collections.yml inventories/production.example.yml playbooks roles .github/workflows
+YAML_FILES := scripts/portfolio_cli/e2e_distros.yml .yamllint.yml .ansible-lint collections.yml inventories/production.example.yml playbooks roles .github/workflows
 INVENTORY ?= inventories/production.yml
 # Optional legacy override; explicit inventory supplies the managed key path.
 AUTOMATION_KEY ?=
@@ -10,17 +10,29 @@ export ANSIBLE_HOME := $(CURDIR)/.ansible
 # Subprocesses must find the same pinned Ansible tools as the invoking interpreter.
 export PATH := $(abspath $(VENV))/bin:$(PATH)
 
-.PHONY: list-users show-user list-user-keys add-user-key revoke-user-key remove-user generate-user-key load-user-key show-public-key copy-public-key show-controller connect-controller connect-user deps setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
+.PHONY: list-users show-user list-user-keys add-user-key revoke-user-key remove-user generate-user-key load-user-key show-public-key copy-public-key show-controller connect-controller connect-user deps deps-ci setup bootstrap-user verify-access docker-host verify-docker harden verify-hardening inspect-hardening reboot-host add-user verify-user secure-ssh verify-ssh-security inspect-operations setup-operations verify-operations check ci lint-yaml lint-ansible syntax-check lint-workflows test-access
 .PHONY: show-server-trust copy-server-trust trust-server
 .PHONY: init-server
 export INIT_FROM
 
+# LOCAL VM operations; never prerequisites of check/ci. No production inputs.
+E2E_USER_TARGETS := e2e-list-users e2e-show-user e2e-list-user-keys e2e-add-user e2e-verify-user e2e-add-user-key e2e-revoke-user-key e2e-remove-user
+.PHONY: e2e-prepare e2e-status e2e-test e2e-reset e2e-delete e2e-list-distros $(E2E_USER_TARGETS)
+export E2E_DISTRO E2E_CPUS E2E_MEMORY E2E_DISK_GB E2E_SUBNET E2E_IMAGE_SHA256 E2E_FROM
+e2e-prepare e2e-status e2e-test e2e-reset e2e-delete e2e-list-distros $(E2E_USER_TARGETS):
+	@test -x $(VENV)/bin/python || { echo "Run make deps first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/e2e.py $(patsubst e2e-%,%,$@)
+
 # Human account inputs are supplied by the caller; USER is intentionally untouched.
-export AGENT_LOAD KEY_FINGERPRINT RECOVERY_USER RECOVERY_KEY KEY_NAME HUMAN_USER HUMAN_GROUPS HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
+export AGENT_LOAD KEY_FINGERPRINT RECOVERY_USER RECOVERY_KEY KEY_NAME HUMAN_USER HUMAN_GROUPS HUMAN_GROUPS_APPROVED HUMAN_SUDO HUMAN_SUDO_COMMANDS HUMAN_KEY HUMAN_PUBLIC_KEY
 
 # Dependency setup uses registries; checks below use installed dependencies offline.
 deps:
 	@sh scripts/setup.sh deps
+
+# Explicit noninteractive installation of project-local pinned dependencies only.
+deps-ci:
+	@sh scripts/setup.sh deps-ci
 
 # LIVE / MUTATING: explicit frontier, existing confirmations and whole-run lock.
 init-server:
@@ -32,7 +44,11 @@ setup:
 	@sh scripts/setup.sh setup
 
 # LOCAL only: generate/load the selected key or display its public member/fingerprint.
-generate-user-key load-user-key show-public-key copy-public-key:
+generate-user-key:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY"
+
+load-user-key show-public-key copy-public-key:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py $@
 
@@ -138,7 +154,15 @@ verify-operations:
 	@$(VENV)/bin/python scripts/access.py verify-operations --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
 
 # Strictly offline, including wrapper tests with temporary fixtures and mocked processes.
-check: lint-yaml lint-ansible syntax-check lint-workflows test-access
+# Recursive make still exposes every offline command under make -n.
+CHECK_STEP = CHECK_DRY_RUN=$(if $(findstring n,$(filter-out --%,$(firstword $(MAKEFLAGS)))),1,0) sh scripts/check-step.sh
+check:
+	@$(CHECK_STEP) 'YAML lint' $(MAKE) --no-print-directory lint-yaml
+	@$(CHECK_STEP) 'Ansible lint' $(MAKE) --no-print-directory lint-ansible
+	@$(CHECK_STEP) 'Syntax check' $(MAKE) --no-print-directory syntax-check
+	@$(CHECK_STEP) 'Actions lint' $(MAKE) --no-print-directory lint-workflows
+	@$(CHECK_STEP) 'Unit tests' $(MAKE) --no-print-directory test-access
+	@printf '\nmake check: PASSED\n'
 
 ci: check
 
@@ -167,4 +191,4 @@ lint-workflows:
 	@$(ACTIONLINT) -shellcheck="" .github/workflows/ci.yml
 
 test-access:
-	@$(VENV)/bin/python -m unittest discover -s tests -q
+	@$(VENV)/bin/python -m unittest discover -s tests -b -q

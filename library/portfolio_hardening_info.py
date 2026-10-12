@@ -334,7 +334,38 @@ def unit_properties(run, name, properties):
     return result
 
 
-def stock_unit(unit, name, socket_mode=False, ipv6_only=False, findings=None):
+def stock_socket_defaults(path):
+    """Read the two reviewed Ubuntu package socket layouts, independently of PID 1.
+
+    Noble's generator omits addresses.conf for its default routes. Later Noble
+    updates use explicit IPv4/IPv6 sockets instead of one dual-stack socket.
+    Never infer disk routes from desired ports or stale loaded Listen properties.
+    """
+    sections, socket_lines = [], []
+    section = None
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith(('#', ';')):
+            continue
+        if line.startswith('['):
+            section = line
+            sections.append(section)
+        elif section == '[Socket]':
+            socket_lines.append(line)
+    legacy = {'ListenStream=22', 'Accept=no', 'FreeBind=yes'}
+    explicit = {'ListenStream=0.0.0.0:22', 'ListenStream=[::]:22',
+                'BindIPv6Only=ipv6-only', 'Accept=no', 'FreeBind=yes'}
+    values = set(socket_lines)
+    require(sections.count('[Socket]') == 1 and len(values) == len(socket_lines) and
+            values in (legacy, explicit), 'Unsupported package SSH socket defaults.')
+    if values == explicit:
+        return socket_listeners('0.0.0.0:22 (Stream) [::]:22 (Stream)', True), True
+    default = Path('/proc/sys/net/ipv6/bindv6only').read_text().strip()
+    require(default in ('0', '1'), 'Ambiguous system IPv6 binding policy.')
+    return socket_listeners('22 (Stream)', default == '1'), default == '1'
+
+
+def stock_unit(unit, name, socket_mode=False, findings=None):
     def check(label, operation):
         return findings.probe(label, operation) if findings is not None else operation()
 
@@ -348,10 +379,14 @@ def stock_unit(unit, name, socket_mode=False, ipv6_only=False, findings=None):
             require(str(path.resolve()) == '/usr/lib/systemd/system/' + name, 'Unsafe systemd unit path.')
             path = Path('/usr/lib/systemd/system/' + name)
         safe_file(path, 'Unsafe systemd unit file type.')
-    check(name + ' package unit file', fragment)
+        return path
+    path = check(name + ' package unit file', fragment)
+    defaults = check('SSH socket package defaults', lambda: stock_socket_defaults(path)) \
+        if socket_mode and name == 'ssh.socket' and path is not None else None
     generated = None
     dropins = set(unit['DropInPaths'].split())
-    for root in ('/etc/systemd/system', '/run/systemd/system', '/run/systemd/generator'):
+    for root in ('/etc/systemd/system', '/run/systemd/system', '/run/systemd/generator',
+                 '/run/systemd/generator.early', '/run/systemd/generator.late'):
         def override(root=root):
             path = Path(root + '/' + name)
             require(not path.exists() and not path.is_symlink(), 'Custom systemd unit detected.')
@@ -380,12 +415,24 @@ def stock_unit(unit, name, socket_mode=False, ipv6_only=False, findings=None):
                         len(lines) >= 3 and lines[:2] == ['[Socket]', 'ListenStream='] and
                         all(line.startswith('ListenStream=') and line != 'ListenStream=' for line in lines[2:]),
                         'Custom SSH socket drop-in detected.')
-                return socket_listeners(' '.join(line.split('=', 1)[1] + ' (Stream)' for line in lines[2:]), ipv6_only)
+                require(defaults is not None, 'Cannot establish package SSH socket binding policy.')
+                return socket_listeners(' '.join(line.split('=', 1)[1] + ' (Stream)' for line in lines[2:]), defaults[1])
             else:
                 require(False, 'Custom systemd drop-in detected.')
         routes = check(name + ' drop-in ' + str(index), dropin)
         if routes is not None:
             generated = routes
+    if socket_mode and name == 'ssh.socket':
+        # A missing file listed by PID 1 remains a failure above, not a default.
+        # Likewise, malformed/custom drop-ins never fall through to defaults.
+        if not dropins and defaults is not None:
+            if findings is not None:
+                findings.items.append({'status': 'PASS', 'check': 'SSH socket route source',
+                                       'detail': 'Package defaults; generated addresses.conf is absent.'})
+            return defaults[0]
+        if generated is not None and findings is not None:
+            findings.items.append({'status': 'PASS', 'check': 'SSH socket route source',
+                                   'detail': 'Validated generated addresses.conf.'})
     return generated
 
 
@@ -560,7 +607,7 @@ def inspect(module):
             dependencies=socket_mode is not None or name == 'ufw.service')
 
     socket_routes = None
-    generated_routes = None
+    disk_routes = None
     ipv6_only = False
     if socket_mode is False:
         def disabled_socket():
@@ -593,8 +640,8 @@ def inspect(module):
                 return default == '1'
             return policy == 'ipv6-only'
         ipv6_only = checks.probe('SSH socket IPv6 binding', binding, unit is not None)
-        generated_routes = checks.probe('generated ssh.socket stock configuration',
-            lambda: stock_unit(unit, 'ssh.socket', True, ipv6_only, findings=checks), unit is not None and ipv6_only is not None)
+        disk_routes = checks.probe('on-disk ssh.socket stock configuration',
+            lambda: stock_unit(unit, 'ssh.socket', True, findings=checks), unit is not None)
         socket_routes = checks.probe('loaded SSH socket listeners',
             lambda: socket_listeners(unit['Listen'], ipv6_only), unit is not None and ipv6_only is not None)
         checks.probe('SSH socket activation relationship', lambda: require(
@@ -710,34 +757,43 @@ def inspect(module):
     if effective_ports is not None and live_ports is not None and ssh_ports is not None:
         checks.convergence('SSH port convergence', effective_ports == set(ssh_ports) == live_ports, verify,
                            'Effective SSH ports/listeners do not match configuration.')
-    # Pre-restart validates the generated candidate only. Loaded systemd routes
-    # and inherited live descriptors may legitimately retain the old subset.
+    # Pre-restart validates the effective disk candidate (package + generator).
+    # Loaded systemd routes and live descriptors may retain the old subset.
     # Post-restart verification requires all three independent states to agree.
     if candidate:
         checks.probe('candidate effective SSH ports', lambda: require(effective_ports == set(ssh_ports),
             'Candidate effective SSH ports differ from desired ports.'), ssh_ports is not None and effective_ports is not None)
-        checks.probe('generated desired SSH socket routes', lambda: require(
-            generated_routes is not None and generated_routes == desired_routes,
-            'Generated socket listeners differ from desired ports or generated configuration is missing.'),
+        checks.probe('on-disk desired SSH socket routes', lambda: require(
+            disk_routes is not None and disk_routes == desired_routes,
+            'On-disk socket listeners differ from desired ports or supported configuration is unavailable.'),
             desired_routes is not None)
         checks.probe('safe live SSH socket subset', lambda: require(live_routes <= desired_routes,
             'Existing live SSH socket routes must be a safe subset of desired routes.'),
             live_routes is not None and desired_routes is not None)
     elif socket_mode and socket_routes is not None and live_routes is not None and desired_routes is not None:
-        coherent = generated_routes == socket_routes and socket_ports == effective_ports
-        checks.convergence('generated/loaded SSH socket state', coherent, verify,
-                           'Generated socket file differs semantically from effective listeners or sshd configuration.')
+        coherent = disk_routes == socket_routes and socket_ports == effective_ports
+        checks.convergence('on-disk/loaded SSH socket state', coherent, verify,
+                           'On-disk socket configuration differs semantically from loaded listeners or sshd configuration.')
         checks.convergence('live SSH socket state', live_routes == socket_routes == desired_routes, verify,
                            'Live SSH socket listeners differ semantically from effective configuration.')
         checks.convergence('desired SSH socket routes',
-                           generated_routes == socket_routes == live_routes == desired_routes, verify,
-                           'Generated, loaded or live SSH socket listeners differ from desired routes.')
+                           disk_routes == socket_routes == live_routes == desired_routes, verify,
+                           'On-disk, loaded or live SSH socket listeners differ from desired routes.')
     checks.probe('socket candidate activation mode', lambda: require(not candidate or socket_mode,
                  'Socket candidate requires socket activation.'))
     result = {'ssh_adoption': legacy, 'ssh_sources': sources, 'ufw_installed': installed,
               'ssh_activation': 'socket' if socket_mode else 'service',
-              'socket_reload_required': bool(socket_mode and (socket_routes != desired_routes or
-                  live_routes != desired_routes or (generated_routes is not None and generated_routes != socket_routes)))}
+              'socket_reload_required': bool(socket_mode and not
+                  disk_routes == socket_routes == live_routes == desired_routes)}
+    if socket_mode:
+        for label, routes in (('on-disk', disk_routes), ('loaded', socket_routes),
+                              ('live', live_routes), ('desired', desired_routes)):
+            # Only validated wildcard TCP reachability crosses the reporting
+            # boundary: fixed family tokens and integer ports, never raw output.
+            checks.items.append({'status': 'PASS' if routes is not None else 'FAIL',
+                                 'check': 'SSH socket ' + label + ' routes',
+                                 'detail': ', '.join(f'{family}:{port}' for _, family, _, port in sorted(routes))
+                                 if routes is not None else 'Unavailable; resolve prerequisite findings.'})
 
     status, rules = None, None
     active = None
@@ -867,6 +923,29 @@ def inspect(module):
                                'Configured TCP ports must be allowed at runtime for IPv4 and IPv6.')
 
     summary = checks.result()
+    if module.params.get('plan_requested', False):
+        summary['plan'] = {
+            'changes_required': any(item['status'] != 'PASS' for item in checks.items),
+            'token': hashlib.sha256(json.dumps(
+                [result, checks.items, status, sorted(rules) if rules is not None else None,
+                 sorted(effective_ports) if effective_ports is not None else None,
+                 sorted(live_ports) if live_ports is not None else None], sort_keys=True).encode()).hexdigest(),
+        }
+        if module.params.get('security_plan') and summary['ready']:
+            security = {'__name__': 'portfolio_security_plan'}
+            exec(SECURITY_PLAN_SOURCE, security)
+            module.params['sources'] = sources
+            module.params['ssh_ports'] = ssh_ports
+            original = security['snapshot'](module)
+            updated = security['candidate'](original)
+            pending = Path(security['PENDING'])
+            require(not pending.exists() and not pending.is_symlink(), 'Pending final SSH activation; STOP.')
+            needed = updated != original[security['MAIN']]
+            if not needed:
+                security['policy_valid'](security['effective'](module), ssh_ports)
+            security['unchanged'](original)
+            summary['plan']['changes_required'] = needed
+        return summary
     if module.params.get('report_only', False):
         # Public inspection exposes only fixed diagnoses, never fingerprints,
         # adoption source paths/records or command/configuration contents.

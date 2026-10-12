@@ -17,6 +17,15 @@ SPEC.loader.exec_module(access)
 
 class ConfigurableAccessTests(unittest.TestCase):
     def setUp(self):
+        planner = patch.object(access, 'hardening_plan', return_value={'changes_required': True, 'token': 'fixed'})
+        planner.start()
+        self.addCleanup(planner.stop)
+        prompt = patch('builtins.input', return_value='y')
+        prompt.start()
+        self.addCleanup(prompt.stop)
+        terminal = patch.object(access.sys.stdin, 'isatty', return_value=True)
+        terminal.start()
+        self.addCleanup(terminal.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
@@ -119,9 +128,9 @@ class ConfigurableAccessTests(unittest.TestCase):
                 patch('builtins.print'):
             access.human_access('add-user', self.inventory)
 
-        self.assertEqual([probe['action'] for probe in probes], ['preflight-add-user', 'show-user', 'add-user-key'])
-        self.assertEqual(probes[2]['key'], content.strip())
-        self.assertEqual(probes[2]['token'], 'synthetic-token')
+        self.assertEqual([probe['action'] for probe in probes], ['preflight-add-user', 'preflight-add-user', 'show-user', 'add-user-key'])
+        self.assertEqual(probes[3]['key'], content.strip())
+        self.assertEqual(probes[3]['token'], 'synthetic-token')
         self.assertEqual(run.call_args.args[3], 'add-user.yml')
         verify.assert_not_called()
 
@@ -137,7 +146,7 @@ class ConfigurableAccessTests(unittest.TestCase):
                 def command(argv, **kwargs):
                     self.assertIn('automation@fixture.example.test', argv)
                     self.assertEqual(argv[argv.index('-i') + 1], str(self.key))
-                    output = 'automation\n' if argv[-1] == 'id -un' else json.dumps({'ready': True, 'report': 'PASS'})
+                    output = 'automation\n' if argv[-1] == 'id -un' else json.dumps({'ready': True, 'report': 'PASS', 'plan': {'changes': {'/etc/apt/apt.conf.d/99zz-portfolio-security': True}, 'token': 'fixed'}})
                     return subprocess.CompletedProcess(argv, 0, output, '')
                 with patch.object(access.subprocess, 'run', side_effect=command), \
                         patch.object(access.sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value='yes'), \

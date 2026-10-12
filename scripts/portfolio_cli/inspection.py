@@ -4,12 +4,13 @@ import json
 import shlex
 import subprocess
 
-from .common import ROOT, SSH_BASE, require
+from . import common
+from .common import ROOT, require
 
 
 def inspect_host(host, port, interpreter, key, inputs, user):
     """Read-only SSH transport avoids Ansible's remote payload/tempfile writes."""
-    ssh = ['ssh'] + shlex.split(SSH_BASE) + [
+    ssh = ['ssh'] + shlex.split(common.SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
         '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
         '-o', 'KbdInteractiveAuthentication=no',
@@ -44,7 +45,7 @@ def inspect_host(host, port, interpreter, key, inputs, user):
 
 def user_probe(host, port, interpreter, key, controller, params):
     """Stream a bounded engine with no remote payload files or private-key reads."""
-    ssh = ['ssh'] + shlex.split(SSH_BASE) + [
+    ssh = ['ssh'] + shlex.split(common.SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey',
         '-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
         '-i', str(key), '-p', str(port), controller + '@' + host,
@@ -55,18 +56,22 @@ def user_probe(host, port, interpreter, key, controller, params):
     payload += '\nmanage_stream(json.loads(' + repr(json.dumps(params | {'controller': controller})) + '))\n'
     result = subprocess.run(ssh + ['sudo -n ' + shlex.quote(interpreter) + ' -I -B -'],
                             input=payload, capture_output=True, text=True, check=False, timeout=180)
+    if result.returncode:
+        raise ValueError('User management SSH command failed (exit status ' + str(result.returncode) +
+                         '); check key-only access, host trust and sudo -n.')
     try:
         response = json.loads(result.stdout)
-        require(result.returncode == 0 and response.get('ready') is True and isinstance(response['result'], dict),
+        require(response.get('ready') is True and isinstance(response['result'], dict),
                 response.get('error', 'User management SSH/sudo failed; stop and inspect through recovery.'))
         return response['result']
     except (KeyError, TypeError, json.JSONDecodeError):
-        raise ValueError('Invalid user management response; stop and inspect through recovery.') from None
+        raise ValueError('Invalid user management response; remote inspection did not return valid JSON. '
+                         'Stop and inspect through recovery.') from None
 
 
 def operations_probe(host, port, interpreter, key, module, params, user):
     """Strict key-only stream transport; no Ansible remote files or cache writes."""
-    ssh = ['ssh'] + shlex.split(SSH_BASE) + [
+    ssh = ['ssh'] + shlex.split(common.SSH_BASE) + [
         '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
         '-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no',
         '-o', 'KbdInteractiveAuthentication=no',
@@ -75,6 +80,9 @@ def operations_probe(host, port, interpreter, key, module, params, user):
     login = subprocess.run(ssh + ['id -un'], capture_output=True, text=True, check=False, timeout=30)
     require(login.returncode == 0 and login.stdout.strip() == user, 'Managed key-only SSH access failed.')
     payload = '__name__ = "portfolio_inspection"\n' + (ROOT / 'library' / module).read_text()
+    if params.get('security_plan'):
+        source = (ROOT / 'library/portfolio_ssh_security.py').read_text().replace('from ansible.module_utils.basic import AnsibleModule', '')
+        payload += '\nSECURITY_PLAN_SOURCE = ' + repr(source) + '\n'
     payload += '\ninspect_stream(json.loads(' + repr(json.dumps(params)) + '))\n'
     process = subprocess.run(ssh + ['sudo -n ' + shlex.quote(interpreter) + ' -I -B -'],
                              input=payload, capture_output=True, text=True, check=False, timeout=300)
@@ -86,3 +94,15 @@ def operations_probe(host, port, interpreter, key, module, params, user):
         raise ValueError('Managed sudo or read-only inspection failed; review manually.') from None
     print(result['report'])
     require(result['ready'], 'Resolve FAIL findings manually before proceeding.')
+    return result
+
+
+def hardening_plan(host, port, interpreter, key, inputs, user, security=False):
+    params = {'current_port': port, 'ssh_ports': inputs['ssh_listen_ports'],
+              'tcp_ports': inputs['firewall_allowed_tcp_ports'], 'verify': security,
+              'refresh_rules': False, 'socket_candidate': False, 'report_only': True,
+              'plan_requested': True, 'security_plan': security}
+    result = operations_probe(host, port, interpreter, key, 'portfolio_hardening_info.py', params, user)
+    plan = result['plan']
+    require(type(plan['changes_required']) is bool and isinstance(plan['token'], str), 'Invalid hardening plan; STOP.')
+    return plan

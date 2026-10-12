@@ -12,9 +12,10 @@ import unittest
 from unittest.mock import patch
 
 from ansible import constants as ansible_constants
-from ansible.errors import AnsibleConnectionFailure
+from ansible.errors import AnsibleAuthenticationFailure, AnsibleConnectionFailure
 from ansible.playbook.play_context import PlayContext
 from ansible.plugins.loader import connection_loader, init_plugin_loader
+from ansible.utils.collection_loader import AnsibleCollectionConfig
 import paramiko
 import yaml
 
@@ -25,6 +26,12 @@ SPEC.loader.exec_module(access)
 
 class AccessTests(unittest.TestCase):
     def setUp(self):
+        prompt = patch('builtins.input', return_value='y')
+        prompt.start()
+        self.addCleanup(prompt.stop)
+        terminal = patch.object(access.sys.stdin, 'isatty', return_value=True)
+        terminal.start()
+        self.addCleanup(terminal.stop)
         output = patch('builtins.print')
         output.start()
         self.addCleanup(output.stop)
@@ -201,7 +208,7 @@ class AccessTests(unittest.TestCase):
                     patch.object(access.sys.stdin, 'isatty', return_value=True), \
                     patch('builtins.input', side_effect=type(answer) if isinstance(answer, BaseException) else None,
                           return_value=answer):
-                with self.assertRaisesRegex(ValueError, 'Reboot declined'):
+                with self.assertRaisesRegex(ValueError, 'Plan declined'):
                     access.live('reboot-host', self.inventory, self.key)
                 self.assertEqual([call.args[3] for call in run.call_args_list], ['verify.yml'])
 
@@ -439,9 +446,94 @@ class AccessTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, output)
                     self.assertIn('controller public key must be a readable regular', output)
 
+    def test_bootstrap_prompt_reaches_paramiko_after_local_delegation(self):
+        # Exercise the real CLI/executor and delegated controller tasks, but
+        # replace prompting and the SSH client; forbid every network connection.
+        (self.directory / 'sitecustomize.py').write_text(
+            'import socket\n'
+            'def deny(*args, **kwargs):\n'
+            '    raise RuntimeError("Network is forbidden")\n'
+            'socket.socket.connect = deny\n'
+            'socket.socket.connect_ex = deny\n'
+            'socket.create_connection = deny\n'
+            'from ansible.cli import CLI\n'
+            'CLI.ask_passwords = lambda self: ("synthetic prompt result", None)\n'
+            'import paramiko\n'
+            'from unittest.mock import MagicMock\n'
+            'def connect(*args, **kwargs):\n'
+            '    if (kwargs.get("password") == "synthetic prompt result"\n'
+            '            and kwargs.get("allow_agent") is False\n'
+            '            and kwargs.get("look_for_keys") is False\n'
+            '            and kwargs.get("key_filename") is None):\n'
+            '        raise RuntimeError("PASSWORD_ONLY_REGRESSION_OK")\n'
+            '    raise RuntimeError("PASSWORD_ONLY_REGRESSION_FAILED")\n'
+            'paramiko.SSHClient = lambda: MagicMock(connect=connect)\n')
+        Path(str(self.key) + '.pub').write_text('ssh-ed25519 ' + HostTrustTests.BLOB + ' synthetic\n')
+        environment = dict(os.environ, PYTHONPATH=str(self.directory),
+                           ANSIBLE_HOME=str(self.directory / 'ansible-home'),
+                           ANSIBLE_LOCAL_TEMP=str(self.directory / 'ansible-tmp'),
+                           ANSIBLE_REMOTE_TEMP=str(self.directory / 'module-tmp'),
+                           ANSIBLE_NOCOLOR='1', SSH_AUTH_SOCK='/synthetic/unrelated-agent')
+        original_run = subprocess.run
+        results = []
+
+        def run(command, **kwargs):
+            env = kwargs.pop('env')
+            env.update(environment)
+            results.append(original_run(command, cwd=kwargs['cwd'], env=env,
+                                        capture_output=True, text=True, timeout=30))
+
+        variables = {
+            'ansible_connection': access.PASSWORD_CONNECTION, 'ansible_user': 'root',
+            'ansible_paramiko_private_key_file': '', 'ansible_paramiko_proxy_command': '',
+            'bootstrap_user_name': 'automation', 'bootstrap_user_public_key_path': str(self.key) + '.pub',
+            'bootstrap_user_allow_passwordless_sudo': True,
+        }
+        with patch.object(access.subprocess, 'run', side_effect=run):
+            access.run_playbook(self.inventory, 'portfolio', variables, 'bootstrap.yml', ask_pass=True)
+        output = results[0].stdout + results[0].stderr
+        self.assertNotEqual(results[0].returncode, 0)
+        self.assertIn('PASSWORD_ONLY_REGRESSION_OK', output)
+        self.assertNotIn('PASSWORD_ONLY_REGRESSION_FAILED', output)
+        self.assertNotIn('Network is forbidden', output)
+        self.assertNotIn('synthetic prompt result', output)
+
+    def test_password_bootstrap_refuses_missing_password_and_explicit_keys(self):
+        if not AnsibleCollectionConfig.collection_finder:
+            init_plugin_loader()
+        connection_loader.add_directory(str(access.ROOT / 'plugins/connection'))
+        with patch.object(paramiko, 'SSHClient') as client:
+            for password in (None, ''):
+                with self.subTest(password=password):
+                    connection = connection_loader.get(access.PASSWORD_CONNECTION, PlayContext(), io.StringIO())
+                    connection.set_options(task_keys={'password': password}, var_options={
+                        'ansible_private_key_file': '/synthetic/unrelated-key',
+                        'ansible_paramiko_private_key_file': '/synthetic/another-key',
+                    }, direct={'look_for_keys': True, 'private_key_file': '/synthetic/direct-key'})
+                    self.assertFalse(connection.get_option('look_for_keys'))
+                    self.assertFalse(connection.get_option('private_key_file'))
+                    with self.assertRaisesRegex(AnsibleAuthenticationFailure, 'non-empty SSH password'):
+                        connection._connect_uncached()
+            client.assert_not_called()
+
+    def test_only_password_child_excludes_agent_and_preserves_parent(self):
+        agent = {'SSH_AUTH_SOCK': '/synthetic/agent', 'SSH_AGENT_PID': '12345'}
+        with patch.dict(os.environ, agent), patch.object(access.subprocess, 'run') as run:
+            access.run_playbook(self.inventory, 'portfolio', {
+                'ansible_connection': access.PASSWORD_CONNECTION,
+            }, 'bootstrap.yml', ask_pass=True)
+            bootstrap_env = run.call_args.kwargs['env']
+            for name in agent:
+                self.assertNotIn(name, bootstrap_env)
+                self.assertEqual(os.environ[name], agent[name])
+            access.run_playbook(self.inventory, 'portfolio', {'ansible_connection': 'ssh'}, 'verify.yml')
+            for name in agent:
+                self.assertEqual(run.call_args.kwargs['env'][name], agent[name])
+
     def test_pinned_paramiko_plugin_password_and_host_key_behavior(self):
         # Simulate Ansible's in-memory prompt result; never use a real credential or network.
-        init_plugin_loader()
+        if not AnsibleCollectionConfig.collection_finder:
+            init_plugin_loader()
         connection_loader.add_directory(str(access.ROOT / 'plugins/connection'))
         with patch.dict(os.environ, {}, clear=True), \
                 patch.object(paramiko, 'SSHClient') as client:
@@ -547,7 +639,7 @@ class HostTrustTests(unittest.TestCase):
     def test_confirmation_precedes_key_generation_and_bootstrap(self):
         def prepare(path):
             self.assertTrue(self.path.exists())
-            self.prompt.assert_called_once()
+            self.assertEqual(self.prompt.call_count, 2)
 
         with patch.object(access, 'prerequisites'), \
                 patch.object(access, 'load_host', return_value=('portfolio', self.host, 22, 'root', '/usr/bin/python3')), \

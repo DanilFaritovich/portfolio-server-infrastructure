@@ -17,6 +17,7 @@ the same commands, arguments, output formats and exit codes.
 | --- | --- |
 | `cli.py` | Argument parsing, locked server command dispatch, umask and sanitized failure/interruption errors. |
 | `common.py` | Repository root, default automation key path, SSH policy constants and validation guards. |
+| `plans.py` | Default-deny plans, snapshots of inputs/implementation, bounded nested consent and anonymous E2E child grants. |
 | `inventory.py` | Exclusive inventory creation, static inventory validation, access selection and hardening port inputs. |
 | `keys.py` | Key path/metadata validation, public key parsing and identity comparison, locked non-overwriting generation and temporary public snapshots. |
 | `local_keys.py` | Local human key selection, generation/show/copy/load commands and loading the selected identity into the invoking shell's existing agent. |
@@ -33,9 +34,10 @@ the same commands, arguments, output formats and exit codes.
 | `compat.py` | Isolated flat helper namespaces for legacy file-based imports of `access.py`. |
 
 Dependencies are explicit relative imports and form an acyclic graph. `common`
-has no package dependencies. `keys`, `ansible` and `inspection` depend only on
-`common`; `inventory` adds `keys`. `clipboard` uses `keys`; `host_trust` uses
-`inventory`, `keys` and `clipboard`. `local_keys` uses `keys` and `clipboard`;
+has no package dependencies. `plans` depends on `common`. `keys`, `ansible` and
+`inspection` depend only on `common`; `inventory` adds `keys`. `clipboard` uses
+`keys` and `plans`; `host_trust` uses `inventory`, `keys` and `clipboard`.
+`local_keys` uses `keys`, `clipboard` and `plans`;
 `ssh` uses `inventory`, `keys`, `local_keys` and `host_trust`. `verification`
 uses `ansible` and `keys`.
 
@@ -68,8 +70,11 @@ absence or authorizes mutation. Remaining stages use existing preflight/postflig
 and an explicit verifier at every dependency boundary; Stage 3 also runs its streamed
 inspector before application. No provisioning roles or recovery logic are duplicated.
 
-Initialization requires a TTY, prepared human admin key and default-deny plan
-confirmation. Stage-specific registration/recovery/operations confirmations remain.
+Initialization requires a TTY and prepared human admin key. One default-deny plan
+confirmation covers the listed remaining stages in this invocation, including the
+provider-console recovery attestation for final SSH policy. Read-only preflight
+may precede consent; confirmation occurs before the first planned change. Native
+password/passphrase, sudo and host-trust prompts remain separate.
 Errors, pending state, interruptions and log-write failures stop later dispatch.
 Continuation requires recovery diagnosis and explicit frontier selection, never
 log-based checkpoints, retry or rollback. Exclusive temporary JSONL files (0600)
@@ -79,10 +84,21 @@ stage (`run` events use whole-run time). Applying stages emit `applying` then
 Logs exclude output, exception text, inventory and identities. Terminal failures
 retain exact allowlisted static causes or safe process/I/O categories and the active
 command, never arbitrary exception text or raw stderr. EOF at frontier selection
-or plan confirmation cancels before host contact without traceback.
+or plan confirmation cancels before mutation without traceback; preflight may
+already have contacted the host.
 These are diagnostic records,
 not authority over server state. The terminal shows progress and verified stages
-while retaining existing stage diagnostics and prompts.
+while retaining existing stage diagnostics and native authentication prompts.
+
+`plans.py` stores authority only in a ContextVar for the active call stack. Nested
+plans can narrow authority and bind additional snapshots, never expand it. Input
+or implementation drift stops dispatch; errors reset the scope. Standalone changes
+use the same `Apply this plan? [y/N]` prompt. Exact read-only evidence permits
+hardening, final SSH policy, operations and managed-key registration to skip
+application when unchanged. Terminal public-key registration still confirms before
+host contact; explicit public-file automation retains its existing contract.
+Local setup compares pinned tool/collection readiness before offering downloads
+and inventory creation. Existing inventories are preserved without reading them.
 
 Other commands dispatch only their existing stage sequence. Initial password
 bootstrap uses `bootstrap_login_user`; managed paths select `ansible_user` and
@@ -149,6 +165,16 @@ engine can mutate managed state only for authorized mutation requests.
 their server-side responsibilities. The CLI package is never uploaded as a
 replacement for those payloads. SSH daemon/socket activation, firewall policy,
 Docker preflight and operations policy remain implemented in those components.
+
+The Stage 3 socket inspector distinguishes the effective on-disk candidate,
+PID 1's loaded properties, inherited live descriptors and desired routes.
+On disk, a supported generated `addresses.conf` resets the package listeners;
+without it, only the two reviewed Ubuntu port-22 package defaults are accepted.
+The package's binding policy normalizes disk routes independently of loaded
+state. Candidate validation requires desired disk routes before restart;
+postflight and reload scheduling compare all normalized IPv4/IPv6 route sets.
+Read-only findings expose the selected source and normalized wildcard routes,
+never raw configurations or command output. Receipt handling is unchanged.
 
 ## State and security invariants
 
@@ -264,3 +290,90 @@ mocking and CLI invocation outside the repository. The clean setup fixture
 copies the package with its entry point. Offline success does not establish
 LIVE access, remote idempotency or recovery readiness; those remain separately
 authorized operator checks.
+
+## Local VM integration boundary
+
+`scripts/e2e.py` invokes `portfolio_cli.e2e`: a separate controller lifecycle for
+one per-user KVM BIOS guest and dedicated NAT on `qemu:///system`. It uses virsh
+XML queries, virt-install XML generation, checked official Ubuntu cloud image,
+minimal cloud-init bootstrap and stopped internal qcow2 snapshots. `e2e_images`
+validates the declarative image registry and rejects redirects before following;
+`e2e_readiness` bounds output-free read-only probes over the local QEMU agent
+channel. New fixtures install/start the guest agent through cloud-init; this
+does not create SSH trust or change the controller's packages.
+`e2e_host` validates Linux x86_64/KVM/libvirt capabilities without host release
+allowlists. It handles only explicitly confirmed missing packages through a reviewed
+Ubuntu/Debian apt mapping, additive groups and exclusive dedicated directory
+creation. Configured but ineffective groups return `REBOOT_REQUIRED`; the CLI
+releases the fixture lock before offering reboot now/later and exits successfully
+without fixture creation. Before a separately confirmed request, `e2e_host` selects
+one backend using local session capabilities: complete GNOME X11/Wayland uses
+`gnome-session-quit --reboot`; other supported Linux/systemd sessions use systemctl
+with explicit inhibitor checks and no authentication prompt. Incomplete GNOME,
+remote/root/unsupported sessions and missing tools use manual instructions.
+There is no force, sudo, OS-version selection or second-backend retry. Static
+failure classification avoids printing child stderr; even a zero exit with stderr
+is unconfirmed because GNOME may swallow D-Bus failures. Uncertain completion
+requires diagnosis before any manual retry; desktop confirmation remains native.
+A fresh prepare revalidates permissions; group errors remain fail-closed.
+Unreadable root-owned QEMU configuration may receive separately confirmed
+read-only sudo inspection by isolated system Python. An unchanged file snapshot
+and stock identities are required; no configuration bytes are printed and no
+file permissions are changed. Failure stops before storage/VM creation.
+Unsupported installers require manual dependencies; prepared hosts
+continue only after capability/access/storage checks. Guest profiles stay strict. Neither implements
+provisioning or recovery. Schema-2 state records the distro; schema-1 Noble fixtures
+remain readable without migration. The lifecycle module
+owns fixture state/locking, resource validation and the interactive scenario;
+it does not implement provisioning. See [the operator guide](docs/local-vm-e2e.md).
+
+The fixture lives outside the repository, with a private HOME, inventory,
+identities, trust and temporary records. Fixed per-user disk paths live under
+`/var/lib/libvirt/images/portfolio-e2e-<UID>`. State UUIDs plus namespaced domain
+and network metadata and exact device/path validation establish ownership.
+New disk sources disable only DAC relabeling to preserve controller ownership:
+the qcow2 grants its protected storage group read/write access (0660), while
+the read-only seed uses 0640. Only the exact owned qcow2 may pass the group-write
+exception; legacy fixtures are not rewritten or repaired.
+Successful list queries alone establish absence; query errors and partial state
+never authorize recreation. Prepare journals `preparing` before artifacts and
+marks `ready` only after a console-verified stopped baseline. After explicit
+console-check and shutdown consent, prepare revalidates resources and allows up
+to 300 seconds for UUID-bound cloud-init/SSH/logind/Power Button readiness before
+requesting graceful shutdown. One short guest probe is tracked at a time, with
+only exit codes collected; identity/guest/protocol errors stop, and only an
+explicit agent-disconnected boot response permits transport polling. Shutdown
+then waits up to 120 seconds before baseline creation. Legacy fixtures are not
+equipped with an agent automatically or resumed after failed preparation.
+Destructive actions validate
+paths/snapshots and foreign users before and after default-deny consent,
+use graceful shutdown and never force unsupported restoration.
+
+The scenario launches existing `make init-server` and `make reboot-host` children.
+The eight `e2e-` user-management Make wrappers dispatch the existing access CLI
+under the same fixture lock and guard. An explicit allowlist forwards human policy,
+selected key paths and recovery inputs; operator key paths become absolute before
+switching HOME. Inventory/controller identity and trust remain fixture-owned.
+User operations retain native confirmations and recovery proofs, without scenario
+consent grants or VM lifecycle actions.
+Before importing CLI transports, `access.py` invokes the E2E guard for these
+children: revalidate resources, bridge route/DHCP, exact inventory and fixed child
+inputs, then pin OpenSSH fixture trust. Paramiko uses isolated HOME. Production
+execution and legacy imports do not activate this guard. The scenario's single
+plan covers key generation, selected initialization, repeat convergence and guest
+reboot. An inherited anonymous pipe transfers consent to exactly one guarded child
+invocation, bound to its mode/frontier and input snapshot; no persistent receipt or
+general environment yes switch exists. Child policy inputs explicitly include
+Make's exported empty values and defaults before snapshotting; missing and empty
+remain distinct. Key generation receives the fixture inventory explicitly. The
+guard rejects changed fixed policy inputs before sanitizing the environment, and
+snapshots bind key selection and the Make recipes as well as CLI/role code.
+Offline regression tests traverse GNU Make, the inherited descriptor and the real
+CLI guard/plan receiver with VM proofs and operation dispatch mocked.
+Roles, independent proofs and native
+authentication/host-trust prompts remain. Numeric Ansible recaps or exact managed
+no-op evidence prove repeat provisioning is unchanged (with the verifier's exact
+three Docker smoke changes); independent SSH probes and boot IDs cover persistence.
+Errors preserve state and diagnostic snapshots; continuation remains explicit.
+Offline mocked lifecycle tests join the existing unittest discovery; check/CI
+never depend on VM targets. Real compatibility/idempotency remain operator tests.

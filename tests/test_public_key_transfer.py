@@ -52,6 +52,8 @@ class PublicKeyTransferTests(unittest.TestCase):
         return subprocess.CompletedProcess(command, 0, '256 SHA256:synthetic (ED25519)\n', '')
 
     def stage(self, mode, inventory, override, public):
+        if access.sys.stdin.isatty():
+            access.stage_consent(mode, inventory, override)
         self.snapshot = public
         self.assertEqual(public.stat().st_mode & 0o777, 0o600)
         self.assertEqual(public.parent.stat().st_mode & 0o777, 0o700)
@@ -108,7 +110,7 @@ class PublicKeyTransferTests(unittest.TestCase):
                 access.local_key('copy-public-key')
             self.assertNotIn('copied', output.getvalue())
 
-    def installation_mocks(self, env, answer='', result=0, available=True, root=False):
+    def installation_mocks(self, env, answer='y', result=0, available=True, root=False):
         """Mock the full local path, including backend discovery after APT."""
         if hasattr(self, 'installation_stack'):
             self.installation_stack.close()
@@ -149,13 +151,13 @@ class PublicKeyTransferTests(unittest.TestCase):
     def test_install_confirmation_retries_copy_for_wayland_and_x11(self):
         for env, package, argv in (({'WAYLAND_DISPLAY': 'fixture'}, 'wl-clipboard', ['wl-copy']),
                                    ({'DISPLAY': ':0'}, 'xclip', ['xclip', '-selection', 'clipboard'])):
-            for answer in ('', 'Y', 'yes'):
+            for answer in ('Y', 'yes'):
                 for root in (False, True):
                     with self.subTest(env=env, answer=answer, root=root):
                         self.calls.clear()
                         prompt, output = self.installation_mocks(env, answer, root=root)
                         access.local_key('copy-public-key')
-                        prompt.assert_called_once_with('Install now? [Y/n]: ')
+                        prompt.assert_called_once_with('Apply this plan? [y/N] ')
                         installer = (['sudo'] if not root else []) + ['apt-get', 'install', '-y', package]
                         self.assertEqual([c for c, _ in self.calls if c[0] != 'ssh-keygen'], [installer, argv])
                         self.assertIn('Required package: ' + package, output.getvalue())
@@ -163,7 +165,7 @@ class PublicKeyTransferTests(unittest.TestCase):
                         self.assertIn('SHA256:synthetic', output.getvalue())
 
     def test_install_decline_or_cancel_never_installs_or_copies(self):
-        for answer in ('n', 'N', 'no', 'unexpected', EOFError(), KeyboardInterrupt()):
+        for answer in ('', 'n', 'N', 'no', 'unexpected', EOFError(), KeyboardInterrupt()):
             with self.subTest(answer=answer):
                 self.calls.clear()
                 _, output = self.installation_mocks({'WAYLAND_DISPLAY': 'fixture'}, answer)
@@ -270,7 +272,8 @@ class PublicKeyTransferTests(unittest.TestCase):
                     patch('builtins.input', side_effect=answers), contextlib.redirect_stdout(io.StringIO()), \
                     self.assertRaises(ValueError):
                 access.human_access('add-user', self.home / 'inventory')
-            self.register.assert_not_called()
+            self.register.reset_mock()
+            self.assertFalse(hasattr(self, 'snapshot'))
 
     def test_invalid_crypto_is_rejected_for_file_and_paste_before_registration(self):
         self.public.write_text('ssh-ed25519 AAAA\n')
@@ -333,12 +336,12 @@ class PublicKeyTransferTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'declined'):
             access.human_access('add-user', self.home / 'inventory')
         prompt.assert_called_once()
-        self.register.assert_not_called()
+        self.assertFalse(hasattr(self, 'snapshot'))
         def failed(*args):
             self.stage(*args)
             raise ValueError('stage failed')
         with patch.dict(os.environ, {'HUMAN_PUBLIC_KEY': str(self.public)}), \
-                patch.object(access, 'human_access_stage', side_effect=failed), \
+                patch.object(access, 'human_access_stage', side_effect=failed), patch('builtins.input', return_value='y'), \
                 contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'stage failed'):
             access.human_access('add-user', self.home / 'inventory')
         self.assertFalse(self.snapshot.parent.exists())

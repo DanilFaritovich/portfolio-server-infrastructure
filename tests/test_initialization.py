@@ -10,10 +10,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_cli_package import load_access
-from portfolio_cli import cli, initialization as init
+from portfolio_cli import cli, initialization as init, plans
 
 
 class InitializationTests(unittest.TestCase):
@@ -30,6 +30,9 @@ class InitializationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(init, 'managed_access', return_value=('automation', Path('/synthetic'))))
         self.stack.enter_context(patch.object(init, 'human_inputs', return_value={
             'human_access_user_sudo': 'admin', 'human_access_user_name': 'person'}))
+        self.stack.enter_context(patch.object(init, 'plan_snapshot', return_value=('fixed',)))
+        self.stack.enter_context(patch.object(init, 'load_host', return_value=('fixture', 'example.test', 22, 'root', '/usr/bin/python3')))
+        self.stack.enter_context(patch.object(init, 'hardening_inputs', return_value={'ssh_listen_ports': [22]}))
         self.check_key = self.stack.enter_context(patch.object(init, 'check_key'))
         self.stack.enter_context(patch.object(init, 'human_key_path', return_value=Path('/synthetic-human')))
         self.answer = self.stack.enter_context(patch('builtins.input', return_value='yes'))
@@ -37,7 +40,12 @@ class InitializationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(init.tempfile, 'NamedTemporaryFile',
                                              side_effect=lambda **kw: factory(dir=self.temp.name, **kw)))
         self.real_init_stage = init.init_stage
-        self.stage = self.stack.enter_context(patch.object(init, 'init_stage'))
+        self.stage = Mock()
+        def dispatch(mode, *args):
+            if mode in plans.PLAN_ACTIONS:
+                plans.stage_consent(mode, *args)
+            return self.stage(mode, *args)
+        self.stack.enter_context(patch.object(init, 'init_stage', side_effect=dispatch))
 
     def run_init(self):
         init.init_server(Path('/synthetic-inventory'), Path('/synthetic-key'))
@@ -142,10 +150,11 @@ class InitializationTests(unittest.TestCase):
                     patch.object(sys, 'argv', ['access.py', 'init-server', '--inventory', '/fixture']):
                 self.answer.side_effect = answers
                 self.assertEqual(cli.main(), 1)
-        self.assertIn('Initialization cancelled (end of input); no host contact requested.', self.output.getvalue())
+        self.assertIn('Initialization cancelled (end of input); no mutation authorized.', self.output.getvalue())
         self.assertNotIn('Traceback', self.output.getvalue())
         self.stage.assert_not_called()
-        self.assertEqual(list(Path(self.temp.name).glob('*.jsonl')), [])
+        for path in Path(self.temp.name).glob('*.jsonl'):
+            self.assertIn('failed', path.read_text())
 
     def test_every_continuation_verifies_dependencies_and_preserves_remaining_order(self):
         for boundary, frontier in enumerate([row[0] for row in init.INIT_STAGES] + ['verify']):

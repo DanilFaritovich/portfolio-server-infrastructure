@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 from .clipboard import copy_public_key
+from .plans import plan_confirm, planned_action
 from .common import require, validate_cli_path
 from .keys import check_key, human_key_path, prepare_human_key, public_key_file
 
@@ -21,7 +22,7 @@ def cli_human_key(public_only=False):
     return name, key
 
 
-def load_agent_key(key, public):
+def load_agent_key(key, public, *, planned=False):
     """OpenSSH owns passphrase input; never launch an agent in a child shell."""
     require(shutil.which('ssh-add'), 'Missing ssh-add. Install OpenSSH client tools.')
     fingerprint = subprocess.run(['ssh-keygen', '-l', '-E', 'sha256', '-f', str(public)],
@@ -49,6 +50,11 @@ def load_agent_key(key, public):
     require(sys.stdin.isatty(),
             'Key is not loaded. Run make load-user-key in a terminal for the OpenSSH passphrase prompt. '
             'Use AGENT_LOAD=no to skip loading during generation.')
+    before = public.read_bytes()
+    agent_endpoint = os.environ.get('SSH_AUTH_SOCK')
+    if not planned:
+        plan_confirm([f'Load the selected key {key} ({selected}) into the invoking shell SSH agent; OpenSSH may ask for its passphrase. Rights: controller user; no agent is started.'],
+                     validate=lambda: (check_key(key), require(public.read_bytes() == before and os.environ.get('SSH_AUTH_SOCK') == agent_endpoint, 'Selected public identity or agent endpoint changed; STOP.')))
     environment = os.environ.copy()
     environment['SSH_ASKPASS_REQUIRE'] = 'never'
     try:
@@ -66,7 +72,16 @@ def local_key(mode):
     policy = os.environ.get('AGENT_LOAD', 'ask')
     require(policy in ('ask', 'yes', 'no'), 'AGENT_LOAD must be ask, yes or no.')
     created = False
+    agent_planned = False
+    selected_agent = os.environ.get('SSH_AUTH_SOCK')
     if mode == 'generate-user-key':
+        if not key.exists() and not key.with_name(key.name + '.pub').exists():
+            agent_planned = policy == 'yes' or (policy == 'ask' and bool(os.environ.get('SSH_AUTH_SOCK')))
+            if not planned_action(mode):
+                plan_confirm([f'Create a non-overwriting Ed25519 key pair at {key} (private 0600, directory 0700); native OpenSSH passphrase input; rights: controller user.' +
+                              (' Load only this newly generated identity into the existing SSH agent; native passphrase input.' if agent_planned else '')],
+                             validate=lambda: require(not key.exists() and not key.with_name(key.name + '.pub').exists(),
+                                                      'Key plan changed; STOP before generation.'))
         created = prepare_human_key(key, name, interactive_passphrase=True)
     # Inspect only private metadata; validate and read public material separately.
     if mode != 'copy-public-key':
@@ -79,22 +94,17 @@ def local_key(mode):
     elif mode == 'generate-user-key':
         if created:
             print('SSH key generated successfully.')
-        if policy == 'yes' or (created and policy == 'ask' and sys.stdin.isatty()):
-            accepted = policy == 'yes'
-            if not accepted:
-                try:
-                    answer = input('Add private key to ssh-agent? [Y/n]: ').strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    answer = 'n'
-                require(answer in ('', 'y', 'yes', 'n', 'no'), 'Answer Y or N; key preserved. Use make load-user-key later.')
-                accepted = answer in ('', 'y', 'yes')
-            if accepted:
-                try:
-                    load_agent_key(key, public)
-                except (ValueError, OSError, subprocess.TimeoutExpired) as error:
-                    print('Key preserved; agent loading failed. ' + str(error), file=sys.stderr)
-            else:
-                print('Agent loading skipped; key preserved.')
+        if created and agent_planned:
+            require(os.environ.get('SSH_AUTH_SOCK') == selected_agent, 'Agent endpoint changed; STOP before loading.')
+            try:
+                load_agent_key(key, public, planned=True)
+            except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+                print('Key preserved; agent loading failed. ' + str(error), file=sys.stderr)
+        elif policy == 'yes':
+            try:
+                load_agent_key(key, public)
+            except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+                print('Key preserved; agent loading failed. ' + str(error), file=sys.stderr)
         else:
             print('Agent loading skipped. Use make load-user-key when ready.')
     elif mode == 'show-public-key':

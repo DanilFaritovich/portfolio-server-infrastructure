@@ -105,14 +105,17 @@ make init-server INIT_FROM=bootstrap HUMAN_USER=operator HUMAN_SUDO=admin \
 
 This is **LIVE / MUTATING**: bootstrap → Docker → SSH/UFW hardening → human access
 → final SSH security → separately confirmed server operations, with mandatory
-verification between stages. Existing registration, recovery, password/trust and
-operations prompts remain. No application deployment, reboot or automatic recovery.
+verification between stages. One preliminary plan and default-deny confirmation
+cover the listed changes for this invocation, including the tested provider-console
+recovery attestation. Native password/passphrase, sudo and host-trust prompts remain
+separate. No application deployment, reboot or automatic recovery.
 
 `INIT_FROM` chooses the first stage authorized for application: `bootstrap`,
 `docker`, `hardening`, `human`, `ssh`, `operations`; omit it for interactive selection
 with no default. Earlier stages are skipped only after successful server verification.
 Remaining stages run existing idempotent wrappers and explicit verification; completed
-stages beyond the selected frontier are not auto-detected. `INIT_FROM=verify` verifies
+hardening, final SSH policy, operations and managed-key registration can skip
+application only after exact read-only evidence shows no changes are needed. `INIT_FROM=verify` verifies
 the entire pipeline without provisioning; Docker's disposable smoke test may change
 the image cache.
 
@@ -134,11 +137,25 @@ Inventory, identities, keys, passwords, exception text and subprocess output are
 never captured. Log-write errors stop later dispatch and may leave the last record
 incomplete. Terminal errors include the active command and an allowlisted static
 cause or safe process/I/O category, without arbitrary exception text or raw stderr.
-Ctrl+D at stage selection or plan confirmation cancels before host contact without
+Ctrl+D at stage selection or plan confirmation cancels before mutation without
 traceback. Stage diagnostics remain in the terminal. Offline checks do not prove
 live access, repeat-run idempotency or provider recovery.
 
 ## Access and security
+
+Mutating commands show a preliminary plan with target, actions and required rights,
+then ask `Apply this plan? [y/N]`. Enter, refusal, EOF and interruption deny approval.
+`init-server` and `e2e-test` reuse one approval only for their listed operations in
+the current invocation. Input or server snapshot drift stops execution. Native
+authentication and host-trust decisions remain separate; preflight may contact the
+host before mutation consent. Terminal public-key registration confirms before
+host contact; explicit public-file automation remains supported.
+Exact no-op evidence skips application and its prompt where supported; Docker's
+disposable smoke test still changes runtime/image cache. Local `setup`/`deps` skip
+downloads and confirmation when pinned tooling and the requested inventory are ready.
+CI uses `make deps-ci` for explicit noninteractive installation of only the same
+pinned project-local dependencies, retaining checksum and plan-input validation.
+It does not create inventory or authorize server/SSH/E2E operations.
 
 The standard path is **bootstrap_login_user + interactive SSH password →
 ansible_user + dedicated SSH key + NOPASSWD sudo**. The initial login is used only
@@ -208,6 +225,7 @@ The plugin is deprecated in newer Ansible releases and scheduled for removal in
 | Target | Purpose | Host access |
 | --- | --- | --- |
 | `make setup` | Install local dependencies; create missing local inventory | Dependency registries only |
+| `make deps-ci` | Install pinned local tooling/collections without interactive consent (CI) | Dependency registries only |
 | `make deps` | Install pinned local tooling/collections | Dependency registries only |
 | `make generate-user-key` | Generate a local human Ed25519 keypair and offer agent loading | **LOCAL / key files and optional local agent** |
 | `make load-user-key` | Load the selected existing key into the local SSH agent | **LOCAL / agent only** |
@@ -553,14 +571,24 @@ ordered transaction. The role then strictly verifies generated, loaded and live
 routes, effective SSH ports, Docker/containerd and the active UFW with exact desired
 IPv4/IPv6 TCP rules. The wrapper verifies fresh key-only SSH and `sudo -n` on every
 `ssh_verify_ports` entry. Runtime mismatch is a hard failure. Preflight checks the actual socket/service dependencies and
-`KillMode=process` to preserve established sessions. A generated-port mismatch
+`KillMode=process` to preserve established sessions. An on-disk port mismatch
 stops before listener restart; use recovery access to reconcile configuration
-before retrying. Socket drift also schedules these handlers when the installed
-SSH block is unchanged, allowing an interrupted transition to converge in one
-`make harden` run. Safe pre-transition generated/loaded/live drift is reported as
+before retrying. Safe socket drift without a pending receipt also schedules these
+handlers when the installed SSH block is unchanged, converging in one
+`make harden` run. Safe pre-transition on-disk/loaded/live drift is reported as
 WARN by `make inspect-hardening`, which remains READY; it becomes PASS after
-convergence. A converged
-repeat run does not reload or restart SSH.
+convergence. A converged repeat run does not reload or restart SSH.
+The on-disk socket candidate combines the validated package unit and any
+supported generated `addresses.conf`. Ubuntu's generator intentionally omits
+that drop-in for stock port 22. Both reviewed package defaults are supported:
+one dual-stack `ListenStream=22`, and separate IPv4/IPv6 listeners with
+`BindIPv6Only=ipv6-only`. The inspector reads their binding policy from disk,
+independently of possibly stale loaded properties; absence never implies that
+nondefault desired ports are configured. Candidate, runtime and reload scheduling
+compare the same normalized wildcard IPv4/IPv6 routes. Pending activation still
+blocks ordinary preflight/verification. The read-only report includes the socket
+route source and normalized on-disk, loaded, live and desired routes; raw unit or
+command contents remain withheld. See [E2E socket diagnosis](docs/local-vm-e2e.md#ssh-socket-diagnosis-read-only).
 See [Ubuntu socket activation](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189).
 See [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
 and [OpenSSH configuration](https://man.openbsd.org/sshd_config).
@@ -811,7 +839,7 @@ offer a LIVE host-only handshake when the inventory port differs from the JSON p
 `copy-public-key`: Wayland (`wl-copy`), X11 (`xclip`/`xsel`) or macOS (`pbcopy`).
 Only the JSON is copied; server, port, fingerprints and success confirmation stay
 in the terminal. On Ubuntu/Debian, a missing utility offers APT installation with
-`Install now? [Y/n]:` (Enter/Y accepts; N cancels installation and copying).
+`Apply this plan? [y/N]` (Y/yes accepts; Enter/N cancels installation and copying).
 Headless sessions fail with guidance to use `show-server-trust`; non-interactive
 calls never install packages. Copy or installation errors never report success.
 A VM needs a configured shared clipboard or another reviewed transfer channel.
@@ -930,8 +958,9 @@ operator checks; offline tests do not prove production access.
 
 ### Agent loading and a new computer with one encrypted key
 
-After creating a new pair, `generate-user-key` asks `Add private key to ssh-agent? [Y/n]:`.
-Enter/Y loads the selected key through native OpenSSH `ssh-add`; N skips loading.
+Before creating a new pair, `generate-user-key` shows one plan for generation and
+optional loading into the existing agent. Only Y/yes accepts `Apply this plan? [y/N]`;
+Enter/N declines before generation. OpenSSH `ssh-add` loads only the selected key.
 OpenSSH owns passphrase input: Python never reads it. Successful loading prints only
 the selected public fingerprint. Generation stays successful if agent loading fails;
 the key is preserved. `load-user-key` reports failure with a nonzero exit status.
@@ -949,8 +978,10 @@ eval "$(ssh-agent -s)"
 make load-user-key HUMAN_USER=portfolio_laptop2
 ```
 
-`AGENT_LOAD=ask` (default), `yes` or `no` controls loading during generation. `yes`
-omits confirmation; `no` skips agent access. New key generation still requires a TTY
+`AGENT_LOAD=ask` (default) includes loading a new key when SSH_AUTH_SOCK is set;
+`yes` requests loading, including for an existing pair; `no` skips agent access.
+Loading is part of the generation plan, or has its own default-deny plan for an
+existing unloaded key. Already loaded identities need no mutation confirmation. New key generation still requires a TTY
 for native passphrase input. Without a TTY there is no confirmation or passphrase
 prompt: `load-user-key` can confirm an already loaded identity, but refuses to add
 an unloaded key. Even `AGENT_LOAD=yes` cannot bypass that rule. Generation preserves
@@ -985,9 +1016,9 @@ and `KEY_NAME`, and copies the complete `.pub` contents, including the comment.
 It needs only the public file and never inspects the private member, contacts a host,
 or loads an agent. In a Wayland session it prefers `wl-copy` (package `wl-clipboard`);
 in X11 it uses `xclip` or `xsel` (matching packages). macOS uses built-in `pbcopy`.
-On Ubuntu/Debian, a missing utility offers `Install now? [Y/n]:` in a terminal:
-Enter/Y installs `wl-clipboard` or `xclip` through APT (with sudo unless root), checks
-availability and retries copying. N declines without installing or copying.
+On Ubuntu/Debian, a missing utility shows an installation plan in a terminal:
+Y/yes installs `wl-clipboard` or `xclip` through APT (with sudo unless root), checks
+availability and retries copying. Enter/N declines without installing or copying.
 `make setup` does not install clipboard packages. Non-interactive calls never prompt
 or install; headless Linux calls suggest `make show-public-key`. Other Linux systems
 require manual installation. Success reports the SHA256 fingerprint; installation
@@ -1037,7 +1068,7 @@ mode without password fallback. Final SSH security still requires a distinct pro
 human administrator; `verify-user` cannot target the current inventory controller.
 
 For an isolated Ubuntu 24.04 VM, first run `make check` offline. Then test local key
-creation, Y/Enter/N, `AGENT_LOAD=no`, repeated generation, agent absence and repeated
+creation, Y acceptance and Enter/N denial, `AGENT_LOAD=no`, repeated generation, agent absence and repeated
 `load-user-key`. Stop the disposable agent or unset `SSH_AUTH_SOCK` to test refusal;
 never stop a shared desktop agent. Fresh SSH and Ansible checks against the disposable
 VM require separate approval and a registered key/trusted host. Test that unrelated
@@ -1366,7 +1397,7 @@ make check              # offline regressions, lint and example-inventory syntax
 make inspect-operations
 make setup-operations   # explicitly confirm in the terminal
 make verify-operations
-make setup-operations   # confirm again; expect changed=0 with no drift
+make setup-operations   # exact no-op skips application and confirmation
 make verify-operations
 ```
 
@@ -1552,3 +1583,100 @@ automation accounts cannot be removed through these commands. If key installatio
 succeeds but ledger writing fails, the new entry remains unmanaged: inspect through
 recovery, then explicitly register its identical public line. A failure after credentials
 or sudo were revoked requires manual recovery inspection, without blind retries.
+
+## Local Ubuntu VM E2E
+
+The optional interactive KVM/libvirt fixture tests the existing `make init-server`
+on a disposable Ubuntu Server 24.04 (default) or 22.04 amd64 guest. It uses `qemu:///system`, virt-install,
+cloud-init and a dedicated NAT; virt-manager can open its serial console.
+Defaults are 2 vCPU, 4 GiB RAM and 25 GiB qcow2, configurable for new fixtures.
+Production inventory, keys and host trust are excluded. Real VM commands are
+local operator actions and are never run by `make check` or CI.
+
+Read [host prerequisites, preparation, scenarios and recovery](docs/local-vm-e2e.md)
+before running `make e2e-prepare`, `make e2e-status`, `make e2e-test`,
+`make e2e-reset` or `make e2e-delete`. Preparation and destructive operations
+require explicit consent; tests use one bounded scenario plan and retain native authentication/trust prompts. The
+scenario covers installation, final verification, repeat provisioning and reboot
+persistence. Failures preserve the guest for console diagnosis, without auto-reset.
+Guarded CLI calls for user-management commands use the fixture's isolated `HOME` and
+`known_hosts`; strict host-key checking remains enabled. SSH transport failures report
+their exit status separately from invalid inspector JSON.
+
+User management on an existing, running and provisioned fixture is available through
+the following wrappers. They reuse the fixture lock, VM ownership/DHCP/route guard,
+generated inventory and existing CLI. They never start, prepare or reset the VM.
+Mutations retain native TTY confirmations and independent recovery proofs; they
+receive no approval from `e2e-test`. Keep the VM console available.
+
+Prepare separate test-only key pairs first. These examples assume Alice's key and
+an additional public key exist at the paths shown, and `e2e_admin` is an independently
+verified administrator created by a successful scenario:
+
+```bash
+stand_keys="$HOME/.local/share/portfolio-e2e/home/.ssh"
+make e2e-list-users
+make e2e-show-user HUMAN_USER=e2e_admin
+make e2e-list-user-keys HUMAN_USER=e2e_admin
+make e2e-add-user HUMAN_USER=alice HUMAN_SUDO=none \
+  HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_ed25519.pub"
+make e2e-verify-user HUMAN_USER=alice HUMAN_SUDO=none \
+  HUMAN_KEY="$stand_keys/portfolio-infra/alice_ed25519"
+make e2e-add-user-key HUMAN_USER=alice \
+  HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519.pub"
+make e2e-list-user-keys HUMAN_USER=alice
+# Copy the exact fingerprint from the listing; destructive commands require a TTY.
+make e2e-revoke-user-key HUMAN_USER=alice KEY_FINGERPRINT='SHA256:REPLACE_FROM_LISTING' \
+  RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+make e2e-remove-user HUMAN_USER=alice \
+  RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+```
+
+The explicit input allowlist is `HUMAN_USER`, `HUMAN_SUDO`, `HUMAN_GROUPS`,
+`HUMAN_GROUPS_APPROVED`, `HUMAN_SUDO_COMMANDS`, `HUMAN_KEY`, `HUMAN_PUBLIC_KEY`,
+`RECOVERY_USER`, `RECOVERY_KEY`, `KEY_NAME`, `KEY_FINGERPRINT` and `AGENT_LOAD`.
+Only explicitly selected key paths cross into the child; relative paths and `~`
+are expanded in the operator environment first. Omitted keys use the existing CLI
+defaults under the isolated fixture HOME; omitted sudo policy is `none`.
+`INVENTORY`, `AUTOMATION_KEY`, Ansible settings and production trust are not
+forwarded. Recovery must remain a separate managed administrator with disjoint
+authorized keys and fresh key-only SSH/sudo proof. Failure stops without retries.
+
+`e2e-delete` accepts standard `0644` public `.pub` files directly in the fixture's
+`home/.ssh/controller`, `home/.ssh/human` and `home/.ssh/portfolio-infra` directories.
+Controller ownership, single hard links, no symlinks and no group/other writes are
+still required. Private keys and all other fixture files retain strict checks.
+Permission/path failures report the escaped problematic path, without file contents;
+see [deletion and recovery](docs/local-vm-e2e.md#reset-deletion-and-incomplete-preparation).
+
+`make e2e-list-distros` lists the local image registry. For a new fixture select
+`make e2e-prepare E2E_DISTRO=ubuntu-22.04`. Host checks use Linux x86_64/KVM/libvirt
+capabilities without a Ubuntu version allowlist. Compatible Ubuntu/Debian apt environments offer missing-package
+installation; other managers require manual setup when tools are missing. Prepare
+combines known missing packages, additive libvirt/kvm groups and dedicated disk
+preparation into one preliminary plan and one default-deny `[y/N]`. VM creation
+joins that plan when permissions are effective. Plan snapshots are revalidated;
+new identities/storage details discovered only after installation need separate
+consent. Native sudo authentication remains interactive. Group
+changes finish successfully with a Reboot now/later menu only while configured groups
+remain inactive. Reboot now prints the rerun instruction, warns about unsaved data
+and requires a separate `[y/N]`. A complete local non-root GNOME X11/Wayland
+session uses `gnome-session-quit --reboot` with native desktop confirmation;
+other supported Linux/systemd sessions use
+`systemctl --check-inhibitors=yes --no-ask-password reboot`. Selection depends on
+session capabilities, not OS versions. Both preserve normal inhibitor/authorization
+handling without sudo or force. Incomplete/remote/unsupported sessions and errors
+show a short safe reason and manual instructions, with no second-backend retry.
+Unconfirmed requests require state inspection before any manual retry.
+Reboot later exits successfully.
+After rebooting, rerun `make e2e-prepare` to recheck access and continue;
+no VM is created before permissions become active. Ready VMs are preserved and distro changes are blocked.
+SHA-256 verification and optional `E2E_IMAGE_SHA256` pinning remain mandatory checks.
+If root-owned `qemu.conf` is unreadable, prepare separately offers read-only sudo
+inspection of file safety and QEMU identity within the same command, without
+printing configuration or changing file permissions. Failed/declined inspection
+or custom settings stop before disk/VM creation.
+Prepare also includes explicitly approved completion of an empty dedicated disk
+directory left at 0750 by an earlier setgid bug, verifying ownership/group and
+unchanged state before sudo chmod 2750. No extra shell command is needed;
+other directory drift or existing data remains blocking.

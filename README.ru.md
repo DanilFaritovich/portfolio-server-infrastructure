@@ -104,15 +104,18 @@ make init-server INIT_FROM=bootstrap HUMAN_USER=operator HUMAN_SUDO=admin \
 
 Это **LIVE / MUTATING**: bootstrap → Docker → SSH/UFW hardening → human access
 → final SSH security → отдельно подтверждаемые server operations с обязательной
-проверкой между этапами. Подтверждения регистрации ключа, recovery, password/trust
-и operations сохраняются. Деплой приложений, reboot и автоматическое recovery исключены.
+проверкой между этапами. Единый предварительный план и default-deny подтверждение
+разрешают перечисленные изменения только в текущем запуске, включая подтверждение
+проверенного provider-console recovery. Штатные запросы password/passphrase, sudo
+и host trust остаются отдельными. Деплой приложений, reboot и автоматическое recovery исключены.
 
 `INIT_FROM` задаёт первый этап, разрешённый для применения: `bootstrap`, `docker`,
 `hardening`, `human`, `ssh`, `operations`. Без переменной выбор интерактивный,
 без значения по умолчанию. Предыдущие этапы пропускаются только после успешной
 фактической проверки сервера. Оставшиеся выполняются существующими идемпотентными
-wrappers с явной верификацией; выполненные этапы после выбранной границы автоматически
-не определяются. `INIT_FROM=verify` проверяет весь pipeline без provisioning;
+wrappers с явной верификацией; hardening, final SSH policy, operations и регистрация
+управляемого ключа пропускают применение только при точном read-only доказательстве
+отсутствия необходимых изменений. `INIT_FROM=verify` проверяет весь pipeline без provisioning;
 disposable Docker smoke test может изменить image cache.
 
 Ошибка проверки не отличает отсутствие этапа от потери доступа, pending activation
@@ -134,10 +137,25 @@ human/provider recovery-доступом. После прерывания remote
 последняя запись может остаться неполной. Ошибка в терминале содержит текущую команду
 и разрешённую статическую причину или безопасную категорию process/I/O, без произвольного
 текста исключения и сырого stderr. Ctrl+D при выборе этапа или подтверждении плана
-отменяет запуск до host contact, без traceback. Диагностика этапов остаётся в терминале.
+отменяет запуск до mutation, без traceback; read-only preflight мог уже обратиться к серверу. Диагностика этапов остаётся в терминале.
 Offline checks не доказывают live-доступ, идемпотентность повторного запуска и provider recovery.
 
 ## Доступ и безопасность
+
+Команды изменения показывают предварительный план с целью, действиями и нужными
+правами, затем спрашивают `Apply this plan? [y/N]`. Enter, отказ, EOF и прерывание
+не дают согласия. `init-server` и `e2e-test` используют одно согласие только для
+перечисленных операций текущего запуска. Изменение входов или снимка сервера
+останавливает выполнение. Штатная аутентификация и host trust остаются отдельными;
+preflight может обратиться к серверу до подтверждения mutation. Терминальная
+регистрация публичного ключа подтверждается до host contact; автоматизация с явно
+заданным публичным файлом сохраняется. Точный no-op пропускает применение и запрос,
+где это поддерживается; disposable Docker smoke test меняет runtime/image cache.
+Локальные `setup`/`deps` пропускают загрузки и подтверждение, если pinned tooling
+и запрошенный inventory уже подготовлены.
+В CI используется `make deps-ci`: неинтерактивная установка только тех же pinned
+локальных зависимостей с проверками checksum и актуальности плана. Inventory не
+создаётся; разрешения на серверные, SSH и E2E операции не предоставляются.
 
 Стандартный путь: **bootstrap_login_user + интерактивный SSH password →
 ansible_user + dedicated SSH key + NOPASSWD sudo**. Начальный login используется
@@ -206,6 +224,7 @@ password prompts и поддержкой выбранного ключа чер�
 | Target | Назначение | Доступ к хосту |
 | --- | --- | --- |
 | `make setup` | Установить local dependencies; создать отсутствующий inventory | Только dependency registries |
+| `make deps-ci` | Неинтерактивно установить pinned local tooling/collections для CI | Только dependency registries |
 | `make deps` | Установить pinned local tooling/collections | Только dependency registries |
 | `make generate-user-key` | Создать локальную пару Ed25519 и предложить загрузку в agent | **LOCAL / ключ и локальный agent** |
 | `make load-user-key` | Загрузить выбранный существующий ключ в локальный agent | **LOCAL / только agent** |
@@ -552,13 +571,26 @@ listeners продолжают работать как безопасный subs
 key-only SSH и `sudo -n` на каждом порту из `ssh_verify_ports`. Runtime mismatch завершает
 запуск ошибкой. Preflight проверяет
 фактические зависимости socket/service и `KillMode=process` для сохранения
-установленных сессий. Несовпадение generated ports останавливает выполнение до
+установленных сессий. Несовпадение on-disk ports останавливает выполнение до
 restart listeners; перед повторной попыткой согласуйте конфигурацию через recovery
-access. При socket drift handlers запускаются и с неизменённым установленным SSH
-block, чтобы завершить прерванный transition за один `make harden`. Безопасный
-pre-transition drift generated/loaded/live даёт WARN в `make inspect-hardening`,
+access. При безопасном socket drift без pending receipt handlers запускаются и с
+неизменённым установленным SSH block, обеспечивая convergence за один `make harden`.
+Безопасный pre-transition drift on-disk/loaded/live даёт WARN в `make inspect-hardening`,
 который остаётся READY; после convergence эти проверки дают PASS. Повторный запуск после convergence
-не выполняет reload/restart SSH. См.
+не выполняет reload/restart SSH.
+On-disk socket candidate объединяет проверенный пакетный unit и поддерживаемый
+generated `addresses.conf`. Генератор Ubuntu намеренно не создаёт этот drop-in
+для штатного порта 22. Поддерживаются оба проверенных пакетных варианта:
+один dual-stack `ListenStream=22` и отдельные IPv4/IPv6 listeners с
+`BindIPv6Only=ipv6-only`. Инспектор читает binding policy с диска независимо от
+возможно устаревших loaded properties; отсутствие drop-in не означает, что
+настроены нестандартные desired ports. Candidate, runtime и решение о reload
+сравнивают одинаково нормализованные wildcard IPv4/IPv6 routes. Pending activation
+по-прежнему блокирует обычные preflight/verification. Read-only отчёт показывает
+источник socket routes и нормализованные on-disk, loaded, live и desired routes;
+сырое содержимое units и команд не выводится. См.
+[диагностику E2E socket](docs/local-vm-e2e.md#ssh-socket-diagnosis-read-only).
+См.
 [Ubuntu socket activation](https://discourse.ubuntu.com/t/sshd-now-uses-socket-based-activation-ubuntu-22-10-and-later/30189),
 [UFW remote management](https://manpages.ubuntu.com/manpages/noble/en/man8/ufw.8.html)
 и [OpenSSH configuration](https://man.openbsd.org/sshd_config).
@@ -813,7 +845,7 @@ SSH host keys определяют сервер и отличаются от п�
 что `copy-public-key`: Wayland (`wl-copy`), X11 (`xclip`/`xsel`) или macOS (`pbcopy`).
 В буфер попадает только JSON; адрес, порт, fingerprints и подтверждение успеха
 остаются в терминале. На Ubuntu/Debian при отсутствии утилиты предлагается APT:
-`Install now? [Y/n]:` (Enter/Y принимает; N отменяет установку и копирование).
+`Apply this plan? [y/N]` (Y/yes принимает; Enter/N отменяет установку и копирование).
 В headless-сессии команда рекомендует `show-server-trust`; неинтерактивный запуск
 не устанавливает пакеты. Ошибки установки или clipboard не сообщают об успехе.
 Для VM нужен настроенный общий буфер либо другой проверенный канал передачи.
@@ -933,8 +965,9 @@ OpenSSH-сессия со strict checking и отключённым forwarding. 
 
 ### Загрузка в agent и новый компьютер с одним зашифрованным ключом
 
-После создания новой пары `generate-user-key` спрашивает `Add private key to ssh-agent? [Y/n]:`.
-Enter/Y загружает выбранный ключ через штатный OpenSSH `ssh-add`; N пропускает загрузку.
+До создания новой пары `generate-user-key` показывает единый план генерации и
+опциональной загрузки в существующий agent. Только Y/yes разрешает `Apply this plan? [y/N]`;
+Enter/N отменяет генерацию. Штатный OpenSSH `ssh-add` загружает только выбранный ключ.
 Passphrase вводится средствами OpenSSH: Python её не читает. Успех выводит только
 fingerprint выбранного публичного ключа. Ошибка agent не отменяет успешную генерацию;
 ключ сохраняется. Отдельная команда `load-user-key` возвращает ненулевой код при ошибке.
@@ -952,8 +985,10 @@ eval "$(ssh-agent -s)"
 make load-user-key HUMAN_USER=portfolio_laptop2
 ```
 
-`AGENT_LOAD=ask` (по умолчанию), `yes` или `no` управляет загрузкой при генерации.
-`yes` пропускает подтверждение; `no` исключает обращения к agent. Создание новой пары
+`AGENT_LOAD=ask` (по умолчанию) включает загрузку нового ключа при заданном SSH_AUTH_SOCK;
+`yes` запрашивает загрузку также существующей пары; `no` исключает обращения к agent.
+Загрузка включается в план генерации либо требует отдельного default-deny плана
+для существующего незагруженного ключа. Уже загруженный ключ не требует подтверждения mutation. Создание новой пары
 по-прежнему требует TTY для штатного ввода passphrase. Без TTY нет запросов подтверждения
 или passphrase: `load-user-key` подтверждает уже загруженный ключ, но отказывается
 загружать отсутствующий. `AGENT_LOAD=yes` не обходит это правило. Генерация сохраняет
@@ -988,9 +1023,9 @@ make add-user INVENTORY=inventories/production.yml HUMAN_USER=portfolio_laptop2 
 к серверу и не загружает agent. В Wayland предпочтение отдаётся `wl-copy` (пакет
 `wl-clipboard`), в X11 — `xclip` или `xsel` (одноимённые пакеты).
 В macOS используется встроенный `pbcopy`. В Ubuntu/Debian при отсутствии утилиты
-в терминале появляется `Install now? [Y/n]:`: Enter/Y устанавливает `wl-clipboard`
+в терминале появляется план установки: Y/yes устанавливает `wl-clipboard`
 или `xclip` через APT (с sudo, если запуск не от root), проверяет наличие утилиты
-и повторяет копирование. N завершает команду без установки и копирования.
+и повторяет копирование. Enter/N завершает команду без установки и копирования.
 `make setup` не устанавливает clipboard-пакеты. В non-interactive режиме нет запросов
 и установки; в headless Linux предлагается `make show-public-key`. В других Linux
 системах нужна ручная установка. Успех сопровождается SHA256 fingerprint; ошибка
@@ -1040,7 +1075,7 @@ mode без password fallback. Финальная SSH security по-прежне
 проверенного human admin; `verify-user` не может проверять текущего inventory controller.
 
 В отдельной Ubuntu 24.04 VM сначала выполните offline `make check`. Затем проверьте
-локальную генерацию, Y/Enter/N, `AGENT_LOAD=no`, повторную генерацию, отсутствие agent
+локальную генерацию, согласие Y и отказ Enter/N, `AGENT_LOAD=no`, повторную генерацию, отсутствие agent
 и повторный `load-user-key`. Для проверки отказа завершите только тестовый agent или
 уберите `SSH_AUTH_SOCK`; общий desktop agent не останавливайте. Новые SSH/Ansible-сессии
 с тестовой VM требуют отдельного разрешения, зарегистрированного ключа и проверенного
@@ -1377,7 +1412,7 @@ make check              # offline regression tests, lint, syntax с пример
 make inspect-operations
 make setup-operations   # явное подтверждение в терминале
 make verify-operations
-make setup-operations   # повторное подтверждение; ожидается changed=0 без drift
+make setup-operations   # точный no-op пропускает применение и подтверждение
 make verify-operations
 ```
 
@@ -1567,3 +1602,112 @@ candidate inventories других ПК. Исключите все действ�
 новая запись остаётся unmanaged: проверьте состояние через recovery, затем явно
 зарегистрируйте идентичную public line. Ошибка после отзыва credentials или sudo требует
 ручной проверки через recovery без слепого повторения.
+
+## Локальный Ubuntu VM E2E
+
+Дополнительный интерактивный стенд KVM/libvirt проверяет существующий
+`make init-server` на одноразовой Ubuntu Server 24.04 (по умолчанию) или 22.04 amd64 VM. Используются
+`qemu:///system`, virt-install, cloud-init и отдельная NAT-сеть; serial console
+доступна через virt-manager. Начальные параметры: 2 vCPU, 4 GiB RAM, 25 GiB
+qcow2; параметры новой VM настраиваются. Production inventory, ключи и доверие
+SSH исключены. Реальные команды VM выполняет оператор отдельно; `make check`
+и CI остаются offline.
+
+Перед `make e2e-prepare`, `make e2e-status`, `make e2e-test`, `make e2e-reset`
+или `make e2e-delete` прочитайте [зависимости, подготовку, сценарии и recovery](docs/local-vm-e2e.md).
+Подготовка и разрушительные операции требуют явного согласия; тест использует
+единый ограниченный план сценария, сохраняя штатные запросы аутентификации и trust.
+Проверяются установка, финальная верификация,
+повторная настройка и сохранение состояния после reboot. Сбой сохраняет VM для
+диагностики через console, без автоматического reset. Подробная инструкция
+стенда приведена на английском языке по ссылке выше.
+Guarded CLI-команды управления пользователями используют изолированные `HOME` и
+`known_hosts` стенда; строгая проверка host key остаётся включённой. Ошибки SSH
+отделены от некорректного JSON-ответа инспектора.
+
+Для управления пользователями существующего, запущенного и настроенного стенда
+доступны обёртки ниже. Они используют lock стенда, guard принадлежности VM/DHCP/
+маршрута, сгенерированный inventory и существующий CLI. Команды не запускают,
+не подготавливают и не сбрасывают VM. Изменения сохраняют штатные TTY-подтверждения
+и независимые recovery-проверки; согласие от `e2e-test` им не передаётся.
+Сохраняйте доступ к консоли VM.
+
+Заранее подготовьте отдельные тестовые пары ключей. Примеры предполагают, что ключ
+Alice и дополнительный публичный ключ существуют по указанным путям, а `e2e_admin`
+создан успешным сценарием и его административный доступ независимо проверен:
+
+```bash
+stand_keys="$HOME/.local/share/portfolio-e2e/home/.ssh"
+make e2e-list-users
+make e2e-show-user HUMAN_USER=e2e_admin
+make e2e-list-user-keys HUMAN_USER=e2e_admin
+make e2e-add-user HUMAN_USER=alice HUMAN_SUDO=none \
+  HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_ed25519.pub"
+make e2e-verify-user HUMAN_USER=alice HUMAN_SUDO=none \
+  HUMAN_KEY="$stand_keys/portfolio-infra/alice_ed25519"
+make e2e-add-user-key HUMAN_USER=alice \
+  HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519.pub"
+make e2e-list-user-keys HUMAN_USER=alice
+# Подставьте точный fingerprint из списка; разрушительные команды требуют TTY.
+make e2e-revoke-user-key HUMAN_USER=alice KEY_FINGERPRINT='SHA256:REPLACE_FROM_LISTING' \
+  RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+make e2e-remove-user HUMAN_USER=alice \
+  RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+```
+
+Явный allowlist параметров: `HUMAN_USER`, `HUMAN_SUDO`, `HUMAN_GROUPS`,
+`HUMAN_GROUPS_APPROVED`, `HUMAN_SUDO_COMMANDS`, `HUMAN_KEY`, `HUMAN_PUBLIC_KEY`,
+`RECOVERY_USER`, `RECOVERY_KEY`, `KEY_NAME`, `KEY_FINGERPRINT`, `AGENT_LOAD`.
+В дочерний процесс передаются только явно выбранные пути ключей; относительные
+пути и `~` заранее раскрываются в окружении оператора. Без указания ключей CLI
+использует штатные пути внутри изолированного HOME стенда; sudo по умолчанию `none`.
+`INVENTORY`, `AUTOMATION_KEY`, настройки Ansible и production trust не передаются.
+Recovery должен оставаться отдельным управляемым администратором с непересекающимися
+наборами авторизованных ключей и свежим доказательством key-only SSH/sudo.
+Ошибка останавливает выполнение без повторных попыток.
+
+`e2e-delete` допускает стандартные права `0644` для публичных `.pub` файлов
+непосредственно в `home/.ssh/controller`, `home/.ssh/human` и
+`home/.ssh/portfolio-infra` стенда. Сохраняются требования владельца-контроллера,
+единственной hard link, отсутствия symlink и записи для группы/остальных.
+Приватные ключи и остальные файлы сохраняют строгие проверки. Ошибки прав/пути
+показывают проблемный путь с экранированием, без содержимого файла;
+см. [удаление и восстановление](docs/local-vm-e2e.md#reset-deletion-and-incomplete-preparation).
+
+`make e2e-list-distros` показывает локальный реестр образов. Для нового стенда:
+`make e2e-prepare E2E_DISTRO=ubuntu-22.04`. Хост проверяется по возможностям
+Linux x86_64/KVM/libvirt без ограничения версий Ubuntu. В совместимом apt-окружении Ubuntu/Debian предлагается установка только
+недостающих пакетов; другие менеджеры требуют ручной установки при отсутствии
+инструментов. Добавление групп libvirt/kvm и создание выделенного каталога дисков
+включаются вместе с заранее известными пакетами в один предварительный план
+с одним default-deny подтверждением `[y/N]`. Создание VM входит в этот план,
+если права уже действуют. Снимки плана проверяются повторно; новые группы или
+параметры каталога, доступные только после установки, требуют отдельного согласия.
+Штатная sudo-аутентификация сохраняется.
+Если настроенные группы ещё не активны, подготовка завершается успешно с меню
+Reboot now/later. Перед перезагрузкой выводятся инструкция повторного запуска и
+предупреждение о несохранённых данных, затем требуется отдельное `[y/N]`.
+Полная локальная GNOME X11/Wayland-сессия обычного пользователя использует
+`gnome-session-quit --reboot`, сохраняя штатное подтверждение рабочего стола.
+Для остальных подходящих Linux/systemd-сессий используется
+`systemctl --check-inhibitors=yes --no-ask-password reboot`. Выбор зависит от
+возможностей сессии, а не версии ОС; системные запреты и авторизация сохраняются,
+sudo и принудительный режим не используются. Для неполной, удалённой или
+неподдерживаемой сессии и при ошибках выводятся краткая безопасная причина и
+инструкция ручной перезагрузки. Второй способ автоматически не запускается;
+при неподтверждённом результате сначала проверьте состояние системы.
+Reboot later успешно завершает команду. После перезагрузки
+запустите `make e2e-prepare`: права проверятся заново, подготовка продолжится.
+До активации прав VM не создаётся.
+При недоступном для чтения root-owned `qemu.conf` команда отдельно предлагает
+read-only sudo-проверку безопасности файла и настроек пользователя/группы QEMU.
+Аутентификация sudo проходит внутри той же команды; содержимое файла не
+выводится, права не меняются. Отказ, ошибка или нестандартные настройки
+останавливают подготовку до создания дисков и VM.
+Для пустого выделенного каталога, оставшегося с режимом 0750 после ошибки setgid,
+эта же команда включает sudo chmod 2750 в согласованный план. Перед изменением
+проверяются владелец, группа и неизменность каталога; дополнительные shell-команды
+не нужны. Другие отклонения и существующие данные блокируют продолжение.
+Готовая VM сохраняется; смена
+дистрибутива блокируется. Проверка SHA-256 сохранена, закрепление digest доступно
+через `E2E_IMAGE_SHA256`.

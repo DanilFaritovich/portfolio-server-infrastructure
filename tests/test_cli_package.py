@@ -118,7 +118,7 @@ class PackageTests(unittest.TestCase):
                 patch.object(operations, 'prerequisites'), patch.object(operations, 'check_key'), \
                 patch.object(operations, 'load_host', return_value=('portfolio', 'fixture.test', 2222, 'root', '/usr/bin/python3')), \
                 patch.object(operations, 'hardening_inputs', return_value={'ssh_listen_ports': [2222], 'firewall_allowed_tcp_ports': []}), \
-                patch.object(operations, 'known_host'), patch.object(operations, 'operations_probe') as probe, \
+                patch.object(operations, 'known_host'), patch.object(operations, 'operations_probe', return_value={'plan': {'changes': {'/etc/apt/apt.conf.d/99zz-portfolio-security': True}, 'token': 'fixed'}}) as probe, \
                 patch.object(operations, 'run_playbook') as run, patch.object(sys.stdin, 'isatty', return_value=True), \
                 patch('builtins.input', return_value=''), contextlib.redirect_stdout(io.StringIO()), \
                 self.assertRaisesRegex(ValueError, 'declined'):

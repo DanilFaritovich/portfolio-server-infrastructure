@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 
+from .plans import plan_confirm
 from .common import require
 from .keys import public_fingerprint, public_key_snapshot, read_public_key
 
@@ -45,11 +46,8 @@ def clipboard_command(fallback='show-public-key'):
                 'install ' + package + f' manually or use make {fallback}.')
         installer.insert(0, 'sudo')
     print('Clipboard utility not found.\nRequired package: ' + package + '\n')
-    try:
-        answer = input('Install now? [Y/n]: ').strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        raise ValueError('Clipboard installation cancelled; data was not copied.') from None
-    require(answer in ('', 'y', 'yes'), 'Clipboard installation declined; data was not copied.')
+    plan_confirm(['Install clipboard package ' + package + ' using ' + ('sudo/apt' if os.geteuid() != 0 else 'root/apt') + '; copy public material using the selected desktop backend. APT resolves dependencies and retains its own review.'],
+                 validate=lambda: require(not shutil.which(candidates[0][0]), 'Clipboard plan changed; rerun for the installed backend.'))
     try:
         result = subprocess.run(installer, check=False, timeout=300)
     except (OSError, subprocess.TimeoutExpired):

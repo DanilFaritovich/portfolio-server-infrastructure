@@ -117,18 +117,19 @@ class NativeStageTests(unittest.TestCase):
             with self.subTest(failure_at=failure_at), contextlib.ExitStack() as stack:
                 self.stage_fixture(stack, operations)
                 error = subprocess.CalledProcessError(1, 'fixture')
-                probes = [error] if failure_at == 'preflight' else [None, None, error] if failure_at == 'postflight' else None
-                probe = stack.enter_context(patch.object(operations, 'operations_probe', side_effect=probes))
+                plan = {'plan': {'changes': {'/etc/apt/apt.conf.d/99zz-portfolio-security': True}, 'token': 'fixed'}}
+                probes = [error] if failure_at == 'preflight' else [None, plan, plan, error] if failure_at == 'postflight' else None
+                probe = stack.enter_context(patch.object(operations, 'operations_probe', return_value=plan, side_effect=probes))
                 run = stack.enter_context(patch.object(operations, 'run_playbook', side_effect=error if failure_at == 'mutation' else None))
                 if failure_at:
                     with self.assertRaises(subprocess.CalledProcessError):
                         operations.operations('setup-operations', Path('/fixture.yml'))
                     self.assertEqual(run.call_count, 0 if failure_at == 'preflight' else 1)
-                    self.assertEqual(probe.call_count, {'preflight': 1, 'mutation': 2, 'postflight': 3}[failure_at])
+                    self.assertEqual(probe.call_count, {'preflight': 1, 'mutation': 3, 'postflight': 4}[failure_at])
                 else:
                     for _ in range(2):
                         operations.operations('setup-operations', Path('/fixture.yml'))
-                    self.assertEqual(probe.call_count, 6)
+                    self.assertEqual(probe.call_count, 8)
                     self.assertEqual(run.call_count, 2)
 
     def test_native_final_ssh_preflight_and_mutation_failures_stop_dependent_work(self):
@@ -140,6 +141,7 @@ class NativeStageTests(unittest.TestCase):
                     'human_access_user_name': 'operator', 'human_access_user_sudo': 'admin'}))
                 stack.enter_context(patch.object(human_access, 'human_key_path', return_value=Path('/human.key')))
                 stack.enter_context(patch.object(human_access, 'require_independent_key'))
+                stack.enter_context(patch.object(human_access, 'hardening_plan', return_value={'changes_required': True, 'token': 'fixed'}))
                 error = subprocess.CalledProcessError(1, 'fixture')
                 verify = stack.enter_context(patch.object(human_access, 'verify_hardening',
                     side_effect=[error] if failure_at == 'preflight' else [None, error] if failure_at == 'postflight' else None))
@@ -150,7 +152,7 @@ class NativeStageTests(unittest.TestCase):
                 with self.assertRaises(ValueError if failure_at == 'mutation' else subprocess.CalledProcessError):
                     human_access.human_access('secure-ssh', Path('/fixture.yml'))
                 self.assertEqual(run.call_count, 0 if failure_at == 'preflight' else 1)
-                self.assertEqual(human.call_count, 0 if failure_at == 'preflight' else 1)
+                self.assertEqual(human.call_count, 0 if failure_at == 'preflight' else 2)
                 self.assertEqual(verify.call_count, 2 if failure_at == 'postflight' else 1)
                 auth.assert_not_called()
 
@@ -162,6 +164,7 @@ class NativeStageTests(unittest.TestCase):
                         patch.object(provisioning, 'prerequisites'), patch.object(provisioning, 'check_key'), \
                         patch.object(provisioning, 'load_host', return_value=('portfolio', 'fixture.test', 2222, 'root', '/usr/bin/python3')), \
                         patch.object(provisioning, 'known_host'), \
+                        patch.object(sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value='yes'), \
                         patch.object(provisioning, 'run_playbook', side_effect=[None] * (failing_call - 1) + [failure]) as run, \
                         contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(type(failure)):
                     provisioning.live('docker-host', Path('/fixture.yml'))
