@@ -239,6 +239,79 @@ class StandTests(unittest.TestCase):
         self.stand.delete()
         self.assertNotIn('undefine', [x[0] for x in self.mutations()])
 
+    def fixture_key(self, relative, mode):
+        path = self.stand.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for parent in (path.parent, *path.parent.parents):
+            if parent == self.stand.root:
+                break
+            parent.chmod(0o700)
+        path.write_text('synthetic key material, never diagnostic output')
+        path.chmod(mode)
+        return path
+
+    def test_delete_accepts_standard_public_keys_in_test_key_directories(self):
+        for directory in ('controller', 'human', 'portfolio-infra'):
+            self.fixture_key(f'home/.ssh/{directory}/test_ed25519', 0o600)
+            self.fixture_key(f'home/.ssh/{directory}/test_ed25519.pub', 0o644)
+        self.stand.delete()
+        self.assertFalse(self.stand.root.exists())
+        self.assertFalse(self.stand.storage.exists())
+
+    def test_delete_public_key_exception_is_narrow_and_precedes_mutation(self):
+        cases = [('home/.ssh/human/key.pub', mode) for mode in (0o622, 0o664, 0o666, 0o755, 0o4644)]
+        cases += [(name, 0o644) for name in (
+            'home/.ssh/human/private_key', 'home/.ssh/known_hosts', 'state-copy.json',
+            'home/.ssh/unknown/key.pub', 'home/.ssh/key.pub', 'home/key.pub',
+            'home/.ssh/human/nested/key.pub')]
+        for relative, mode in cases:
+            with self.subTest(path=relative, mode=oct(mode)):
+                path = self.fixture_key(relative, mode)
+                with self.assertRaisesRegex(e2e.E2EPathError, 'ownership/mode') as raised:
+                    self.stand.delete()
+                self.assertEqual(raised.exception.path, str(path))
+                self.assertIn(json.dumps(str(path)), e2e.error_reason(raised.exception))
+                self.assertNotIn('synthetic key material', e2e.error_reason(raised.exception))
+                self.assertFalse(self.mutations())
+                e2e.confirm.assert_not_called()
+                path.unlink()
+
+    def test_public_key_exception_preserves_owner_link_and_private_checks(self):
+        path = self.fixture_key('home/.ssh/human/test.pub', 0o644)
+        info = path.lstat()
+        foreign = SimpleNamespace(st_mode=info.st_mode, st_uid=info.st_uid + 1,
+                                  st_gid=info.st_gid, st_nlink=1)
+        with patch.object(Path, 'lstat', return_value=foreign), \
+                self.assertRaisesRegex(e2e.E2EPathError, 'ownership/mode'):
+            e2e.safe_path(path, public_key=True)
+        # The generic validator remains private by default, including .pub files.
+        with self.assertRaises(e2e.E2EPathError):
+            e2e.safe_path(path)
+        link = path.with_name('hardlink.pub')
+        os.link(path, link)
+        with self.assertRaises(e2e.E2EPathError):
+            self.stand.delete()
+        link.unlink()
+        link.symlink_to(path)
+        with self.assertRaisesRegex(e2e.E2EPathError, 'Unsafe E2E path'):
+            self.stand.delete()
+        link.unlink()
+        directory_link = path.parent.with_name('portfolio-infra')
+        directory_link.symlink_to(path.parent, target_is_directory=True)
+        with self.assertRaisesRegex(e2e.E2EPathError, 'Unsafe E2E path'):
+            self.stand.delete()
+        self.assertFalse(self.mutations())
+        e2e.confirm.assert_not_called()
+
+    def test_path_diagnostics_escape_terminal_controls(self):
+        path = self.fixture_key('home/.ssh/human/bad\n\x1b[31m.pub', 0o666)
+        with self.assertRaises(e2e.E2EPathError) as raised:
+            self.stand.deletion_paths()
+        reason = e2e.error_reason(raised.exception)
+        self.assertIn(json.dumps(str(path)), reason)
+        self.assertNotIn('\n', reason)
+        self.assertNotIn('\x1b', reason)
+
     def test_protected_storage_removal_uses_confirmed_sudo_with_state_retained(self):
         def remove(argv, **kwargs):
             self.assertEqual(argv, ['sudo', '--', 'rmdir', '--', str(self.stand.storage)])

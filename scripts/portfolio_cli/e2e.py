@@ -207,16 +207,27 @@ def disposable_password():
         return password
 
 
-def safe_path(path, *, directory=False, private=True, group_write_gid=None):
-    require(path.is_absolute() and path.resolve() == path and
-            not any(p.is_symlink() for p in (path, *path.parents)), 'Unsafe E2E path.')
+class E2EPathError(E2EError):
+    """Keep the static reason separate from the terminal-escaped diagnostic path."""
+
+    def __init__(self, reason, path):
+        super().__init__(reason)
+        self.path = str(path)
+
+
+def safe_path(path, *, directory=False, private=True, group_write_gid=None, public_key=False):
+    if not (path.is_absolute() and path.resolve() == path and
+            not any(p.is_symlink() for p in (path, *path.parents))):
+        raise E2EPathError('Unsafe E2E path.', path)
     info = path.lstat()
     group_write = (group_write_gid is not None and not directory and not private
                    and info.st_gid == group_write_gid and stat.S_IMODE(info.st_mode) == 0o660)
-    require((stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+    public_read = (public_key and not directory and private
+                   and stat.S_IMODE(info.st_mode) in (0o400, 0o440, 0o444, 0o600, 0o640, 0o644))
+    if not ((stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
             and info.st_uid == os.getuid() and (directory or info.st_nlink == 1)
-            and info.st_mode & (0o077 if private else 0o002 if group_write else 0o022) == 0,
-            'Unsafe E2E ownership/mode.')
+            and (public_read or info.st_mode & (0o077 if private else 0o002 if group_write else 0o022) == 0)):
+        raise E2EPathError('Unsafe E2E ownership/mode.', path)
 
 
 def write_new(path, content, mode=0o600):
@@ -801,6 +812,7 @@ class Stand:
 
     def deletion_paths(self):
         files, directories = [], []
+        key_directories = {self.root / 'home/.ssh' / name for name in ('controller', 'human', 'portfolio-infra')}
         for root in (self.root, self.storage):
             safe_path(root, directory=True, private=root == self.root)
             directories.append(root)
@@ -814,7 +826,8 @@ class Stand:
                     if root == self.storage and path == self.disk:
                         self.disk_file()
                     else:
-                        safe_path(path, private=root == self.root)
+                        safe_path(path, private=root == self.root,
+                                  public_key=root == self.root and path.parent in key_directories and path.suffix == '.pub')
                     if root == self.storage:
                         require(path in (self.disk, self.seed), 'Unrecognized storage file; no deletion allowed.')
                     files.append(path)
@@ -1058,7 +1071,9 @@ def main():
 
 
 def error_reason(error):
-    """Expose only static reasons and OS categories, never exception payloads."""
+    """Expose static reasons, OS categories and escaped paths, never file/command contents."""
+    if isinstance(error, E2EPathError):
+        return str(error) + ' Path: ' + json.dumps(error.path, ensure_ascii=True) + '.'
     if isinstance(error, E2EError):
         return str(error)
     if isinstance(error, subprocess.TimeoutExpired):

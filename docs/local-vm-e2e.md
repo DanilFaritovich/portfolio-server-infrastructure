@@ -469,6 +469,16 @@ and state are retained until storage removal succeeds; no parent permissions
 are changed and no extra shell command is required.
 If deletion fails halfway, inspect actual resources; do not retry blindly.
 
+Deletion accepts standard `ssh-keygen` public-key permissions (`0644`, plus safe
+read-only/group-readable modes) only for regular `.pub` files directly inside the
+fixture's `home/.ssh/controller`, `home/.ssh/human` and `home/.ssh/portfolio-infra`
+directories. These files must still belong to the controller, have exactly one
+hard link and no symlink components; group/other writes remain forbidden.
+Private keys, `known_hosts`, directories and all other fixture files retain their
+existing private permission checks. No permissions are repaired automatically.
+Unsafe-path and ownership/mode errors identify the failing path as an escaped JSON
+string, without printing file contents. Inspect that path before retrying deletion.
+
 A failed prepare retains phase `preparing`. Another prepare refuses to resume,
 recreate or overwrite it. Use status/console to diagnose, then explicitly delete
 only after ownership validation. Lost/invalid state, unknown resources or drift

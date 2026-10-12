@@ -1642,6 +1642,13 @@ defaults under the isolated fixture HOME; omitted sudo policy is `none`.
 forwarded. Recovery must remain a separate managed administrator with disjoint
 authorized keys and fresh key-only SSH/sudo proof. Failure stops without retries.
 
+`e2e-delete` accepts standard `0644` public `.pub` files directly in the fixture's
+`home/.ssh/controller`, `home/.ssh/human` and `home/.ssh/portfolio-infra` directories.
+Controller ownership, single hard links, no symlinks and no group/other writes are
+still required. Private keys and all other fixture files retain strict checks.
+Permission/path failures report the escaped problematic path, without file contents;
+see [deletion and recovery](docs/local-vm-e2e.md#reset-deletion-and-incomplete-preparation).
+
 `make e2e-list-distros` lists the local image registry. For a new fixture select
 `make e2e-prepare E2E_DISTRO=ubuntu-22.04`. Host checks use Linux x86_64/KVM/libvirt
 capabilities without a Ubuntu version allowlist. Compatible Ubuntu/Debian apt environments offer missing-package
