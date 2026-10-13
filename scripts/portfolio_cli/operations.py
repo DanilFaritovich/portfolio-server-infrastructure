@@ -96,3 +96,4 @@ def operations(mode, inventory, key=None):
         'server_operations_confirmed': True,
     }, 'setup-operations.yml')
     operations_probe(host, port, interpreter, key, 'portfolio_operations_info.py', {'verify': True}, managed_user)
+    return 'verify-operations'

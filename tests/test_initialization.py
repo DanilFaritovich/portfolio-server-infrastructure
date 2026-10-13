@@ -40,12 +40,17 @@ class InitializationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(init.tempfile, 'NamedTemporaryFile',
                                              side_effect=lambda **kw: factory(dir=self.temp.name, **kw)))
         self.real_init_stage = init.init_stage
-        self.stage = Mock()
+        self.stage = Mock(side_effect=self.verified_result)
         def dispatch(mode, *args):
             if mode in plans.PLAN_ACTIONS:
                 plans.stage_consent(mode, *args)
             return self.stage(mode, *args)
         self.stack.enter_context(patch.object(init, 'init_stage', side_effect=dispatch))
+
+    @staticmethod
+    def verified_result(mode, *_):
+        return {apply: verify for _, apply, verify in init.INIT_STAGES
+                if apply != 'add-user'}.get(mode)
 
     def run_init(self):
         init.init_server(Path('/synthetic-inventory'), Path('/synthetic-key'))
@@ -61,9 +66,8 @@ class InitializationTests(unittest.TestCase):
 
     def test_full_pipeline_orders_mutations_inspection_and_verifiers(self):
         self.run_init()
-        self.assertEqual(self.calls(), ['bootstrap-user', 'verify-access', 'docker-host', 'verify-docker',
-                                       'inspect-hardening', 'harden', 'verify-hardening', 'add-user', 'verify-user',
-                                       'secure-ssh', 'verify-ssh-security', 'setup-operations', 'verify-operations'])
+        self.assertEqual(self.calls(), ['bootstrap-user', 'docker-host', 'inspect-hardening', 'harden',
+                                       'add-user', 'verify-user', 'secure-ssh', 'setup-operations'])
         self.assertEqual(self.events()[-1]['status'], 'completed')
         self.assertIn('Applications remain separate', self.output.getvalue())
 
@@ -71,15 +75,20 @@ class InitializationTests(unittest.TestCase):
         seconds = [0]
         def execute(mode, *_):
             seconds[0] += 2 if mode.startswith('verify-') else (0 if mode == 'inspect-hardening' else 3)
+            return self.verified_result(mode)
         self.stage.side_effect = execute
         with patch.object(init.time, 'monotonic', side_effect=lambda: seconds[0]):
             self.run_init()
         events = self.events()
         for stage, *_ in init.INIT_STAGES:
             rows = [row for row in events if row['stage'] == stage]
-            self.assertEqual([row['status'] for row in rows], ['applying', 'verifying', 'completed'])
-            self.assertEqual([row['elapsed_seconds'] for row in rows], [0, 3, 5])
-        self.assertEqual(events[-1]['elapsed_seconds'], 30)
+            if stage == 'human':
+                self.assertEqual([row['status'] for row in rows], ['applying', 'verifying', 'completed'])
+                self.assertEqual([row['elapsed_seconds'] for row in rows], [0, 3, 5])
+            else:
+                self.assertEqual([row['status'] for row in rows], ['applying', 'completed'])
+                self.assertEqual([row['elapsed_seconds'] for row in rows], [0, 3])
+        self.assertEqual(events[-1]['elapsed_seconds'], 20)
 
     def test_verification_failure_records_phase_and_elapsed_time_without_error_text(self):
         seconds = [0]
@@ -168,8 +177,50 @@ class InitializationTests(unittest.TestCase):
                         if stage == 'hardening':
                             expected.append('inspect-hardening')
                         expected.append(apply)
-                    expected.append(verify)
+                    if index < boundary or apply == 'add-user':
+                        expected.append(verify)
                 self.assertEqual(self.calls(), expected)
+
+    def test_unverified_noop_paths_keep_explicit_verifiers(self):
+        self.stage.side_effect = lambda mode, *_: (None if mode in ('secure-ssh', 'setup-operations')
+                                                 else self.verified_result(mode))
+        self.run_init()
+        self.assertEqual(self.calls()[-4:], ['secure-ssh', 'verify-ssh-security',
+                                            'setup-operations', 'verify-operations'])
+
+    def test_noop_verifier_failure_stops_later_stages(self):
+        for failed in ('verify-ssh-security', 'verify-operations'):
+            with self.subTest(failed=failed):
+                self.stage.reset_mock()
+                def execute(mode, *_):
+                    if mode == failed:
+                        raise ValueError('pending state')
+                    if mode in ('secure-ssh', 'setup-operations'):
+                        return None
+                    return self.verified_result(mode)
+                self.stage.side_effect = execute
+                with self.assertRaises(ValueError):
+                    self.run_init()
+                self.assertEqual(self.calls()[-1], failed)
+                if failed == 'verify-ssh-security':
+                    self.assertNotIn('setup-operations', self.calls())
+
+    def test_wrong_verifier_result_cannot_skip_boundary(self):
+        self.stage.side_effect = lambda *_: 'verify-access'
+        self.run_init()
+        self.assertIn('verify-docker', self.calls())
+        self.assertIn('verify-hardening', self.calls())
+        self.assertIn('verify-user', self.calls())
+        self.assertIn('verify-ssh-security', self.calls())
+        self.assertIn('verify-operations', self.calls())
+
+    def test_dispatch_returns_wrapper_postflight_result(self):
+        for mode, handler, proof in [('docker-host', 'live', 'verify-docker'),
+                                     ('secure-ssh', 'human_access', 'verify-ssh-security'),
+                                     ('setup-operations', 'operations', 'verify-operations')]:
+            with self.subTest(mode=mode), patch.object(init, handler, return_value=proof), \
+                    patch.object(init, 'init_stage', self.real_init_stage):
+                self.assertEqual(init.init_stage(mode, Path('/fixture'), None), proof)
 
     def test_repeated_verification_uses_fresh_server_checks_without_mutation(self):
         with patch.dict(os.environ, INIT_FROM='verify'):
@@ -178,9 +229,8 @@ class InitializationTests(unittest.TestCase):
         self.assertEqual(self.calls(), [row[2] for row in init.INIT_STAGES] * 2)
 
     def test_each_failure_or_interruption_stops_all_later_calls(self):
-        modes = ['bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'inspect-hardening',
-                 'harden', 'verify-hardening', 'add-user', 'verify-user', 'secure-ssh',
-                 'verify-ssh-security', 'setup-operations', 'verify-operations']
+        modes = ['bootstrap-user', 'docker-host', 'inspect-hardening', 'harden',
+                 'add-user', 'verify-user', 'secure-ssh', 'setup-operations']
         for failure in (ValueError, KeyboardInterrupt):
             for position, mode in enumerate(modes):
                 with self.subTest(failure=failure, mode=mode):
@@ -188,6 +238,7 @@ class InitializationTests(unittest.TestCase):
                     def execute(selected, *_):
                         if selected == mode:
                             raise failure('secret stderr inventory password')
+                        return self.verified_result(selected)
                     self.stage.side_effect = execute
                     with self.assertRaises(failure):
                         self.run_init()
@@ -250,7 +301,7 @@ class InitializationTests(unittest.TestCase):
         with patch.dict(os.environ, INIT_FROM=''):
             self.answer.side_effect = ['operations', 'yes']
             self.run_init()
-        self.assertEqual(self.calls()[-2:], ['setup-operations', 'verify-operations'])
+        self.assertEqual(self.calls()[-1:], ['setup-operations'])
         with patch.object(init, 'human_access', side_effect=ValueError('recovery declined')) as human:
             with self.assertRaises(ValueError):
                 with patch.object(init, 'init_stage', self.real_init_stage):

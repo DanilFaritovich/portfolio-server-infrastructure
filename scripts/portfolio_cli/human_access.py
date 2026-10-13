@@ -178,3 +178,5 @@ def human_access_stage(mode, inventory, automation_key=None, supplied_public=Non
             for login in (managed_user, name):
                 verify_auth_methods(host, target, login, identity)
     print('Requested human access stage completed. STOP.')
+    if mode == 'secure-ssh':
+        return 'verify-ssh-security'

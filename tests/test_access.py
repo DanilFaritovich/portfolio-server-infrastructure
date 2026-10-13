@@ -129,7 +129,7 @@ class AccessTests(unittest.TestCase):
         with patch.object(access, 'prerequisites'), patch.object(access, 'known_host'), \
                 patch.object(access, 'prepare_key'), patch.object(access.sys.stdin, 'isatty', return_value=True), \
                 patch.object(access, 'run_playbook') as run:
-            access.live('bootstrap-user', self.inventory, self.key)
+            self.assertEqual(access.live('bootstrap-user', self.inventory, self.key), 'verify-access')
             initial, verify = run.call_args_list
             self.assertEqual(initial.args[2]['ansible_user'], 'root')
             self.assertEqual(initial.args[2]['ansible_connection'], access.PASSWORD_CONNECTION)

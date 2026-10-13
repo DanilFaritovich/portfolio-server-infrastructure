@@ -500,7 +500,8 @@ def inspect(module):''')
             with self.subTest(mode=mode), patch.object(access, 'prerequisites'), \
                     patch.object(access, 'known_host'), patch.object(access, 'run_playbook', side_effect=capture), \
                     patch('builtins.print'):
-                access.live(mode, self.inventory, self.key)
+                result = access.live(mode, self.inventory, self.key)
+            self.assertEqual(result, 'verify-hardening' if mode == 'harden' else None)
             self.assertTrue(all(values['ansible_port'] == 2222 for _, values in calls[-2:]))
             self.assertEqual([name for name, _ in calls], ['verify.yml'] +
                              (['harden.yml'] if mode == 'harden' else []) + ['verify.yml', 'verify-hardening.yml'])

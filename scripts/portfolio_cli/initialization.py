@@ -91,11 +91,11 @@ def init_stage(mode, inventory, key):
     """Call directly: the CLI owns the whole-run lock."""
     validate_current_plan()
     if mode in ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'):
-        human_access(mode, inventory, key)
+        return human_access(mode, inventory, key)
     elif mode in ('setup-operations', 'verify-operations'):
-        operations(mode, inventory, key)
+        return operations(mode, inventory, key)
     else:
-        live(mode, inventory, key)
+        return live(mode, inventory, key)
 
 
 def init_event(log, stage, status, started):
@@ -154,16 +154,21 @@ def init_execute(inventory, key, boundary):
                       ('verify before skipping' if checking else 'apply and verify'), flush=True)
                 action = verify if checking else apply
                 init_event(log, stage, 'verifying' if checking else 'applying', event_started)
+                verified = None
                 if not checking:
                     if stage == 'hardening':
                         action = 'inspect-hardening'
                         init_stage('inspect-hardening', inventory, key)
                     action = apply
-                    init_stage(apply, inventory, key)
+                    verified = init_stage(apply, inventory, key)
+                # Only a successful wrapper's exact verifier result covers this
+                # boundary. No-op/public-only paths return no proof. Earlier
+                # stages and separate invocations always verify afresh.
+                if checking or verified != verify:
                     action = verify
-                    init_event(log, stage, 'verifying', event_started)
-                # Public-only add-user intentionally returns unverified.
-                init_stage(verify, inventory, key)
+                    if not checking:
+                        init_event(log, stage, 'verifying', event_started)
+                    init_stage(verify, inventory, key)
                 init_event(log, stage, 'verified_skip' if checking else 'completed', event_started)
                 completed.append(stage)
             current = 'run'
