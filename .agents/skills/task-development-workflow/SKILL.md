@@ -1,6 +1,6 @@
 ---
 name: task-development-workflow
-description: Core workflow for implementing one software development task with Codex, from scoped context and implementation through validation, documentation, commit, Pull Request, and CI. Load references only when their topic applies.
+description: Core development workflow with task branches created strictly from develop, local-only commits, opt-in documentation, and automatic ARCHITECTURE.md maintenance for material architecture changes.
 ---
 
 # Task Development Workflow
@@ -18,31 +18,28 @@ Use this core workflow for normal feature, fix, refactor, chore, and documentati
 - use an available optional execution worker for bounded high-output or mechanical loops
   when delegation clearly reduces primary-model context;
 - avoid repeated reads/checks;
-- leave final merge to the developer.
+- leave remote publication, Pull Requests, and merge to the developer unless explicitly requested.
 
 ## Core workflow
 
 ```text
 inspect branch/worktree
--> determine scope
--> read only relevant project context
+-> resolve develop (create from main if missing) -> task branch FROM develop, or continue current task branch
+-> determine scope and read relevant context
 -> implement complete change
 -> make fix / component fix
 -> targeted validation
 -> make check once
 -> optional make verify
+-> requested documentation; update existing ARCHITECTURE.md if architecture materially changes
 -> final review
--> update required docs
--> commit
--> push task branch
--> Pull Request
--> GitHub CI
--> developer review/merge
+-> local commit
+-> STOP (push/PR/merge only on explicit request)
 ```
 
 ## Explicit task stop points
 
-The core workflow is a default end-to-end path, not permission to ignore a narrower user-requested boundary.
+The default delivery boundary is a local commit, not remote publication. Explicit user instructions can request an earlier stop or separately authorize a push/PR.
 
 If the caller explicitly requests a staged workflow such as:
 
@@ -56,7 +53,7 @@ stop at the requested stage. In particular:
 
 - do not run validation commands when the caller reserved validation for manual execution;
 - do not contact external/live systems merely because later validation would normally do so;
-- do not stage, commit, push, open a Pull Request, or wait on CI when delivery was deferred;
+- do not stage or commit if the caller reserved those steps; do not push, open a Pull Request, or wait on CI without an explicit request;
 - still prepare the code/configuration/documented commands required for the developer's next manual step;
 - report later workflow stages as pending rather than treating them as failed.
 
@@ -64,16 +61,18 @@ A later explicit request may resume from the verified working tree without resta
 
 ## Start safely
 
-Use the repository's configured development branch, normally `develop`.
+The **only base for new task branches is `develop`**. Never create a task branch directly from `main`, even when `main` is checked out. Do not treat `main` as a fallback development base.
 
 Before editing:
 
-1. check current branch and working tree;
-2. preserve unrelated staged/unstaged/untracked changes;
-3. create or continue a dedicated task branch;
-4. never reset/revert unrelated work.
+1. Check the current branch, local/remote `develop` availability, and staged, unstaged, and untracked changes.
+2. If already on a non-base task/development branch, **continue there**; do not automatically create another branch or rebase/switch it.
+3. If on `develop`, create a descriptive task branch from the current `develop` tip before editing.
+4. If on `main`: use an existing local `develop` (or materialize a local tracking `develop` from `origin/develop`, when only the remote exists); then create the task branch **from `develop`**. If no local or remote `develop` exists, create **local `develop` from `main` first**, then create the task branch from that new `develop`. Never push the newly created `develop` implicitly.
+5. Preserve all unrelated changes; if switching branches would overwrite work, stop and ask rather than forcing checkout, stashing, resetting, rebasing, or discarding it. Do not silently update or rewrite existing branches.
+6. On detached HEAD, ambiguous/unrelated branches, or unresolved base state, ask before modifying files.
 
-Do not perform normal task development directly in `develop` or `main`.
+Never perform normal task development directly on `develop` or `main`; task commits remain local unless remote delivery was explicitly requested.
 
 ## Load only relevant context
 
@@ -102,7 +101,7 @@ Before editing, identify:
 - affected components/files;
 - existing tests;
 - relevant project conventions;
-- documentation that may need a final update.
+- whether documentation was explicitly requested, or existing `ARCHITECTURE.md` must be updated because the task materially changes the architecture.
 
 Avoid unrelated refactoring.
 
@@ -129,9 +128,9 @@ Do not repeat a successful check unless later changes could affect it.
 
 ## Documentation
 
-Update documentation after implementation and necessary validation stabilize, not continuously while code is changing.
+Do **not** create, update, or refresh routine documentation without an explicit request (including a request to synchronize agent standards/instructions). **Exception:** if implementation materially changes architecture—module/component responsibilities, boundaries/dependencies, major data or control flows, persistence/integration contracts, or deployment topology—make a minimal accurate update to an **existing** `ARCHITECTURE.md` after implementation stabilizes, even without a separate documentation request. Small refactors, file moves without changed responsibilities, and implementation details alone do not trigger this exception. Do not auto-create `ARCHITECTURE.md`, rewrite unrelated sections, or use the exception to change README/`docs/`/`AGENTS.md`.
 
-Use the documentation skill for detailed documentation rules.
+Use the documentation skill for details.
 
 ## Final review
 
@@ -145,17 +144,17 @@ For detailed context/diff rules, read [references/context-efficiency.md](./refer
 
 When starting/continuing branches, committing, pushing, preparing PRs, or handling CI, read [references/git-delivery.md](./references/git-delivery.md).
 
-Normal destination:
+Normal local endpoint:
 
 ```text
-task branch -> develop
+task branch -> validated changes -> local commit -> STOP
 ```
 
-Codex must not merge the Pull Request unless the user explicitly requests that separate action.
+Stage only task-related files. **Do not push, create/update a Pull Request, or merge without a specific explicit user request.** An explicit request to create a PR also authorizes pushing its task branch, but not a merge. For requested remote delivery, target the configured development branch (normally `develop`).
 
 ## Completion criteria
 
-For a normal end-to-end task, completion means:
+For a normal task with local-only delivery, completion means:
 
 - requested scope is implemented;
 - required tests are updated;
@@ -163,11 +162,10 @@ For a normal end-to-end task, completion means:
 - the normal project check passes;
 - extended verification was used when justified;
 - final review is complete;
-- required documentation is current;
-- task changes are committed/pushed;
-- Pull Request is prepared;
-- CI is running or complete.
+- documentation was changed only when explicitly requested, except minimal updates to existing `ARCHITECTURE.md` for material architecture changes;
+- task changes are locally committed;
+- push/PR/merge were not performed without explicit user authorization.
 
-When the caller defined an earlier explicit stop point, completion is scoped to that boundary: complete the requested stages, preserve the working state for continuation, and clearly list the intentionally pending validation/delivery stages.
+When the caller defines an earlier or later explicit stop point, complete only those authorized stages and report remaining delivery as pending.
 
 Keep the final report concise; report results/status, not a chronological tool log.

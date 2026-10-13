@@ -139,7 +139,7 @@ When a lock file already exists:
 3. if the upstream commit equals the locked `source.ref`:
    - inspect only the target project's pending changes under `.agents/skills/` and `.codex-standards.lock.yaml`;
    - if there are no pending standards-sync changes, stop: standards are already current;
-   - if pending standards changes are consistent with an incomplete synchronization/delivery, do not refetch upstream and resume local validation, staging, commit, push, and PR/CI delivery as applicable;
+   - if pending standards changes are consistent with an incomplete synchronization/delivery, do not refetch upstream and resume local validation, staging, and commit; push/PR/CI delivery only when explicitly requested;
    - if the pending standards changes are unrelated or ambiguous, report the conflict instead of overwriting them;
 4. otherwise compare the locked upstream commit with the new upstream commit;
 5. inspect the changed-file list before fetching skill contents;
