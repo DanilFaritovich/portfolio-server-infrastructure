@@ -1540,12 +1540,14 @@ generated inventory and existing CLI. They never start, prepare or reset the VM.
 Mutations retain native TTY confirmations and independent recovery proofs; they
 receive no approval from `e2e-test`. Keep the VM console available.
 
-Prepare separate test-only key pairs first. These examples assume Alice's key and
-an additional public key exist at the paths shown, and `e2e_admin` is an independently
-verified administrator created by a successful scenario:
+### Exercise users and keys
+
+After a successful scenario, keep the guest running and the console available. Create two test-only keys on the controller; explicit paths remain under the isolated fixture HOME so deletion can validate them:
 
 ```bash
 stand_keys="$HOME/.local/share/portfolio-e2e/home/.ssh"
+make generate-user-key HUMAN_USER=alice HUMAN_KEY="$stand_keys/portfolio-infra/alice_ed25519"
+make generate-user-key HUMAN_USER=alice HUMAN_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519"
 make e2e-list-users
 make e2e-show-user HUMAN_USER=e2e_admin
 make e2e-list-user-keys HUMAN_USER=e2e_admin
@@ -1555,13 +1557,29 @@ make e2e-verify-user HUMAN_USER=alice HUMAN_SUDO=none \
   HUMAN_KEY="$stand_keys/portfolio-infra/alice_ed25519"
 make e2e-add-user-key HUMAN_USER=alice \
   HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519.pub"
+make e2e-verify-user HUMAN_USER=alice HUMAN_SUDO=none \
+  HUMAN_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519"
 make e2e-list-user-keys HUMAN_USER=alice
-# Copy the exact fingerprint from the listing; destructive commands require a TTY.
+```
+
+Load encrypted keys in the existing agent before verification. Copy the extra key's exact fingerprint from the listing into the revocation command; use the scenario administrator for independent recovery:
+
+```bash
 make e2e-revoke-user-key HUMAN_USER=alice KEY_FINGERPRINT='SHA256:REPLACE_FROM_LISTING' \
   RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+```
+
+A fresh `e2e-verify-user` with the extra key must now fail; the original key must still pass. Revocation does not terminate existing sessions. Stop after unexpected errors. Close Alice's sessions/processes before removal:
+
+```bash
 make e2e-remove-user HUMAN_USER=alice \
   RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+make e2e-list-users
+make e2e-status
+make e2e-delete
 ```
+
+User wrappers neither start nor reset the VM. Deletion requires default-deny consent, ownership/path revalidation and graceful stopped-state checks; it does not uninstall host packages or undo group membership. For reset, partial fixtures and diagnostic snapshots, follow [recovery instructions](local-vm-e2e.md#reset-deletion-and-incomplete-preparation).
 
 The explicit input allowlist is `HUMAN_USER`, `HUMAN_SUDO`, `HUMAN_GROUPS`,
 `HUMAN_GROUPS_APPROVED`, `HUMAN_SUDO_COMMANDS`, `HUMAN_KEY`, `HUMAN_PUBLIC_KEY`,

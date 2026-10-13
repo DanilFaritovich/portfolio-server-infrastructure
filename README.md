@@ -43,16 +43,19 @@ Controller/tool pins are defined in [requirements-dev.txt](requirements-dev.txt)
 The controller is your local computer; the managed host is the Ubuntu server. The CLI owns local keys, trust, confirmations and sequencing. Ansible roles apply server configuration; independent SSH and server inspectors verify it.
 
 ```mermaid
-flowchart TD
-    A[Local setup and inventory] --> B[Bootstrap automation access]
-    B --> C[Verify SSH and sudo]
-    C --> D[Docker host and runtime verification]
-    D --> E[SSH ports and UFW; verify hardening]
-    E --> F[Human administrator; verify access]
-    F --> G[Final key-only SSH policy; verify security]
-    G --> H[Confirmed system operations; verify policy]
-    H --> I[STOP: application deployment is separate]
+flowchart LR
+    subgraph Controller["Local controller"]
+        CLI["Make / Python CLI"] --> Ansible["Ansible: roles and playbooks"]
+        CLI --> Checks["Independent SSH/sudo checks and inspectors"]
+        Ansible --> SSH["SSH: OpenSSH / Paramiko"]
+        Checks --> SSH
+        Checks -. "result gates next stage" .-> CLI
+    end
+    SSH --> VPS["Managed Ubuntu VPS"]
+    VPS -. "effective state" .-> Checks
 ```
+
+**Initialization order:** local setup → automation access → Docker → SSH ports/UFW → human administrator → final SSH policy → confirmed system operations → STOP. Each stage must pass independent verification before the next; applications are deployed separately.
 
 | Boundary | Responsibility |
 | --- | --- |
@@ -144,13 +147,7 @@ make generate-user-key HUMAN_USER=portfolio_admin
 make show-public-key HUMAN_USER=portfolio_admin
 ```
 
-Generation preserves existing pairs and asks for a passphrase through OpenSSH. The default path is `~/.ssh/portfolio-infra/portfolio_admin_ed25519`. If using an encrypted key, ensure the invoking shell has an existing SSH agent and load it:
-
-```bash
-make load-user-key HUMAN_USER=portfolio_admin
-```
-
-If no agent is running, start one in your shell as described in the [key guide](docs/operator-guide.md#agent-loading-and-a-new-computer-with-one-encrypted-key). The CLI never starts one for you. The automation key is separate: bootstrap generates it if missing, without a passphrase, and never overwrites an existing pair. Both automation and `HUMAN_SUDO=admin` grant root-equivalent `NOPASSWD: ALL` access; protect the controller and keys accordingly.
+The default key path is `~/.ssh/portfolio-infra/portfolio_admin_ed25519`; existing pairs are preserved. For an encrypted key, run `make load-user-key HUMAN_USER=portfolio_admin` in a shell with an existing SSH agent. The CLI never starts an agent; see the [key guide](docs/operator-guide.md#agent-loading-and-a-new-computer-with-one-encrypted-key). Bootstrap creates the separate automation key without a passphrase. Automation and `HUMAN_SUDO=admin` grant root-equivalent `NOPASSWD: ALL`; protect the controller and keys.
 
 ### 4. Initialize the server
 
@@ -187,17 +184,13 @@ These are actual [Makefile](Makefile) targets. Server commands use `INVENTORY=in
 | Command | Purpose / effect |
 | --- | --- |
 | `make setup` | Install local tooling and create missing inventory; registry access |
-| `make deps` / `make deps-ci` | Install the same dependencies without inventory; interactive / explicit noninteractive CI mode |
-| `make generate-user-key HUMAN_USER=NAME` | Generate a non-overwriting human key; optional loading into an existing agent |
-| `make load-user-key HUMAN_USER=NAME` | Load the selected existing key into the local agent |
-| `make show-public-key HUMAN_USER=NAME` / `make copy-public-key HUMAN_USER=NAME` | Display public key/fingerprint or copy public material; clipboard copying may offer package installation |
+| `make deps` / `make deps-ci` | Dependencies only: interactive / explicit noninteractive CI mode |
+| `make generate-user-key HUMAN_USER=NAME` / `make load-user-key HUMAN_USER=NAME` | Generate a non-overwriting key / load it into an existing agent |
+| `make show-public-key HUMAN_USER=NAME` / `make copy-public-key HUMAN_USER=NAME` | Display / copy public key material only |
 | `make show-controller` | Validate local key/trust and display inventory access |
-| `make show-server-trust` / `make copy-server-trust` | Export existing verified host-trust JSON to terminal/clipboard; clipboard installation may be offered |
-| `make trust-server` | Confirm local host-trust import; may separately offer a LIVE host-only proof on another port |
-| `make check` / `make ci` | Aggregate offline checks, using example inventory and synthetic fixtures |
-| `make lint-yaml` / `make lint-ansible` | YAML lint / offline Ansible lint |
-| `make syntax-check` / `make lint-workflows` | Ansible syntax / GitHub Actions validation |
-| `make test-access` | Offline Python test suite, including mocked E2E lifecycle |
+| `make check` / `make ci` | Aggregate offline checks with example inventory and synthetic fixtures |
+
+See the operator guide for [keys and interactive SSH](docs/operator-guide.md#local-keys-and-interactive-ssh), [trust export/import](docs/operator-guide.md#transfer-server-trust-to-a-second-computer) and [individual checks](docs/operator-guide.md#commands-and-boundaries). Trust import requires confirmation; an optional LIVE proof on another port is separately confirmed. Clipboard operations may offer local package installation.
 
 ### Server initialization and maintenance — LIVE
 
@@ -220,30 +213,16 @@ These are actual [Makefile](Makefile) targets. Server commands use `INVENTORY=in
 
 | Command | Purpose / effect |
 | --- | --- |
-| `make list-users` | Read recorded human users and protected controller state |
-| `make show-user HUMAN_USER=NAME` | Read identity, groups, sudo and key state |
-| `make list-user-keys HUMAN_USER=NAME` | Read key fingerprints and managed ownership |
+| `make list-users` / `make show-user HUMAN_USER=NAME` / `make list-user-keys HUMAN_USER=NAME` | Inspect recorded users, rights and keys |
 | `make add-user-key HUMAN_USER=NAME HUMAN_PUBLIC_KEY=/path/key.pub` | Add one explicit public key, preserving other entries |
-| `make revoke-user-key HUMAN_USER=NAME KEY_FINGERPRINT=SHA256:...` | Revoke one exact managed key; separate recovery proof required |
-| `make remove-user HUMAN_USER=NAME` | Revoke credentials/sudo and remove the account, retaining files; separate recovery proof required |
+| `make revoke-user-key HUMAN_USER=NAME KEY_FINGERPRINT=SHA256:...` | Revoke one managed key; separate recovery proof |
+| `make remove-user HUMAN_USER=NAME` | Revoke credentials/sudo and remove the account, retaining files; separate recovery proof |
 
-`add-user` requires `HUMAN_USER` and an explicit public file via `HUMAN_PUBLIC_KEY`, or pasted public input in a terminal. `HUMAN_SUDO=none|admin|restricted` selects rights; restricted policy requires `HUMAN_SUDO_COMMANDS`. Existing users accept additive keys, not privilege/group migration. Non-sudo supplementary groups require a rights review and exact `HUMAN_GROUPS_APPROVED` acceptance.
-
-For destructive operations supply `RECOVERY_USER` and `RECOVERY_KEY` for a different, independently proven human administrator with disjoint keys. Root/current controller and unmanaged accounts/keys are protected. Removal is non-forced, retains home/mail/files and records a receipt that blocks recreation. See [user lifecycle and recovery](docs/operator-guide.md#user-and-ssh-key-management-stage-6-task-3).
+`add-user` requires an explicit public file or pasted input in a terminal. Destructive operations require `RECOVERY_USER`/`RECOVERY_KEY` for a different independently proven administrator with disjoint keys; root, the current controller and unmanaged state are protected. See the [user guide](docs/operator-guide.md#user-and-ssh-key-management-stage-6-task-3) for sudo/group policies, additive keys without privilege migration and removal restrictions.
 
 ### Local VM lifecycle — real local operations
 
-| Command | Purpose / effect |
-| --- | --- |
-| `make e2e-list-distros` | LOCAL registry listing only |
-| `make e2e-prepare` | Confirm host preparation and create a dedicated guest, NAT and stopped baseline |
-| `make e2e-status` | Query fixture ownership/readiness without starting it |
-| `make e2e-test E2E_FROM=bootstrap` | Initialize, verify, check repeat convergence and reboot persistence |
-| `make e2e-reset` | Confirm graceful stop and restore the owned baseline |
-| `make e2e-delete` | Confirm safe removal of owned fixture resources |
-| `make e2e-list-users` / `make e2e-show-user` / `make e2e-list-user-keys` | Guarded read-only user inspection in the running guest |
-| `make e2e-add-user` / `make e2e-verify-user` / `make e2e-add-user-key` | Guarded guest human access/key operations with the same `HUMAN_*` inputs |
-| `make e2e-revoke-user-key` / `make e2e-remove-user` | Guarded guest revocation/removal with separate recovery proof |
+`make e2e-list-distros` reads only the local registry. `make e2e-prepare`, `make e2e-status`, `make e2e-test`, `make e2e-reset` and `make e2e-delete` operate a real fixture outside CI. See the [short scenario below](#e2e-on-a-real-ubuntu-vm) and the [E2E guide](docs/local-vm-e2e.md) for preparation, stop and deletion requirements.
 
 ## Testing and recorded results
 
@@ -255,24 +234,21 @@ make check
 
 Checks run YAML/Ansible/workflow lint, Ansible syntax validation and offline Python tests with synthetic fixtures and mocked SSH, downloads and hypervisor commands. They use the example inventory, require no production credentials and do not contact a server or launch a VM. [GitHub Actions](.github/workflows/ci.yml) runs `make deps-ci` followed by `make ci` on Ubuntu 24.04.
 
-The following records the completed checks reported for [PR #11](https://github.com/DanilFaritovich/portfolio-server-infrastructure/pull/11) and the operator's subsequent confirmation supplied for this guide. The PR description confirms prepare/initialization and offline checks; it leaves the final repeat/reboot scenario pending. Those later results and user lifecycle/deletion are **operator-reported**, not new executions performed while editing this documentation. No test count or broader platform acceptance is inferred.
+Real E2E on an Ubuntu Server 24.04 LTS amd64 guest with an Ubuntu 26.04 controller was run manually by the operator: [PR #11](https://github.com/DanilFaritovich/portfolio-server-infrastructure/pull/11) supports preparation/initialization, and the operator's subsequent confirmation covers repeat execution, reboot, user management and deletion. These are existing recorded results, not new runs during documentation editing; see the [validation record](docs/validation.md) for detailed provenance and limits.
 
-| Check | Recorded result / environment |
+| Check | Recorded result |
 | --- | --- |
-| `make check` / CI: lint, Ansible syntax, Python tests | Passed; PR evidence and GitHub Actions on Ubuntu 24.04 |
-| E2E VM creation | Passed; Ubuntu Server 24.04 LTS guest; controller Ubuntu 26.04 according to the operator |
-| Full initialization | Passed: bootstrap, Docker, hardening, human access, SSH security, server operations |
-| Final verification, repeat execution and idempotency | Passed according to the operator; provisioning converged, smoke-test runtime changes remain expected |
-| Guest reboot and re-verification | Passed according to the operator |
-| User creation/SSH verification, key addition/revocation, user removal | Passed according to the operator |
-| Safe E2E fixture deletion | Passed according to the operator |
-| External production VPS | Outside the confirmed E2E run |
+| Offline / CI: lint, Ansible syntax, Python tests | Passed |
+| E2E: VM creation and full Stage 1–5 initialization | Passed |
+| E2E: final verification, repeat convergence and verification after reboot | Passed; smoke-test runtime changes remain expected |
+| E2E: user creation/verification, key addition/revocation, user and fixture deletion | Passed |
+| External production VPS, other platforms | Not established by this run |
 
-See the bilingual [validation record](docs/validation.md) for scope and evidence limits. Offline success alone does not prove live access, idempotency or provider recovery.
+Offline success does not prove live access, idempotency or provider recovery; a VM result does not establish acceptance on every allowed release or platform.
 
 ## E2E on a real Ubuntu VM
 
-This optional interactive route creates a real local KVM/libvirt guest with isolated inventory, HOME, keys and host trust. It is outside offline checks and CI. Read the [full E2E operator guide](docs/local-vm-e2e.md) before approving host changes or creating a VM. The registry includes Ubuntu Server 24.04 LTS (default) and 22.04 LTS; the recorded complete run is 24.04.
+This optional interactive route creates a real local KVM/libvirt guest with isolated inventory, HOME, keys and host trust. It is outside offline checks and CI. Read the [full E2E operator guide](docs/local-vm-e2e.md) before approving host changes or creating a VM. The registry includes Ubuntu Server 24.04 LTS (default) and 22.04 LTS.
 
 ### Prepare and run the full scenario
 
@@ -284,61 +260,35 @@ make e2e-status
 make e2e-test E2E_FROM=bootstrap
 ```
 
-Run each command only after the previous one succeeds. Preparation may need separately approved packages/groups/storage; ineffective new groups stop before VM creation and require a controller restart. Set a unique disposable root password. Use the printed console command to confirm cloud-init success, root console recovery and the guest host-key fingerprint as described in the [first-run procedure](docs/local-vm-e2e.md#prepare-and-first-run). Confirm graceful shutdown/baseline creation; readiness is bounded to 300 seconds and shutdown to 120 seconds. Partial preparation is retained for diagnosis.
+Run each command only after the previous one succeeds. Before creating a VM, read [first-run and console checks](docs/local-vm-e2e.md#prepare-and-first-run): package/group/storage changes require consent, and fingerprints/recovery access require verification. Readiness is bounded to 300 seconds and graceful shutdown to 120; errors retain the fixture for diagnosis without automatic reset.
 
-The scenario creates `e2e_admin` with an independent key, runs the existing initialization CLI, verifies all stages, repeats convergence from Docker with provisioning `changed=0`, reboots the guest and verifies a new boot ID and server state. Native trust/authentication prompts remain; compare fingerprints with the guest console. Errors preserve the VM for diagnosis and never trigger automatic reset.
+The scenario creates a separate `e2e_admin`, initializes and verifies the server, requires provisioning convergence with `changed=0` and checks state after reboot. See [scenario details](docs/local-vm-e2e.md#isolation-and-scenario-execution) and [reset/deletion/recovery](docs/local-vm-e2e.md#reset-deletion-and-incomplete-preparation).
 
 ### Exercise users and keys
 
-After a successful scenario, keep the guest running and the console available. Create two test-only keys on the controller; explicit paths remain under the isolated fixture HOME so deletion can validate them:
-
-```bash
-stand_keys="$HOME/.local/share/portfolio-e2e/home/.ssh"
-make generate-user-key HUMAN_USER=alice HUMAN_KEY="$stand_keys/portfolio-infra/alice_ed25519"
-make generate-user-key HUMAN_USER=alice HUMAN_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519"
-make e2e-list-users
-make e2e-show-user HUMAN_USER=e2e_admin
-make e2e-add-user HUMAN_USER=alice HUMAN_SUDO=none \
-  HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_ed25519.pub"
-make e2e-verify-user HUMAN_USER=alice HUMAN_SUDO=none \
-  HUMAN_KEY="$stand_keys/portfolio-infra/alice_ed25519"
-make e2e-add-user-key HUMAN_USER=alice \
-  HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519.pub"
-make e2e-verify-user HUMAN_USER=alice HUMAN_SUDO=none \
-  HUMAN_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519"
-make e2e-list-user-keys HUMAN_USER=alice
-```
-
-Load encrypted keys in the existing agent before verification. Copy the extra key's exact fingerprint from the listing into the revocation command; use the scenario administrator for independent recovery:
-
-```bash
-make e2e-revoke-user-key HUMAN_USER=alice KEY_FINGERPRINT='SHA256:REPLACE_FROM_LISTING' \
-  RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
-```
-
-A fresh `e2e-verify-user` with the extra key must now fail; the original key must still pass. Revocation does not terminate existing sessions. Stop after unexpected errors. Close Alice's sessions/processes before removal:
-
-```bash
-make e2e-remove-user HUMAN_USER=alice \
-  RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
-make e2e-list-users
-make e2e-status
-make e2e-delete
-```
-
-User wrappers neither start nor reset the VM. Deletion requires default-deny consent, ownership/path revalidation and graceful stopped-state checks; it does not uninstall host packages or undo group membership. For reset, partial fixtures and diagnostic snapshots, follow [recovery instructions](docs/local-vm-e2e.md#reset-deletion-and-incomplete-preparation).
+In the running guest, follow the [operator guide](docs/operator-guide.md#exercise-users-and-keys) to create a user, verify both keys, revoke the extra key and remove the account. Keep console access and a separate recovery administrator. Wrappers neither start nor reset the VM; fixture deletion requires separate confirmation.
 
 ## Compatibility
 
 | Platform | Status / limits |
 | --- | --- |
-| Linux controller, glibc x86_64/arm64 | Implemented local toolchain path. Operator reports the full local run on Ubuntu 26.04; this does not establish acceptance on every Linux distribution or architecture |
-| Ubuntu Server | Docker allows 22.04/24.04/26.04 subject to all stage preflights. Confirmed complete E2E guest: Ubuntu Server 24.04 LTS amd64 |
+| Linux controller, glibc x86_64/arm64 | Implemented local toolchain path; recorded acceptance is limited to the environment in the results table |
+| Ubuntu Server | Docker allows 22.04/24.04/26.04 subject to all stage preflights; release allowlists are not E2E acceptance |
 | Windows through WSL2 | **Not tested.** Requires the Linux prerequisites; agent, paths, clipboard and networking need independent checks. No KVM/libvirt E2E acceptance is claimed |
 | Native Windows / macOS controller | Full setup is unsupported by the Linux-only toolchain installer. A macOS clipboard backend does not imply full platform support |
 | Other server OS / custom host configurations | Outside the implemented Ubuntu pipeline; custom SSH/systemd/UFW/Docker policies may be refused by safety preflight |
 
 E2E host eligibility is based on Linux x86_64/KVM/libvirt capabilities rather than a host release allowlist. Automatic missing-package installation is restricted to reviewed Ubuntu/Debian APT environments; other systems require manual prerequisites. A registry entry or code allowlist does not prove a successful end-to-end run.
+
+### Windows through WSL2 — untested
+
+This is a preliminary route for running the Linux CLI, not an officially tested platform. It requires Windows with WSL2 support, enabled hardware virtualization and an Ubuntu Linux distribution with glibc on x86_64/arm64.
+
+1. Install WSL/Ubuntu with `wsl --install` in administrator PowerShell and restart Windows as described in [Microsoft's instructions](https://learn.microsoft.com/en-us/windows/wsl/install). Check version 2 with `wsl --list --verbose`.
+2. Open Ubuntu, create a normal Linux user and install Git, Make, curl, tar/gzip, coreutils and the OpenSSH client. Keep the repository and keys in Linux HOME, for example `~/work/`, to preserve Linux permissions.
+3. Run the clone commands and `make setup` from [Quick Start](#quick-start) inside WSL. System Python/uv are unnecessary. Before LIVE commands, check registry access, connectivity to the VPS SSH port, host trust and encrypted-key loading in that Linux shell's agent.
+
+Paths, agent, networking and clipboard behavior need independent checks. Local KVM/libvirt E2E on WSL2 is **not confirmed**; successful WSL installation does not establish VM-fixture suitability.
 
 ## Security, limitations and recovery
 

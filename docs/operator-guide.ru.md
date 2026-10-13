@@ -1567,12 +1567,14 @@ Guarded CLI-команды управления пользователями и�
 и независимые recovery-проверки; согласие от `e2e-test` им не передаётся.
 Сохраняйте доступ к консоли VM.
 
-Заранее подготовьте отдельные тестовые пары ключей. Примеры предполагают, что ключ
-Alice и дополнительный публичный ключ существуют по указанным путям, а `e2e_admin`
-создан успешным сценарием и его административный доступ независимо проверен:
+### Проверьте пользователей и ключи
+
+После успешного сценария оставьте гостя работающим и сохраните доступ к консоли. Создайте два тестовых ключа на контроллере; явные пути остаются внутри изолированного HOME стенда, чтобы удаление могло их проверить:
 
 ```bash
 stand_keys="$HOME/.local/share/portfolio-e2e/home/.ssh"
+make generate-user-key HUMAN_USER=alice HUMAN_KEY="$stand_keys/portfolio-infra/alice_ed25519"
+make generate-user-key HUMAN_USER=alice HUMAN_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519"
 make e2e-list-users
 make e2e-show-user HUMAN_USER=e2e_admin
 make e2e-list-user-keys HUMAN_USER=e2e_admin
@@ -1582,13 +1584,29 @@ make e2e-verify-user HUMAN_USER=alice HUMAN_SUDO=none \
   HUMAN_KEY="$stand_keys/portfolio-infra/alice_ed25519"
 make e2e-add-user-key HUMAN_USER=alice \
   HUMAN_PUBLIC_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519.pub"
+make e2e-verify-user HUMAN_USER=alice HUMAN_SUDO=none \
+  HUMAN_KEY="$stand_keys/portfolio-infra/alice_extra_ed25519"
 make e2e-list-user-keys HUMAN_USER=alice
-# Подставьте точный fingerprint из списка; разрушительные команды требуют TTY.
+```
+
+Перед проверкой загрузите зашифрованные ключи в существующий agent. Скопируйте точный fingerprint дополнительного ключа из списка в команду отзыва; для независимого восстановления используйте администратора сценария:
+
+```bash
 make e2e-revoke-user-key HUMAN_USER=alice KEY_FINGERPRINT='SHA256:REPLACE_FROM_LISTING' \
   RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+```
+
+Свежая `e2e-verify-user` с дополнительным ключом теперь должна завершиться отказом, а с исходным — успешно. Отзыв не завершает существующие сессии. При неожиданных ошибках остановитесь. Перед удалением закройте сессии и процессы Alice:
+
+```bash
 make e2e-remove-user HUMAN_USER=alice \
   RECOVERY_USER=e2e_admin RECOVERY_KEY="$stand_keys/human/admin_ed25519"
+make e2e-list-users
+make e2e-status
+make e2e-delete
 ```
+
+Обёртки управления пользователями не запускают и не сбрасывают VM. Удаление требует подтверждения с отказом по умолчанию, повторной проверки принадлежности/путей и корректной остановки; оно не удаляет пакеты хоста и не отменяет членство в группах. Для сброса, незавершённых стендов и диагностических снимков следуйте [инструкциям восстановления](local-vm-e2e.md#reset-deletion-and-incomplete-preparation).
 
 Явный allowlist параметров: `HUMAN_USER`, `HUMAN_SUDO`, `HUMAN_GROUPS`,
 `HUMAN_GROUPS_APPROVED`, `HUMAN_SUDO_COMMANDS`, `HUMAN_KEY`, `HUMAN_PUBLIC_KEY`,
