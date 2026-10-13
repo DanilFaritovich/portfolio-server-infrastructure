@@ -13,6 +13,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 
 
 LOGIN_DEFS = Path('/etc/login.defs')
@@ -23,10 +24,44 @@ class Runner:
     def __init__(self, params):
         self.params = params
 
-    def run_command(self, argv, environ_update=None):
+    def run_command(self, argv, environ_update=None, timeout=30):
         result = subprocess.run(argv, capture_output=True, text=True, check=False,
-                                timeout=30, env=dict(os.environ, LC_ALL='C'))
+                                timeout=timeout, env=dict(os.environ, LC_ALL='C'))
         return result.returncode, result.stdout, result.stderr
+
+
+def wait_for_no_processes(uid):
+    # SSH exit does not imply UID quiescence: logind normally retains user@.service
+    # for UserStopDelaySec (default 10s) after logout. Wait without stopping anything.
+    deadline = time.monotonic() + 15
+    diagnostics = {}
+    while True:
+        statuses = []
+        # Separate probes implement OR: pgrep combines -U and -u with AND.
+        for selector in ('-U', '-u'):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                rc, output, _ = Runner({}).run_command(
+                    ['pgrep', selector, str(uid)], timeout=min(2, remaining))
+            except (OSError, subprocess.TimeoutExpired):
+                raise PreflightError(f'Process lookup failed for UID {uid}, {selector}; '
+                                     'STOP before credential revocation; inspect through recovery access.') from None
+            # Only fixed labels, numeric status and bounded numeric PID samples leave
+            # the engine. Never report stderr, command lines, names or environments.
+            pids = [line for line in output.splitlines() if re.fullmatch(r'[0-9]{1,10}', line)][:8]
+            diagnostics[selector] = {'exit_code': rc, 'pid_sample': pids}
+            require(rc in (0, 1), f'Process lookup failed for UID {uid}, {selector}, exit code {rc}; '
+                    'STOP before credential revocation; inspect through recovery access.')
+            statuses.append(rc)
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, f'Account still has active processes or quiescence was not proven within 15 seconds; '
+                f'UID {uid}; last pgrep probes: {json.dumps(diagnostics, sort_keys=True)}. '
+                'Credentials unchanged; inspect sessions/services through recovery access and stop processes manually.')
+        if statuses == [1, 1]:
+            return
+        time.sleep(min(1, remaining))
 
 
 def read_keys(name, uid):
@@ -266,11 +301,7 @@ def execute(params):
             content = ''.join(line for line in content.splitlines(keepends=True) if line.rstrip('\r\n') != key)
         else:
             require(all(entry['managed'] for entry in before['keys']), 'Unmanaged keys block account removal.')
-            # Separate probes implement OR: pgrep combines -U and -u with AND.
-            # procps pgrep(1): only status 1 means no matches; errors fail closed.
-            for selector in ('-U', '-u'):
-                rc, _, _ = Runner({}).run_command(['pgrep', selector, str(before['uid'])])
-                require(rc == 1, 'Account has active processes or process lookup failed; stop them manually.')
+            wait_for_no_processes(before['uid'])
             login_defs = LOGIN_DEFS
             safe(login_defs)
             require(not any(line.split('#', 1)[0].strip().startswith('USERDEL_CMD')

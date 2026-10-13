@@ -31,6 +31,21 @@ def key(seed):
     return 'ssh-ed25519 ' + base64.b64encode(blob).decode() + ' fixture-' + str(seed)
 
 
+class ProcessClock:
+    """Deterministic guest time; no real sleeps or remote process probes."""
+
+    def __init__(self):
+        self.now = 0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 class EngineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -275,10 +290,13 @@ class EngineTests(unittest.TestCase):
     def test_remove_retains_files_revokes_keys_sudo_and_is_idempotent(self):
         retained = self.home / 'operator/work.txt'
         retained.write_text('keep')
-        with patch.object(engine.Runner, 'run_command', side_effect=self.command) as commands:
+        clock = ProcessClock()
+        with patch.object(engine, 'time', clock), \
+                patch.object(engine.Runner, 'run_command', side_effect=self.command) as commands:
             result = engine.execute(self.params('remove-user'))
         probes = [call.args[0] for call in commands.call_args_list if call.args[0][0] == 'pgrep']
         self.assertEqual(probes, [['pgrep', '-U', str(os.getuid())], ['pgrep', '-u', str(os.getuid())]])
+        self.assertEqual(clock.sleeps, [])
         self.assertTrue(result['files_preserved'])
         self.assertEqual('keep', retained.read_text())
         self.assertEqual('', (self.home / 'operator/.ssh/authorized_keys').read_text())
@@ -293,13 +311,24 @@ class EngineTests(unittest.TestCase):
         for selector in ('-U', '-u'):
             for rc in (0, 2, 3, -9):
                 with self.subTest(selector=selector, rc=rc):
+                    clock = ProcessClock()
                     def probe(argv, **kwargs):
                         if argv[:2] == ['pgrep', selector]:
-                            return rc, '123' if rc == 0 else '', ''
+                            return rc, '123\n\x1b[31msecret-command\n' if rc == 0 else '', 'secret-error'
                         return self.command(argv, **kwargs)
-                    with patch.object(engine.Runner, 'run_command', side_effect=probe):
-                        with self.assertRaisesRegex(engine.PreflightError, 'active processes or process lookup failed'):
+                    with patch.object(engine, 'time', clock), \
+                            patch.object(engine.Runner, 'run_command', side_effect=probe):
+                        with self.assertRaisesRegex(engine.PreflightError, 'active processes|Process lookup failed') as raised:
                             engine.execute(self.params('remove-user'))
+                    self.assertNotIn('secret', str(raised.exception))
+                    self.assertNotIn('\x1b', str(raised.exception))
+                    if rc == 0:
+                        self.assertEqual(clock.now, 15)
+                        self.assertIn('"pid_sample": ["123"]', str(raised.exception))
+                        self.assertIn('exit_code', str(raised.exception))
+                    else:
+                        self.assertEqual(clock.sleeps, [])
+                        self.assertIn(f'exit code {rc}', str(raised.exception))
                     self.assertEqual(original, [path.read_bytes() for path in paths])
                     self.assertFalse(self.deleted)
                     self.assertFalse((self.state / 'operator.removed').exists())
@@ -316,10 +345,94 @@ class EngineTests(unittest.TestCase):
                     return self.command(argv, **kwargs)
                 with self.subTest(selector=selector, error=type(error).__name__), \
                         patch.object(engine.Runner, 'run_command', side_effect=probe):
-                    with self.assertRaises(type(error)):
+                    with self.assertRaisesRegex(engine.PreflightError, 'Process lookup failed'):
                         engine.execute(self.params('remove-user'))
                 self.assertEqual(original, [path.read_bytes() for path in paths])
                 self.assertFalse(self.deleted)
+
+    def test_transient_processes_wait_for_both_uids_before_revocation(self):
+        # Model the documented 10-second user-manager lifetime after SSH logout.
+        # Effective-UID processes remain for one extra poll after real-UID processes.
+        clock = ProcessClock()
+        paths = [self.home / 'operator/.ssh/authorized_keys', self.state / 'operator.keys.json',
+                 self.sudo / 'portfolio-human-operator', self.state / 'operator.json']
+        original = [path.read_bytes() for path in paths]
+        probes = []
+        def probe(argv, **kwargs):
+            if argv[0] == 'pgrep':
+                self.assertEqual(original, [path.read_bytes() for path in paths])
+                probes.append(argv[1])
+                self.assertGreater(kwargs['timeout'], 0)
+                self.assertLessEqual(kwargs['timeout'], min(2, 15 - clock.now))
+                active = clock.now < (10 if argv[1] == '-U' else 11)
+                return (0, '123\n', '') if active else (1, '', '')
+            return self.command(argv, **kwargs)
+        with patch.object(engine, 'time', clock), patch.object(engine.Runner, 'run_command', side_effect=probe):
+            self.assertTrue(engine.execute(self.params('remove-user'))['changed'])
+        self.assertEqual(clock.now, 11)
+        self.assertEqual(clock.sleeps, [1] * 11)
+        self.assertEqual(probes, ['-U', '-u'] * 12)
+        self.assertTrue(self.deleted)
+
+    def test_process_lookup_error_after_match_stops_without_more_waiting(self):
+        clock = ProcessClock()
+        original = (self.home / 'operator/.ssh/authorized_keys').read_bytes()
+        def probe(argv, **kwargs):
+            if argv[0] == 'pgrep':
+                return (0, '123', '') if clock.now == 0 else (2, '', 'private error')
+            return self.command(argv, **kwargs)
+        with patch.object(engine, 'time', clock), patch.object(engine.Runner, 'run_command', side_effect=probe):
+            with self.assertRaisesRegex(engine.PreflightError, 'exit code 2'):
+                engine.execute(self.params('remove-user'))
+        self.assertEqual(clock.sleeps, [1])
+        self.assertEqual(original, (self.home / 'operator/.ssh/authorized_keys').read_bytes())
+        self.assertFalse(self.deleted)
+
+    def test_process_timeout_diagnostic_bounds_and_filters_pid_samples(self):
+        clock = ProcessClock()
+        output = '\x1b[31msecret\n' + '\n'.join(str(pid) for pid in range(100, 120))
+        with patch.object(engine, 'time', clock), \
+                patch.object(engine.Runner, 'run_command', return_value=(0, output, 'private stderr')):
+            with self.assertRaisesRegex(engine.PreflightError, 'within 15 seconds') as raised:
+                engine.wait_for_no_processes(1002)
+        message = str(raised.exception)
+        self.assertIn('UID 1002', message)
+        self.assertIn('"-U":', message)
+        self.assertIn('"-u":', message)
+        self.assertIn('"107"', message)
+        for forbidden in ('108', '119', 'secret', 'private stderr', '\x1b'):
+            self.assertNotIn(forbidden, message)
+        self.assertEqual(clock.now, 15)
+
+    def test_slow_process_probe_cannot_extend_deadline_or_authorize_removal(self):
+        clock = ProcessClock()
+        original = (self.home / 'operator/.ssh/authorized_keys').read_bytes()
+        def probe(argv, **kwargs):
+            if argv[0] == 'pgrep':
+                clock.now += kwargs['timeout']
+                return (1, '', '') if clock.now >= 15 else (0, '123', '')
+            return self.command(argv, **kwargs)
+        with patch.object(engine, 'time', clock), patch.object(engine.Runner, 'run_command', side_effect=probe):
+            with self.assertRaisesRegex(engine.PreflightError, 'within 15 seconds'):
+                engine.execute(self.params('remove-user'))
+        self.assertEqual(clock.now, 15)
+        self.assertEqual(original, (self.home / 'operator/.ssh/authorized_keys').read_bytes())
+        self.assertFalse(self.deleted)
+
+    def test_recovery_drift_during_process_wait_blocks_revocation(self):
+        clock = ProcessClock()
+        original = (self.home / 'operator/.ssh/authorized_keys').read_bytes()
+        def probe(argv, **kwargs):
+            if argv[0] == 'pgrep' and clock.now == 0:
+                (self.home / 'recovery/.ssh/authorized_keys').write_text(key(5) + '\n')
+                return 0, '123', ''
+            return self.command(argv, **kwargs)
+        with patch.object(engine, 'time', clock), patch.object(engine.Runner, 'run_command', side_effect=probe):
+            with self.assertRaisesRegex(engine.PreflightError, 'Recovery state changed'):
+                engine.execute(self.params('remove-user'))
+        self.assertEqual(clock.now, 1)
+        self.assertEqual(original, (self.home / 'operator/.ssh/authorized_keys').read_bytes())
+        self.assertFalse(self.deleted)
 
     def test_userdel_failure_reports_partial_revocation_without_receipt(self):
         params = self.params('remove-user')
