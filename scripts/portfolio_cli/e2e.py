@@ -118,7 +118,7 @@ def convergence_command(argv, env, pass_fds=()):
     """Stream interactive output; retain only numeric recap counts, never a log."""
     smoke = yaml.safe_load((ROOT / 'playbooks/verify-docker.yml').read_text())[0]['name']
     required = {yaml.safe_load((ROOT / 'playbooks' / name).read_text())[0]['name'] for name in
-                ('docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml')}
+                ('setup-swap.yml', 'docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml')}
     noops = {message: yaml.safe_load((ROOT / 'playbooks' / (mode + '.yml')).read_text())[0]['name']
              for mode, message in PLAN_NOOP_MESSAGES.items()}
     seen, failed, play = set(), False, None
@@ -458,11 +458,28 @@ class Stand:
             'ssh_verify_ports': [22], 'firewall_allowed_tcp_ports': [80, 443],
         }}}}}}
 
+    def swap_inventory(self, size):
+        require(type(size) is int and size in (0, 512, 1024), 'Invalid E2E swap profile.')
+        return self.root / ('inventory-swap-' + str(size) + '.yml')
+
+    def expected_swap_inventory(self, size):
+        data = self.expected_inventory()
+        data['all']['children']['bootstrap']['hosts']['e2e']['swap_size_mb'] = size
+        return data
+
+    def prepare_swap_inventories(self):
+        for size in (0, 512, 1024):
+            path = self.swap_inventory(size)
+            if not path.exists() and not path.is_symlink():
+                write_new(path, yaml.safe_dump(self.expected_swap_inventory(size)))
+            self.check_inventory(path)
+
     def check_inventory(self, path):
-        require(path == self.inventory, 'Production/foreign inventory is forbidden for E2E.')
+        profiles = {self.swap_inventory(size): size for size in (0, 512, 1024)}
+        require(path == self.inventory or path in profiles, 'Production/foreign inventory is forbidden for E2E.')
         safe_path(path)
         try:
-            require(yaml.safe_load(path.read_text()) == self.expected_inventory(), 'E2E inventory drift; no host contact permitted.')
+            require(yaml.safe_load(path.read_text()) == (self.expected_swap_inventory(profiles[path]) if path in profiles else self.expected_inventory()), 'E2E inventory drift; no host contact permitted.')
         except yaml.YAMLError:
             raise ValueError('Invalid E2E inventory; no host contact permitted.') from None
 
@@ -869,20 +886,40 @@ class Stand:
                  '--inventory', str(self.inventory), '--key', ''],
                 capture=False, timeout=None, env=self.child_env(inputs))
 
-    def cli(self, mode, frontier=None, unchanged=False):
+    def cli(self, mode, frontier=None, unchanged=False, swap_size=512):
         self.load()
         self.check_inventory(self.inventory)
         self.ready(running=True)
         env = self.child_env()
         if frontier:
             env['INIT_FROM'] = frontier
+        inventory = self.swap_inventory(swap_size)
+        self.check_inventory(inventory)
+        env['INVENTORY'] = str(inventory)
         argv = ['make', '--no-print-directory', mode]
-        with e2e_plan_pipe(self.inventory, env, mode) as (child_env, descriptors):
+        with e2e_plan_pipe(inventory, env, mode) as (child_env, descriptors):
             if unchanged:
                 convergence_command(argv, child_env, **({'pass_fds': descriptors} if descriptors else {}))
             else:
                 command(argv, capture=False, timeout=None, env=child_env,
                         **({'pass_fds': descriptors} if descriptors else {}))
+
+    def swap_file_retained(self):
+        self.ready(running=True)
+        self.check_inventory(self.swap_inventory(0))
+        from .ssh import interactive_ssh_command
+        previous = os.environ.get('HOME')
+        os.environ['HOME'] = str(self.root / 'home')
+        try:
+            key = Path(self.expected_inventory()['all']['children']['bootstrap']['hosts']['e2e']['ansible_private_key_file'])
+            argv = interactive_ssh_command(self.ip, 22, 'ansible', key)
+        finally:
+            if previous is None:
+                os.environ.pop('HOME', None)
+            else:
+                os.environ['HOME'] = previous
+        argv.remove('-t')
+        command(argv + ['sudo -n test -f /swapfile && sudo -n test "$(stat -c %s /swapfile)" = 1073741824'], timeout=90)
 
     def independent(self):
         self.ready(running=True)
@@ -929,13 +966,13 @@ class Stand:
         env['AGENT_LOAD'] = 'ask'
         frontier = os.environ.get('E2E_FROM', '')
         if not frontier:
-            frontier = input('E2E_FROM (bootstrap/docker/hardening/human/ssh/operations/verify; no default): ').strip()
-        require(frontier in ('bootstrap', 'docker', 'hardening', 'human', 'ssh', 'operations', 'verify'), 'Invalid E2E_FROM.')
-        print('E2E plan: initialize from ' + frontier + '; verify all stages; repeat convergence from docker '
+            frontier = input('E2E_FROM (bootstrap/swap/docker/hardening/human/ssh/operations/verify; no default): ').strip()
+        require(frontier in ('bootstrap', 'swap', 'docker', 'hardening', 'human', 'ssh', 'operations', 'verify'), 'Invalid E2E_FROM.')
+        print('E2E plan: initialize from ' + frontier + '; verify all stages; repeat convergence from swap '
               'and require provisioning changed=0; reboot this owned guest; verify again and prove a new boot ID. '
-              'No reset/delete or host installation. Retain guest console recovery.')
+              'Then resize SWAP 512 -> 1024 MiB, disable while retaining /swapfile, and re-enable 512 MiB; repeat changed=0 and reboot/verify each state. No reset/delete or host installation. Retain guest console recovery.')
         print('Human key path: ' + env['HUMAN_KEY'] + '; admin account: e2e_admin; sudo: unrestricted NOPASSWD.')
-        modes = ['docker-host', 'harden', 'add-user', 'secure-ssh', 'setup-operations', 'reboot-host']
+        modes = ['setup-swap', 'docker-host', 'harden', 'add-user', 'secure-ssh', 'setup-operations', 'reboot-host']
         if frontier == 'bootstrap':
             modes.insert(0, 'bootstrap-user')
         public = Path(env['HUMAN_PUBLIC_KEY'])
@@ -944,13 +981,19 @@ class Stand:
         if missing:
             modes.insert(0, 'generate-user-key')
         identity = public.read_bytes() if public.exists() else None
+        self.prepare_swap_inventories()
+        profiles = tuple(self.swap_inventory(size) for size in (0, 512, 1024))
+        expected_profiles = tuple(path.read_bytes() for path in profiles)
         expected_inventory = self.inventory.read_bytes()
         def snapshot():
             self.ready(running=True)
             self.check_inventory(self.inventory)
             require((public.read_bytes() if public.exists() else None) == identity,
                     'Human public identity changed; STOP.')
-            return self.inventory.read_bytes(), tuple(sorted(env.items())), plan_code_snapshot()
+            require(tuple(path.read_bytes() for path in profiles) == expected_profiles, 'E2E swap inventory drift; STOP.')
+            for path in profiles:
+                self.check_inventory(path)
+            return self.inventory.read_bytes(), expected_profiles, tuple(sorted(env.items())), plan_code_snapshot()
         with plan_scope(modes, snapshot):
             with e2e_plan_pipe(self.inventory, env, 'generate-user-key') as (child_env, descriptors):
                 command(['make', '--no-print-directory', 'generate-user-key'], capture=False, timeout=None, env=child_env,
@@ -961,14 +1004,26 @@ class Stand:
             self.cli('init-server', frontier)
             self.cli('init-server', 'verify')
             self.independent()
-            self.cli('init-server', 'docker', unchanged=True)
+            self.cli('init-server', 'swap', unchanged=True)
             self.cli('init-server', 'verify')
             before = self.independent()
             self.cli('reboot-host')
             self.cli('init-server', 'verify')
             after = self.independent()
             require(before != after, 'Reboot did not produce a new independently observed boot ID; STOP.')
-            print('E2E passed: installation/verification/repeat changed=0/reboot.')
+            # Every transition uses the real init-server and shared SWAP stage.
+            for size in (1024, 0, 512):
+                self.cli('init-server', 'swap', swap_size=size)
+                self.cli('init-server', 'swap', unchanged=True, swap_size=size)
+                if size == 0:
+                    self.swap_file_retained()
+                before = self.independent()
+                self.cli('reboot-host', swap_size=size)
+                self.cli('init-server', 'verify', swap_size=size)
+                if size == 0:
+                    self.swap_file_retained()
+                require(before != self.independent(), 'SWAP reboot boot ID unchanged; STOP.')
+            print('E2E passed: installation/verification/repeat changed=0/reboot and swap resize/disable/retention.')
 
 
 def configure_child():
@@ -985,16 +1040,19 @@ def configure_child():
     safe_path(root / 'home', directory=True)
     safe_path(root / 'home/.ssh', directory=True)
     safe_path(root / 'tmp', directory=True)
-    stand.check_inventory(Path(os.environ.get('INVENTORY', '')))
+    selected_inventory = Path(os.environ.get('INVENTORY', ''))
+    stand.check_inventory(selected_inventory)
     # access.py accepts exactly the inventory owned by the stand. Explicit argv
     # checks prevent --inventory/--key overrides before argparse dispatch.
     local = sys.argv[1:] == ['generate-user-key', '--inventory', str(stand.inventory)]
-    require(local or (len(sys.argv) == 6 and sys.argv[2:4] == ['--inventory', str(stand.inventory)]
+    require(local or (len(sys.argv) == 6 and sys.argv[2:4] == ['--inventory', str(selected_inventory)]
             and sys.argv[4:] == ['--key', ''] and
             sys.argv[1] in ('init-server', 'reboot-host', *USER_MODES)),
             'Foreign E2E CLI arguments forbidden.')
     user_operation = sys.argv[1] in USER_MODES
+    require(not user_operation or selected_inventory == stand.inventory, 'User commands require the base E2E inventory.')
     env = stand.child_env(os.environ if user_operation else None)
+    env['INVENTORY'] = str(selected_inventory)
     if user_operation:
         for name in USER_KEY_INPUTS:
             value = env[name]

@@ -23,7 +23,7 @@ from .user_management import USER_MANAGEMENT_MODES, user_management
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['init-server', *USER_MANAGEMENT_MODES, 'show-server-trust', 'copy-server-trust', 'trust-server', 'generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
+    parser.add_argument('mode', choices=['setup-swap', 'verify-swap', 'init-server', *USER_MANAGEMENT_MODES, 'show-server-trust', 'copy-server-trust', 'trust-server', 'generate-user-key', 'load-user-key', 'show-public-key', 'copy-public-key', 'show-controller', 'connect-controller', 'connect-user', 'preview-apt-policy', 'apply-apt-policy', 'inspect-operations', 'setup-operations', 'verify-operations', 'setup', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker', 'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host', 'add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'])
     parser.add_argument('--inventory', default=str(ROOT / 'inventories/production.yml'))
     parser.add_argument('--key', default=None, help='Legacy key override; explicit inventories own the key path.')
     args = parser.parse_args()

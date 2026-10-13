@@ -33,6 +33,7 @@ class InitializationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(init, 'plan_snapshot', return_value=('fixed',)))
         self.stack.enter_context(patch.object(init, 'load_host', return_value=('fixture', 'example.test', 22, 'root', '/usr/bin/python3')))
         self.stack.enter_context(patch.object(init, 'hardening_inputs', return_value={'ssh_listen_ports': [22]}))
+        self.stack.enter_context(patch.object(init, 'swap_input', return_value=2048))
         self.check_key = self.stack.enter_context(patch.object(init, 'check_key'))
         self.stack.enter_context(patch.object(init, 'human_key_path', return_value=Path('/synthetic-human')))
         self.answer = self.stack.enter_context(patch('builtins.input', return_value='yes'))
@@ -66,7 +67,7 @@ class InitializationTests(unittest.TestCase):
 
     def test_full_pipeline_orders_mutations_inspection_and_verifiers(self):
         self.run_init()
-        self.assertEqual(self.calls(), ['bootstrap-user', 'docker-host', 'inspect-hardening', 'harden',
+        self.assertEqual(self.calls(), ['bootstrap-user', 'setup-swap', 'docker-host', 'inspect-hardening', 'harden',
                                        'add-user', 'verify-user', 'secure-ssh', 'setup-operations'])
         self.assertEqual(self.events()[-1]['status'], 'completed')
         self.assertIn('Applications remain separate', self.output.getvalue())
@@ -88,7 +89,7 @@ class InitializationTests(unittest.TestCase):
             else:
                 self.assertEqual([row['status'] for row in rows], ['applying', 'completed'])
                 self.assertEqual([row['elapsed_seconds'] for row in rows], [0, 3])
-        self.assertEqual(events[-1]['elapsed_seconds'], 20)
+        self.assertEqual(events[-1]['elapsed_seconds'], 23)
 
     def test_verification_failure_records_phase_and_elapsed_time_without_error_text(self):
         seconds = [0]
@@ -122,7 +123,7 @@ class InitializationTests(unittest.TestCase):
             rows = [row for row in events if row['stage'] == stage]
             self.assertEqual([row['status'] for row in rows], ['verifying', 'verified_skip'])
             self.assertEqual([row['elapsed_seconds'] for row in rows], [0, 2])
-        self.assertEqual(events[-1]['elapsed_seconds'], 12)
+        self.assertEqual(events[-1]['elapsed_seconds'], 14)
 
     def test_safe_cause_reaches_cli_terminal_but_never_log(self):
         reason = 'Managed key-only SSH access failed.'
@@ -229,7 +230,7 @@ class InitializationTests(unittest.TestCase):
         self.assertEqual(self.calls(), [row[2] for row in init.INIT_STAGES] * 2)
 
     def test_each_failure_or_interruption_stops_all_later_calls(self):
-        modes = ['bootstrap-user', 'docker-host', 'inspect-hardening', 'harden',
+        modes = ['bootstrap-user', 'setup-swap', 'docker-host', 'inspect-hardening', 'harden',
                  'add-user', 'verify-user', 'secure-ssh', 'setup-operations']
         for failure in (ValueError, KeyboardInterrupt):
             for position, mode in enumerate(modes):

@@ -333,7 +333,7 @@ The scenario performs:
 
 - An operator-selected `INIT_FROM` frontier via `E2E_FROM` or the native prompt:
   fresh installation uses `bootstrap`; continuation uses an explicitly diagnosed
-  frontier. Supported values are `bootstrap`, `docker`, `hardening`, `human`,
+  frontier. Supported values are `bootstrap`, `swap`, `docker`, `hardening`, `human`,
   `ssh`, `operations` and `verify`; there is no default. Native earlier-stage
   verification remains mandatory.
 - `init-server` verification of all stages; separate SSH probes check fixture
@@ -341,7 +341,7 @@ The scenario performs:
   stock SSH listener, final root/password denial, maintenance timers and journald.
   Existing SSH security verification also probes offered authentication methods
   and independently proves human administrator access.
-- Repeat convergence from `docker`, included in the same scenario plan.
+- Repeat convergence from `swap`, included in the same scenario plan.
   Streamed Ansible recaps or exact managed no-op evidence require provisioning
   `changed=0`; the existing
   Docker disposable smoke verifier must report exactly its three deliberate
@@ -350,6 +350,8 @@ The scenario performs:
   covered by existing verification and offline engine tests.
 - Existing `reboot-host`, explicitly included in the scenario plan, full final verification and
   independent probes again. Independently obtained boot IDs must differ.
+
+The SWAP scenario uses exact generated, private inventory profiles `inventory-swap-512.yml`, `inventory-swap-1024.yml` and `inventory-swap-0.yml`; the original fixture inventory remains unchanged, including legacy schema-1 fixtures. Initial `init-server` creates/activates 512 MiB. Further real `init-server INIT_FROM=swap` calls resize to 1024 MiB, disable with zero while independently proving the 1024 MiB file remains, and re-enable 512 MiB. Each state repeats provisioning with `changed=0`, reboots through the existing wrapper, verifies the full pipeline and proves a changed boot ID; disabled-file retention is checked again after reboot. Profile drift fails before dispatch. The plan explicitly lists these transitions and reboots.
 
 Failures stop immediately, retain guest/local state and never reset/retry.
 There is no automatic success report after a partial test. Sanitized native init

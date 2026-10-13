@@ -64,14 +64,14 @@ make init-server INIT_FROM=bootstrap HUMAN_USER=operator HUMAN_SUDO=admin \
   HUMAN_PUBLIC_KEY="$HOME/.ssh/portfolio-infra/operator_ed25519.pub"
 ```
 
-This is **LIVE / MUTATING**: bootstrap → Docker → SSH/UFW hardening → human access
+This is **LIVE / MUTATING**: bootstrap → SWAP → Docker → SSH/UFW hardening → human access
 → final SSH security → separately confirmed server operations, with mandatory
 verification between stages. One preliminary plan and default-deny confirmation
 cover the listed changes for this invocation, including the tested provider-console
 recovery attestation. Native password/passphrase, sudo and host-trust prompts remain
 separate. No application deployment, reboot or automatic recovery.
 
-`INIT_FROM` chooses the first stage authorized for application: `bootstrap`,
+`INIT_FROM` chooses the first stage authorized for application: `bootstrap`, `swap`,
 `docker`, `hardening`, `human`, `ssh`, `operations`; omit it for interactive selection
 with no default. Earlier stages are skipped only after successful server verification.
 Remaining stages run existing idempotent wrappers and explicit verification; completed
@@ -226,6 +226,16 @@ No safe automatic formatter is configured. For targeted diagnosis:
 `make lint-yaml`, `make lint-ansible`, `make syntax-check`, `make lint-workflows`,
 `make test-access`. Configure `offline-validation` as a required branch-protection
 check separately.
+
+## SWAP management
+
+After `make bootstrap-user` and `make verify-access`, set `swap_size_mb: 2048` in the local inventory and run `make setup-swap`; review the LIVE plan before approving. `make verify-swap` independently checks the owned file size/signature/permissions, kernel activity and exact fstab configuration. To resize, change only `swap_size_mb` and rerun setup; to disable, use `0`. Disabling preserves the file and its ownership receipt. Re-enabling the same size reuses that file.
+
+The `swap` role delegates to `library/portfolio_swap.py`; setup and verification use the same inspection contract. Only a newly created file is owned; an existing unmanaged `/swapfile` is never adopted or reformatted. The receipt in `/var/lib/portfolio-swap/receipt.json` binds the inode, size, metadata and swap UUID. Alternate file/UUID fstab entries, custom swap units/drop-ins, symlinks, hard links, sparse files and unsafe ownership block changes. Unrelated swap entries remain intact. Independent verification is read-only; ordinary file reads may update atime.
+
+A resize allocates a full replacement on ext4/XFS before stopping old swap, retaining the old file until successful swapoff. Disk needs the entire new size plus 256 MiB free reserve; RAM needs active swap usage plus 256 MiB `MemAvailable`. Both safety and unchanged-state checks repeat before swapoff. Persisted activation evidence precedes mutation and is removed only after full activation checks. A command error, timeout, interruption or pending marker stops the pipeline. Recovery diagnosis must examine `/proc/swaps`, memory/disk, `/etc/fstab`, the receipt and `/var/lib/portfolio-swap/pending`; a staged `/.portfolio-swap-*` file may remain after failure. Never clear the marker, adopt drift or retry automatically. No rollback or reboot is bundled. Concurrent raw root changes and other controllers must remain manually serialized.
+
+Offline success is not evidence of LIVE access, filesystem support, reboot persistence or idempotency. The optional VM scenario exercises those states after separate authorization.
 
 ## Docker host stage
 

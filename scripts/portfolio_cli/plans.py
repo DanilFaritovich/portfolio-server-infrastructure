@@ -10,6 +10,7 @@ import sys
 from .common import ROOT, require
 
 PLAN_ACTIONS = {
+    'setup-swap': 'Manage only owned /swapfile using inventory swap_size_mb (remote sudo): allocate/activate, stage a safe resize, or disable without deletion; maintain fstab and verify independently. Conflicts or insufficient RAM/disk stop; retain recovery access.',
     'generate-user-key': 'Generate the selected missing human Ed25519 key pair locally without overwrite (directory 0700, private 0600); native passphrase input. Load only the new identity into the existing SSH agent when selected; no agent is started.',
     'bootstrap-user': 'Create/reuse the dedicated local automation key; create the managed account, authorized key and unrestricted NOPASSWD sudo (remote root; native login/sudo authentication).',
     'docker-host': 'Install official docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin and docker-compose-plugin APT packages; configure bounded local container logs and enable/start Docker (remote sudo); validate/restart only changed configuration; run a disposable smoke container, possibly caching its image.',

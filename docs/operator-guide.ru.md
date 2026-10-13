@@ -63,14 +63,14 @@ make init-server INIT_FROM=bootstrap HUMAN_USER=operator HUMAN_SUDO=admin \
   HUMAN_PUBLIC_KEY="$HOME/.ssh/portfolio-infra/operator_ed25519.pub"
 ```
 
-Это **LIVE / MUTATING**: bootstrap → Docker → SSH/UFW hardening → human access
+Это **LIVE / MUTATING**: bootstrap → SWAP → Docker → SSH/UFW hardening → human access
 → final SSH security → отдельно подтверждаемые server operations с обязательной
 проверкой между этапами. Единый предварительный план и default-deny подтверждение
 разрешают перечисленные изменения только в текущем запуске, включая подтверждение
 проверенного provider-console recovery. Штатные запросы password/passphrase, sudo
 и host trust остаются отдельными. Деплой приложений, reboot и автоматическое recovery исключены.
 
-`INIT_FROM` задаёт первый этап, разрешённый для применения: `bootstrap`, `docker`,
+`INIT_FROM` задаёт первый этап, разрешённый для применения: `bootstrap`, `swap`, `docker`,
 `hardening`, `human`, `ssh`, `operations`. Без переменной выбор интерактивный,
 без значения по умолчанию. Предыдущие этапы пропускаются только после успешной
 фактической проверки сервера. Оставшиеся выполняются существующими идемпотентными
@@ -225,6 +225,16 @@ Controller-key regression test запускает реальный локаль�
 `make lint-yaml`, `make lint-ansible`, `make syntax-check`, `make lint-workflows`,
 `make test-access`. Required branch-protection check `offline-validation`
 настраивается отдельно.
+
+## Управление SWAP
+
+После `make bootstrap-user` и `make verify-access` задайте `swap_size_mb: 2048` в локальном inventory и выполните `make setup-swap`; изучите LIVE-план до подтверждения. `make verify-swap` независимо проверяет размер, сигнатуру и права своего файла, активность в ядре и точную конфигурацию fstab. Для изменения размера поменяйте только `swap_size_mb` и повторите setup; для отключения задайте `0`. Отключение сохраняет файл и запись владения. Повторное включение того же размера использует сохранённый файл.
+
+Роль `swap` вызывает `library/portfolio_swap.py`; настройка и проверка используют общий контракт инспекции. Управляемым становится только новый файл; существующий чужой `/swapfile` никогда не присваивается и не форматируется. `/var/lib/portfolio-swap/receipt.json` связывает inode, размер, метаданные и UUID SWAP. Альтернативные записи файла/UUID в fstab, собственные swap units/drop-ins, symlink, hard link, разреженный файл и небезопасное владение блокируют изменения. Посторонние записи SWAP сохраняются. Независимая проверка не меняет конфигурацию; обычное чтение файлов может обновлять atime.
+
+Изменение размера полностью выделяет новый файл на ext4/XFS до отключения старого SWAP, сохраняя старый файл до успешного swapoff. Нужен полный новый размер плюс резерв 256 МиБ свободного диска; `MemAvailable` должен покрывать занятый активный SWAP плюс 256 МиБ. Проверки ресурсов и неизменности состояния повторяются перед swapoff. Маркер активации сохраняется до изменений и удаляется только после полных проверок активации. Ошибка команды, timeout, прерывание или pending-маркер останавливают pipeline. Recovery-диагностика должна изучить `/proc/swaps`, RAM/диск, `/etc/fstab`, запись владения и `/var/lib/portfolio-swap/pending`; после сбоя может остаться подготовленный `/.portfolio-swap-*`. Не удаляйте маркер, не присваивайте drift и не повторяйте автоматически. Автоматических rollback или reboot нет. Прямые изменения от root и другие контроллеры требуют ручной сериализации.
+
+Успех offline-тестов не доказывает LIVE-доступ, поддержку файловой системы, сохранение после reboot или идемпотентность. Отдельно разрешённый сценарий VM проверяет эти состояния.
 
 ## Docker host stage
 

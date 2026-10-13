@@ -437,6 +437,23 @@ class StandTests(unittest.TestCase):
                 self.domain.find('uuid').text = self.state['uuid']
                 self.vm_state = 'running'
 
+    def test_swap_profiles_bind_exact_owned_inventory_and_block_drift(self):
+        self.stand.prepare_swap_inventories()
+        for size in (0, 512, 1024):
+            path = self.stand.swap_inventory(size)
+            self.stand.check_inventory(path)
+            self.assertEqual(yaml.safe_load(path.read_text())['all']['children']['bootstrap']['hosts']['e2e']['swap_size_mb'], size)
+        path = self.stand.swap_inventory(512)
+        data = yaml.safe_load(path.read_text())
+        data['all']['children']['bootstrap']['hosts']['e2e']['swap_size_mb'] = 1024
+        path.write_text(yaml.safe_dump(data))
+        with self.assertRaisesRegex(ValueError, 'drift'):
+            self.stand.check_inventory(path)
+        with self.assertRaises(ValueError):
+            self.stand.prepare_swap_inventories()
+        with self.assertRaises(ValueError):
+            self.stand.swap_inventory(2048)
+
     def test_test_failure_stops_without_reset(self):
         public = self.stand.root / 'home/.ssh/human/admin_ed25519.pub'
         public.parent.mkdir(parents=True, exist_ok=True)
@@ -505,13 +522,20 @@ class StandTests(unittest.TestCase):
         with patch.object(e2e.sys.stdin, 'isatty', return_value=True), \
                 patch.object(e2e, 'command', side_effect=run), \
                 patch.object(self.stand, 'cli') as cli, \
-                patch.object(self.stand, 'independent', side_effect=['initial', 'before', 'after']), \
+                patch.object(self.stand, 'swap_file_retained') as retained, \
+                patch.object(self.stand, 'independent', side_effect=['initial', 'before', 'after', 'b1', 'a1', 'b2', 'a2', 'b3', 'a3']), \
                 patch.dict(os.environ, E2E_FROM='bootstrap'):
             self.stand.test()
+        self.assertEqual(retained.call_count, 2)
         self.assertEqual([(c.args, c.kwargs) for c in cli.call_args_list], [
             (('init-server', 'bootstrap'), {}), (('init-server', 'verify'), {}),
-            (('init-server', 'docker'), {'unchanged': True}), (('init-server', 'verify'), {}),
-            (('reboot-host',), {}), (('init-server', 'verify'), {})])
+            (('init-server', 'swap'), {'unchanged': True}), (('init-server', 'verify'), {}),
+            (('reboot-host',), {}), (('init-server', 'verify'), {})] + [
+                row for size in (1024, 0, 512) for row in [
+                    (('init-server', 'swap'), {'swap_size': size}),
+                    (('init-server', 'swap'), {'unchanged': True, 'swap_size': size}),
+                    (('reboot-host',), {'swap_size': size}),
+                    (('init-server', 'verify'), {'swap_size': size})]])
         self.assertFalse(self.mutations())
 
     def test_failed_revert_keeps_disk_does_not_start_or_reset_again(self):
@@ -714,10 +738,10 @@ class StandTests(unittest.TestCase):
 
     def test_repeat_recaps_enforce_zero_provisioning_allow_exact_smoke(self):
         names = [yaml.safe_load((e2e.ROOT / 'playbooks' / n).read_text())[0]['name'] for n in
-                 ('docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml', 'verify-docker.yml')]
+                 ('setup-swap.yml', 'docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml', 'verify-docker.yml')]
         for drift in (False, True):
             text = ''.join('PLAY [' + name + '] ***\n' +
-                           'e2e : ok=10 changed=' + str(3 if index == 4 else int(drift)) + ' failed=0\n'
+                           'e2e : ok=10 changed=' + str(3 if index == 5 else int(drift)) + ' failed=0\n'
                            for index, name in enumerate(names))
             class Process:
                 stdout = io.BufferedReader(io.BytesIO(text.encode()))
@@ -737,7 +761,8 @@ class StandTests(unittest.TestCase):
     def test_repeat_accepts_exact_noops_and_rejects_missing_evidence(self):
         docker = yaml.safe_load((e2e.ROOT / 'playbooks/docker-host.yml').read_text())[0]['name']
         smoke = yaml.safe_load((e2e.ROOT / 'playbooks/verify-docker.yml').read_text())[0]['name']
-        recaps = f'PLAY [{docker}] ***\ne2e : ok=10 changed=0 failed=0\nPLAY [{smoke}] ***\ne2e : ok=10 changed=3 failed=0\n'
+        swap_play = yaml.safe_load((e2e.ROOT / 'playbooks/setup-swap.yml').read_text())[0]['name']
+        recaps = f'PLAY [{swap_play}] ***\ne2e : ok=10 changed=0 failed=0\nPLAY [{docker}] ***\ne2e : ok=10 changed=0 failed=0\nPLAY [{smoke}] ***\ne2e : ok=10 changed=3 failed=0\n'
         for missing in (False, True):
             messages = list(e2e.PLAN_NOOP_MESSAGES.values())
             if missing:

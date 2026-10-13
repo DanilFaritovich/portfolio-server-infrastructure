@@ -27,7 +27,7 @@ the same commands, arguments, output formats and exit codes.
 | `ansible.py` | Controller prerequisites, local pipeline serialization and pinned playbook execution using a temporary inventory overlay. |
 | `inspection.py` | SSH stdin transports for hardening/operations inspectors and the remote user-management engine. |
 | `verification.py` | Independent managed and human Ansible access verification over selected ports. |
-| `provisioning.py` | Bootstrap/access, Docker, hardening and separately confirmed reboot orchestration. |
+| `provisioning.py` | Bootstrap/access, SWAP, Docker, hardening and separately confirmed reboot orchestration. |
 | `human_access.py` | Human policy inputs, confirmed public-key registration, account creation/additive access and final SSH security orchestration. |
 | `user_management.py` | User queries and mutations, including fresh independent recovery access proof and confirmation. |
 | `operations.py` | Operations inspection/setup/verification and separately confirmed APT policy preview/application. |
@@ -54,6 +54,7 @@ The provisioning sequence remains:
 
 ```text
 local setup -> password bootstrap -> managed access verification
+-> owned SWAP -> SWAP verification
 -> Docker host -> Docker verification
 -> firewall/SSH hardening -> hardening verification
 -> human access -> human verification
@@ -383,3 +384,19 @@ three Docker smoke changes); independent SSH probes and boot IDs cover persisten
 Errors preserve state and diagnostic snapshots; continuation remains explicit.
 Offline mocked lifecycle tests join the existing unittest discovery; check/CI
 never depend on VM targets. Real compatibility/idempotency remain operator tests.
+
+## Owned SWAP boundary
+
+The `swap` role and `setup-swap.yml` converge only `/swapfile` from the single
+`swap_size_mb` input; `verify-swap.yml` independently inspects the same contract.
+`library/portfolio_swap.py` owns the root-only receipt and directory lock under
+`/var/lib/portfolio-swap`, checks RAM/disk/conflicts before mutation, stages a
+fully allocated replacement before swapoff, and atomically preserves unrelated
+fstab entries. Zero removes activation/configuration while retaining the file.
+Pending activation blocks retries and verification; only successful activation
+checks clear it. Foreign swap, file adoption and automatic recovery are excluded.
+`provisioning.live` performs managed access preflight and independent postflight,
+returning `verify-swap` for initialization's existing result-reuse optimization.
+The `swap` frontier is between Bootstrap and Docker. E2E profiles pin three
+exact inventories and exercise creation, resize, disable, convergence and reboot
+through the real initialization wrappers without changing the base fixture.
