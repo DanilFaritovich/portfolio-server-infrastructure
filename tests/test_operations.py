@@ -640,9 +640,26 @@ class OperationsWrapperTests(unittest.TestCase):
 
     def test_confirmed_setup_passes_explicit_consent(self):
         with patch.object(access.sys.stdin, 'isatty', return_value=True), patch('builtins.input', return_value='yes'):
-            access.operations('setup-operations', Path('/fixture'), Path('/opaque-key'))
+            self.assertEqual(access.operations('setup-operations', Path('/fixture'), Path('/opaque-key')),
+                             'verify-operations')
+        self.assertEqual(self.probe.call_args.args[5], {'verify': True})
         self.assertTrue(self.playbook.call_args.args[2]['server_operations_confirmed'])
         self.assertEqual(self.playbook.call_args.args[3], 'setup-operations.yml')
+
+    def test_setup_noop_does_not_claim_postflight(self):
+        self.probe.return_value = {'plan': {'changes': {'/etc/apt/apt.conf.d/99zz-portfolio-security': False},
+                                          'token': 'fixed'}}
+        self.assertIsNone(access.operations('setup-operations', Path('/fixture'), Path('/opaque-key')))
+        self.playbook.assert_not_called()
+        self.assertEqual(self.probe.call_count, 2)
+
+    def test_failed_postflight_cannot_return_verifier_result(self):
+        plan = self.probe.return_value
+        self.probe.side_effect = [plan, plan, plan, ValueError('postflight failed')]
+        with patch.object(access.sys.stdin, 'isatty', return_value=True), \
+                patch('builtins.input', return_value='yes'), self.assertRaisesRegex(ValueError, 'postflight failed'):
+            access.operations('setup-operations', Path('/fixture'), Path('/opaque-key'))
+        self.playbook.assert_called_once()
 
     def test_stream_payload_and_transport_are_read_only(self):
         result = {'ready': True, 'report': 'PASS'}

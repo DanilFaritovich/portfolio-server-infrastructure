@@ -115,3 +115,6 @@ def live(mode, inventory, key=None):
                 print(PLAN_NOOP_MESSAGES[mode])
         verify_hardening(inventory, alias, host, port, stage, inputs)
     print('Requested stage completed. STOP.')
+    # Returned only after the independent postflight has succeeded.
+    return {'bootstrap-user': 'verify-access', 'docker-host': 'verify-docker',
+            'harden': 'verify-hardening'}.get(mode)

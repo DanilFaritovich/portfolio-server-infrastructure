@@ -59,7 +59,8 @@ class DockerTests(unittest.TestCase):
 
                 run.side_effect = capture
                 with patch.dict(os.environ, {'FIXTURE': 'safe'}, clear=True), patch('builtins.print'):
-                    access.live(mode, self.inventory, self.key)
+                    result = access.live(mode, self.inventory, self.key)
+                self.assertEqual(result, 'verify-docker' if mode == 'docker-host' else None)
                 prepare.assert_not_called()
                 trust.assert_called_once_with('fixture.example.test', 2222, allow_trust=False)
                 expected_playbooks = ['verify.yml', mode + '.yml']

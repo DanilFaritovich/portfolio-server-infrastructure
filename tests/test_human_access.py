@@ -253,7 +253,8 @@ class HumanWrapperTests(unittest.TestCase):
 
     def test_secure_order_and_post_activation_failure_stops_later_checks(self):
         with patch('builtins.input', return_value='yes'):
-            access.human_access('secure-ssh', self.inventory, self.automation)
+            self.assertEqual(access.human_access('secure-ssh', self.inventory, self.automation),
+                             'verify-ssh-security')
         self.assertEqual(self.events, ['automation', 'human', 'human', 'secure-ssh.yml', 'automation', 'human',
                                        'verify-ssh-security.yml'])
         self.assertEqual(self.verify_auth_methods.call_count, 4)
@@ -264,6 +265,18 @@ class HumanWrapperTests(unittest.TestCase):
             access.human_access('secure-ssh', self.inventory, self.automation)
         self.assertEqual(self.events, ['automation', 'human', 'human'])
         self.verify_auth_methods.assert_not_called()
+
+    def test_secure_noop_does_not_claim_final_policy_verification(self):
+        with patch.object(access, 'hardening_plan', return_value={'changes_required': False, 'token': 'fixed'}):
+            self.assertIsNone(access.human_access('secure-ssh', self.inventory, self.automation))
+        self.assertEqual(self.events, ['automation', 'human'])
+        self.verify_auth_methods.assert_not_called()
+        self.run_playbook.assert_not_called()
+
+    def test_final_auth_failure_cannot_return_postflight_result(self):
+        self.verify_auth_methods.side_effect = ValueError('auth failed')
+        with patch('builtins.input', return_value='yes'), self.assertRaisesRegex(ValueError, 'auth failed'):
+            access.human_access('secure-ssh', self.inventory, self.automation)
 
     def test_independent_verification_covers_every_selected_port(self):
         self.verify_human.side_effect = None

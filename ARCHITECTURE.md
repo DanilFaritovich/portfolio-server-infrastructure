@@ -67,8 +67,13 @@ invocations. An operator-selected `INIT_FROM` frontier authorizes remaining
 applications; earlier stages must pass their independent verifiers before being
 skipped. `verify` selects verification only. A failed verifier never establishes
 absence or authorizes mutation. Remaining stages use existing preflight/postflight
-and an explicit verifier at every dependency boundary; Stage 3 also runs its streamed
-inspector before application. No provisioning roles or recovery logic are duplicated.
+and independent verification at every dependency boundary. A successful wrapper
+returns the exact verifier name only after completing its full independent postflight;
+initialization then omits the duplicate verifier. Public-only human registration and
+unverified SSH/operations no-op paths retain explicit verification. Results are used
+only at the current boundary, never cached across stages or invocations. Stage 3 also
+runs its streamed inspector before application. No provisioning roles or recovery
+logic are duplicated.
 
 Initialization requires a TTY and prepared human admin key. One default-deny plan
 confirmation covers the listed remaining stages in this invocation, including the
@@ -79,8 +84,9 @@ Errors, pending state, interruptions and log-write failures stop later dispatch.
 Continuation requires recovery diagnosis and explicit frontier selection, never
 log-based checkpoints, retry or rollback. Exclusive temporary JSONL files (0600)
 store only schema, fixed stage/status and monotonic elapsed seconds for the named
-stage (`run` events use whole-run time). Applying stages emit `applying` then
-`verifying` before `completed` or `failed`; verified skips retain `verified_skip`.
+stage (`run` events use whole-run time). Applying stages emit `applying`, with
+`verifying` before a separate explicit verifier, then `completed` or `failed`; embedded postflight remains part of the
+wrapper execution. Verified skips retain `verified_skip`.
 Logs exclude output, exception text, inventory and identities. Terminal failures
 retain exact allowlisted static causes or safe process/I/O categories and the active
 command, never arbitrary exception text or raw stderr. EOF at frontier selection
