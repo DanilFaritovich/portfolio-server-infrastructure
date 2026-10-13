@@ -15,7 +15,7 @@ It is intended for operators who can review SSH and sudo permissions and recover
 
 ## Features
 
-- **Guided initialization:** `make init-server` coordinates bootstrap, Docker, hardening, human access, final SSH security and server operations, with independent verification between stages.
+- **Guided initialization:** `make init-server` coordinates bootstrap, SWAP, Docker, hardening, human access, final SSH security and server operations, with independent verification between stages.
 - **Ansible provisioning:** reviewable roles and idempotent configuration; converged provisioning avoids unnecessary changes and service restarts.
 - **Docker host:** official Docker Engine packages, Compose and Buildx, bounded `local` container logs and a disposable runtime smoke test.
 - **SSH and UFW:** validated listening ports, IPv4/IPv6 firewall rules and final key-only SSH with root, password and keyboard-interactive login disabled. Stock SSH service and socket activation modes are preserved.
@@ -129,6 +129,7 @@ all:
           ansible_user: ansible
           ansible_private_key_file: ~/.ssh/portfolio-server-infrastructure/ansible_ed25519
           ansible_python_interpreter: /usr/bin/python3
+          swap_size_mb: 2048
           ssh_listen_ports: [22]
           ssh_verify_ports: [22]
           firewall_allowed_tcp_ports: [80, 443]
@@ -173,7 +174,15 @@ make init-server INIT_FROM=verify HUMAN_USER=portfolio_admin HUMAN_SUDO=admin \
 
 This verifies the full pipeline without provisioning. Docker verification creates/removes a smoke container and may populate the image cache. `make connect-user HUMAN_USER=portfolio_admin` opens an interactive human session after verification.
 
-After an error, **stop and diagnose before continuing**. `INIT_FROM` also accepts `docker`, `hardening`, `human`, `ssh` or `operations`; earlier stages must pass fresh verification. Choosing a later stage is an explicit decision after diagnosis, not automatic recovery. See [interrupted stages](docs/operator-guide.md#interrupted-stages-and-safe-repetition).
+After an error, **stop and diagnose before continuing**. `INIT_FROM` also accepts `swap`, `docker`, `hardening`, `human`, `ssh` or `operations`; earlier stages must pass fresh verification. Choosing a later stage is an explicit decision after diagnosis, not automatic recovery. See [interrupted stages](docs/operator-guide.md#interrupted-stages-and-safe-repetition).
+
+### SWAP between Bootstrap and Docker
+
+Set the sole inventory input `swap_size_mb: 2048` for 2 GiB; existing inventories must add an explicit integer before `init-server`. Initialization applies and independently verifies SWAP after Bootstrap and before Docker. `INIT_FROM=swap` verifies Bootstrap, then applies SWAP and later stages. The successful wrapper postflight is reused within this invocation, preserving the PR #13 optimization.
+
+`make setup-swap` requires managed key-only SSH/sudo and default-deny plan confirmation; `make verify-swap` independently checks without configuration changes. Positive sizes allocate and activate `/swapfile` with root:root 0600 permissions and an exact managed `/etc/fstab` entry. Zero disables it and removes that entry while retaining the file; an absent file stays absent. Other swap files/partitions remain untouched.
+
+Existing foreign `/swapfile`, unsafe metadata, conflicting fstab/systemd units, unsupported filesystems or changed ownership block application. Creation/resizing supports ext4/XFS and requires space for a full staged replacement plus 256 MiB reserve; stopping active swap requires `MemAvailable` to cover its current usage plus 256 MiB. Checks repeat before swapoff, and command failure stops before replacing the active file. Repeated matching state reports no changes. Partial failure retains `/var/lib/portfolio-swap/pending`, ownership evidence and possibly a staged root file: STOP, inspect through recovery, never blindly retry or automatically clear evidence. See the [operator guide](docs/operator-guide.md#swap-management).
 
 ## Command reference
 
@@ -198,6 +207,7 @@ See the operator guide for [keys and interactive SSH](docs/operator-guide.md#loc
 | --- | --- |
 | `make init-server` | Guided initialization or full verification; select `INIT_FROM` |
 | `make bootstrap-user` / `make verify-access` | Create automation access / prove independent key-only SSH and sudo |
+| `make setup-swap` / `make verify-swap` | Confirm and manage owned `/swapfile` / independently verify size, activity and persistence |
 | `make docker-host` / `make verify-docker` | Provision Docker with postflight / runtime and disposable container checks |
 | `make inspect-hardening` | Read-only Stage 3 safety report; FAIL blocks changes |
 | `make harden` / `make verify-hardening` | Configure SSH ports/UFW / verify listeners, routes and firewall |

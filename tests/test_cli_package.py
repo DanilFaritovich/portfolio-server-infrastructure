@@ -64,7 +64,7 @@ class PackageTests(unittest.TestCase):
                            'setup-operations', 'verify-operations'),
             'user_management': cli.USER_MANAGEMENT_MODES,
             'human_access': ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'),
-            'live': ('bootstrap-user', 'verify-access', 'docker-host', 'verify-docker',
+            'live': ('setup-swap', 'verify-swap', 'bootstrap-user', 'verify-access', 'docker-host', 'verify-docker',
                      'harden', 'verify-hardening', 'inspect-hardening', 'reboot-host'),
         }
         for handler, commands in modes.items():

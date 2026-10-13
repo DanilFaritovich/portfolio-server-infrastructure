@@ -1,0 +1,15 @@
+---
+- name: Require an explicit integer swap size
+  ansible.builtin.assert:
+    that:
+      - swap_size_mb is defined
+      - swap_size_mb is integer
+      - swap_size_mb is not boolean
+      - swap_size_mb >= 0
+      - swap_size_mb <= 1048576
+    quiet: true
+
+- name: Converge the owned swapfile safely
+  portfolio_swap:
+    size_mb: "{{ swap_size_mb }}"
+  become: true

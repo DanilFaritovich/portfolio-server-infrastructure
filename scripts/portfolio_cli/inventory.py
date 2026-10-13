@@ -12,7 +12,7 @@ from .keys import key_path
 HARDENING_FIELDS = {'ssh_listen_ports', 'ssh_verify_ports', 'firewall_allowed_tcp_ports'}
 
 
-HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'bootstrap_login_user', 'ansible_private_key_file', 'ansible_python_interpreter'} | HARDENING_FIELDS
+HOST_FIELDS = {'ansible_host', 'ansible_port', 'ansible_user', 'bootstrap_login_user', 'ansible_private_key_file', 'ansible_python_interpreter'} | HARDENING_FIELDS | {'swap_size_mb'}
 
 
 def setup_inventory(path):
@@ -45,7 +45,10 @@ def load_host(path, validate_hardening=True):
                 'Use a simple host alias such as portfolio.')
         require(alias != 'localhost', 'Reserve localhost for the controller; use a separate VPS alias.')
         require(isinstance(values, dict) and set(values) <= HOST_FIELDS,
-                'Only host, port, access users/key path, Python interpreter and hardening port lists belong in inventory.')
+                'Only host, port, access users/key path, Python interpreter, swap size and hardening port lists belong in inventory.')
+        if 'swap_size_mb' in values:
+            require(type(values['swap_size_mb']) is int and 0 <= values['swap_size_mb'] <= 1048576,
+                    'swap_size_mb must be an integer from 0 to 1048576.')
         for name in HARDENING_FIELDS & values.keys() if validate_hardening else ():
             validate_ports(values[name], allow_empty=name == 'firewall_allowed_tcp_ports')
         host = values.get('ansible_host')
@@ -120,3 +123,11 @@ def hardening_inputs(path, alias, port, validate=True):
             'Keep current ansible_port in ssh_listen_ports. Add new ports alongside the current route first.')
     require(port in result['ssh_verify_ports'], 'Keep current ansible_port in ssh_verify_ports.')
     return result
+
+
+def swap_input(path, alias):
+    values = yaml.safe_load(path.read_text())['all']['children']['bootstrap']['hosts'][alias]
+    value = values.get('swap_size_mb')
+    require(type(value) is int and 0 <= value <= 1048576,
+            'Set swap_size_mb to an explicit integer from 0 to 1048576 before SWAP initialization.')
+    return value

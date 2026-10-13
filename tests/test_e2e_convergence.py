@@ -89,10 +89,10 @@ class ConvergenceTerminalTests(unittest.TestCase):
 
     def recaps(self, *, drift=0, smoke=3, omit=False):
         names = [yaml.safe_load((ROOT / 'playbooks' / name).read_text())[0]['name']
-                 for name in ('docker-host.yml', 'harden.yml', 'secure-ssh.yml',
+                 for name in ('setup-swap.yml', 'docker-host.yml', 'harden.yml', 'secure-ssh.yml',
                               'setup-operations.yml', 'verify-docker.yml')]
         return ''.join('PLAY [' + name + '] ***\nPLAY RECAP ***\n'
-                       'e2e : ok=10 changed=%d unreachable=0 failed=0\n' % (smoke if index == 4 else drift)
+                       'e2e : ok=10 changed=%d unreachable=0 failed=0\n' % (smoke if index == 5 else drift)
                        for index, name in enumerate(names) if not (omit and index == 0))
 
     def test_yes_and_normal_completion_with_split_unicode_and_recaps(self):

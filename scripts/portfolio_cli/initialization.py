@@ -15,7 +15,7 @@ import time
 
 from .common import require
 from .human_access import human_access, human_inputs
-from .inventory import managed_access, load_host, hardening_inputs
+from .inventory import managed_access, load_host, hardening_inputs, swap_input
 from .keys import check_key, human_key_path
 from .operations import operations
 from .provisioning import live
@@ -24,6 +24,7 @@ from .plans import plan_scope, plan_snapshot, validate_current_plan
 
 INIT_STAGES = (
     ('bootstrap', 'bootstrap-user', 'verify-access'),
+    ('swap', 'setup-swap', 'verify-swap'),
     ('docker', 'docker-host', 'verify-docker'),
     ('hardening', 'harden', 'verify-hardening'),
     ('human', 'add-user', 'verify-user'),
@@ -116,7 +117,7 @@ def init_server(inventory, key=None):
         print('Choose the first stage authorized for mutation: ' + ', '.join(choices) +
               '. Earlier stages will only be verified. verify checks everything.')
         frontier = init_input('INIT_FROM (no default): ').strip()
-    require(frontier in choices, 'Set INIT_FROM to bootstrap, docker, hardening, human, ssh, operations or verify.')
+    require(frontier in choices, 'Set INIT_FROM to bootstrap, swap, docker, hardening, human, ssh, operations or verify.')
     managed_user, _ = managed_access(inventory, key)
     human = human_inputs(managed_user=managed_user)
     require(human['human_access_user_sudo'] == 'admin', 'init-server requires HUMAN_SUDO=admin and an independent human key.')
@@ -127,6 +128,7 @@ def init_server(inventory, key=None):
     modes = [apply for index, (_, apply, _) in enumerate(INIT_STAGES) if index >= boundary]
     alias, host, port, _, _ = load_host(inventory)
     print(f'Target: {host}:{port}; managed account: {managed_user}.')
+    print('SWAP size MiB: ' + str(swap_input(inventory, alias)))
     print('SSH/firewall inputs: ' + json.dumps(hardening_inputs(inventory, alias, port), sort_keys=True))
     print('Selected human policy: ' + json.dumps(human, sort_keys=True))
     with plan_scope(modes, lambda: plan_snapshot(inventory, key), reader=init_input, lazy=True):

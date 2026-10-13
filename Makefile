@@ -173,6 +173,8 @@ lint-ansible:
 	@ANSIBLE_INVENTORY="$(CURDIR)/inventories/production.example.yml" $(VENV)/bin/ansible-lint --offline playbooks roles
 
 syntax-check:
+	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/setup-swap.yml
+	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/verify-swap.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/apt-policy.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/bootstrap.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/verify.yml
@@ -192,3 +194,9 @@ lint-workflows:
 
 test-access:
 	@$(VENV)/bin/python -m unittest discover -s tests -b -q
+
+# LIVE: managed access preflight, owned swap only, independent postflight.
+.PHONY: setup-swap verify-swap
+setup-swap verify-swap:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
