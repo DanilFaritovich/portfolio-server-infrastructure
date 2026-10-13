@@ -423,13 +423,15 @@ class StandTests(unittest.TestCase):
                              (('verify-swap',), dict(swap_size=size))])
             if index in (2, 3):
                 expected.extend([(('reboot-host',), dict(swap_size=size)),
+                                 (('verify-swap',), dict(swap_size=size)),
+                                 (('setup-swap',), dict(unchanged=True, swap_size=size)),
                                  (('verify-swap',), dict(swap_size=size))])
         self.assertEqual([(c.args, c.kwargs) for c in cli.call_args_list], expected)
         self.assertFalse(self.mutations())
 
     def test_standalone_swap_stops_at_every_failed_step_without_reset(self):
         e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
-        for failure in range(20):
+        for failure in range(24):
             calls = []
 
             def dispatch(*args, **kwargs):
@@ -457,42 +459,85 @@ class StandTests(unittest.TestCase):
         self.assertEqual(cli.call_args.kwargs['swap_size'], 0)
         self.assertFalse(self.mutations())
 
-    def user_scenario(self, *, failure=None, bad_inspection=False, ssh_failure=None):
-        calls, fingerprints = [], ['SHA256:' + letter * 43 for letter in 'abc']
-        active, removed = [], False
-        name = 'e2e_t_123456789abc'
+    def user_scenario(self, *, failure=None, bad_inspection=False, ssh_failure=None,
+                      list_drift=None, list_kind='token', bad_repeat=None, home_drift=False):
+        calls, accounts, removed, repeated = [], {}, {}, {}
+        protected = {'name': 'ansible', 'protected': True}
+        admin = {'name': 'e2e_admin', 'sudo': 'admin', 'groups': [], 'token': 'stable'}
+        names = ['e2e_t_' + str(index).zfill(12) for index in (1, 2, 3)]
+        list_calls = []
+
+        def fingerprint(path):
+            return 'SHA256:' + hashlib.sha256(path.name.encode()).hexdigest()[:43]
 
         def dispatch(mode, **kwargs):
-            nonlocal removed
             inputs = kwargs['user_inputs']
+            name = inputs.get('HUMAN_USER')
             calls.append((mode, inputs, kwargs.get('capture', False)))
             if failure is not None and len(calls) == failure + 1:
                 raise e2e.E2EError('synthetic failure')
-            if mode == 'add-user':
-                active.append(fingerprints[0])
+            if mode == 'list-users':
+                list_calls.append(mode)
+                users = [dict(protected), dict(admin)] + list(accounts.values())
+                if list_drift == len(list_calls):
+                    if list_kind == 'extra':
+                        users.append(dict(name='foreign', sudo='none'))
+                    elif list_kind == 'missing':
+                        users.pop()
+                    else:
+                        users[1]['token'] = 'foreign edit'
+                return json.dumps({'users': users, 'changed': False})
+            if mode == 'add-user' and name not in accounts:
+                policy = inputs['HUMAN_SUDO']
+                accounts[name] = dict(name=name, sudo=policy, groups=[], token='stable', uid=1001,
+                                      commands=['ALL'] if policy == 'admin' else ['/usr/bin/id'] if policy == 'restricted' else [],
+                                      keys=[{'fingerprint': fingerprint(Path(inputs['HUMAN_PUBLIC_KEY'])), 'managed': True}])
             elif mode == 'add-user-key':
-                active.append(fingerprints[len(active)])
+                digest = fingerprint(Path(inputs['HUMAN_PUBLIC_KEY']))
+                if not any(entry['fingerprint'] == digest for entry in accounts[name]['keys']):
+                    accounts[name]['keys'].append({'fingerprint': digest, 'managed': True})
             elif mode == 'revoke-user-key':
-                active.remove(inputs['KEY_FINGERPRINT'])
-            elif mode == 'remove-user':
-                removed = True
+                accounts[name]['keys'] = [entry for entry in accounts[name]['keys'] if entry['fingerprint'] != inputs['KEY_FINGERPRINT']]
+            elif mode == 'remove-user' and name in accounts:
+                del accounts[name]
+                removed[name] = dict(name=name, removed=True, files_preserved=True)
             elif mode in ('show-user', 'list-user-keys'):
-                return json.dumps({'name': name, 'removed': True} if removed else {
-                    'name': name, 'sudo': 'none' if bad_inspection else 'admin', 'groups': [], 'commands': ['ALL'],
-                    'keys': [{'fingerprint': digest, 'managed': True} for digest in active]})
+                data = dict(accounts.get(name, removed.get(name, {})), changed=False)
+                if bad_inspection:
+                    data['groups'] = ['foreign']
+                return json.dumps(data)
+            if mode in ('add-user', 'add-user-key', 'revoke-user-key', 'remove-user'):
+                identity = mode, name, inputs.get('HUMAN_PUBLIC_KEY')
+                repeated[identity] = repeated.get(identity, 0) + 1
+                if mode == bad_repeat and repeated[identity] == 2:
+                    if name in accounts:
+                        accounts[name]['token'] = 'repeat changed state'
+                    else:
+                        removed[name]['unexpected'] = True
 
-        ssh_steps = []
+        ssh_steps, home_steps = [], []
 
-        def probe(*args, **kwargs):
-            ssh_steps.append(args)
+        def probe(user, key, script, **kwargs):
+            ssh_steps.append((user, key, script, kwargs))
             if ssh_failure is not None and len(ssh_steps) == ssh_failure + 1:
                 raise e2e.E2EError('synthetic SSH failure')
+            if kwargs.get('denied'):
+                self.assertFalse(user in accounts and any(entry['fingerprint'] == fingerprint(Path(str(key) + '.pub'))
+                                                         for entry in accounts[user]['keys']))
+            if 'files=$(sudo -n find' in script:
+                name = next(name for name in names if '/home/' + name in script)
+                home_steps.append(name)
+                changed = home_drift and home_steps.count(name) == 2
+                return (hashlib.sha256(name.encode()).hexdigest() + '  /home/' + name + '/.portfolio-e2e-retained\n' +
+                        ('b' if changed else 'a') * 64 + '  /home/' + name + '/.profile\n')
+            return ''
 
         with patch.object(self.stand, 'standalone_ready') as readiness, \
-                patch.object(e2e.uuid, 'uuid4', return_value=SimpleNamespace(hex='123456789abcdef0')), \
-                patch('portfolio_cli.keys.public_fingerprint', side_effect=fingerprints), \
-                patch.object(self.stand, 'fixture_ssh', side_effect=probe) as ssh, patch.object(self.stand, 'cli', side_effect=dispatch):
-            if failure is not None or bad_inspection or ssh_failure is not None:
+                patch.object(e2e.uuid, 'uuid4', side_effect=[SimpleNamespace(hex=name[6:]) for name in names]), \
+                patch('portfolio_cli.keys.public_fingerprint', side_effect=fingerprint), \
+                patch.object(self.stand, 'fixture_ssh', side_effect=probe) as ssh, \
+                patch.object(self.stand, 'cli', side_effect=dispatch):
+            if failure is not None or bad_inspection or ssh_failure is not None or list_drift or bad_repeat or home_drift:
                 with self.assertRaises(ValueError):
                     self.stand.test_users()
                 self.assertEqual(readiness.call_count, 1)
@@ -504,23 +549,35 @@ class StandTests(unittest.TestCase):
     def test_standalone_users_owned_lifecycle_recovery_and_negative_access(self):
         calls, ssh = self.user_scenario()
         modes = [row[0] for row in calls]
-        self.assertEqual(modes[:4], ['generate-user-key'] * 3 + ['add-user'])
-        self.assertEqual(modes.count('add-user-key'), 2)
-        self.assertEqual(modes.count('verify-user'), 5)
-        self.assertEqual(modes.count('remove-user'), 1)
+        self.assertEqual(modes[0], 'list-users')
+        self.assertEqual(modes.count('list-users'), 7)
+        self.assertEqual(modes.count('add-user'), 6)
+        self.assertEqual(modes.count('add-user-key'), 4)
+        self.assertEqual(modes.count('revoke-user-key'), 2)
+        self.assertEqual(modes.count('verify-user'), 6)
+        self.assertEqual(modes.count('remove-user'), 6)
+        policies = set()
         for mode, inputs, capture in calls:
-            self.assertEqual(inputs['HUMAN_USER'], 'e2e_t_123456789abc')
-            self.assertEqual(inputs['HUMAN_SUDO'], 'admin')
+            if mode == 'list-users':
+                self.assertEqual(inputs, {})
+                continue
+            policies.add(inputs['HUMAN_SUDO'])
+            self.assertTrue(inputs['HUMAN_USER'].startswith('e2e_t_'))
             self.assertEqual(inputs['RECOVERY_USER'], 'e2e_admin')
             self.assertEqual(inputs['RECOVERY_KEY'], str(self.stand.root / 'home/.ssh/human/admin_ed25519'))
+            self.assertEqual(inputs['HUMAN_SUDO_COMMANDS'], '/usr/bin/id' if inputs['HUMAN_SUDO'] == 'restricted' else '')
             if 'HUMAN_KEY' in inputs:
                 self.assertTrue(Path(inputs['HUMAN_KEY']).is_relative_to(self.stand.root / 'home/.ssh/human'))
             self.assertEqual(capture, mode in ('show-user', 'list-user-keys'))
+        self.assertEqual(policies, {'admin', 'none', 'restricted'})
         denials = [c for c in ssh.call_args_list if c.kwargs.get('denied')]
-        self.assertEqual(len(denials), 4)
-        self.assertTrue(str(denials[0].args[1]).endswith('_1'))
-        self.assertTrue(all(c.args[0] == 'e2e_t_123456789abc' for c in denials))
-        self.assertIn('test $? = 2', ssh.call_args_list[0].args[2])
+        # Five denials before registration, one revoked key and five removed keys.
+        self.assertEqual(len(denials), 11)
+        self.assertTrue(all(c.args[0].startswith('e2e_t_') for c in denials))
+        getent = [c for c in ssh.call_args_list if c.args[2].startswith('getent passwd')]
+        self.assertEqual(len(getent), 6)
+        self.assertTrue(all('test $? = 2' in c.args[2] for c in getent))
+        self.assertEqual(sum('files=$(sudo -n find' in c.args[2] for c in ssh.call_args_list), 6)
         self.assertFalse(self.mutations())
 
     def test_standalone_users_failures_do_not_continue_or_reset(self):
@@ -533,16 +590,108 @@ class StandTests(unittest.TestCase):
         self.assertEqual(stopped[-1][0], 'show-user')
         self.assertFalse(self.mutations())
 
-    def test_standalone_users_probe_failures_never_remove_or_report_success(self):
-        stopped, ssh = self.user_scenario(ssh_failure=0)
-        self.assertEqual(stopped, [])
-        self.assertEqual(ssh.call_count, 1)
-        stopped, ssh = self.user_scenario(ssh_failure=1)
-        self.assertNotIn('remove-user', [call[0] for call in stopped])
-        self.assertEqual(ssh.call_count, 2)
-        for index in (2, 3, 4):
-            stopped, ssh = self.user_scenario(ssh_failure=index)
-            self.assertEqual(ssh.call_count, index + 1)
+    def test_standalone_users_protect_baseline_repeats_and_home_files(self):
+        for list_drift in (2, 3, 4, 5, 6, 7):
+            with self.subTest(list_drift=list_drift):
+                stopped, _ = self.user_scenario(list_drift=list_drift)
+                self.assertEqual(stopped[-1][0], 'list-users')
+        for mode in ('add-user', 'add-user-key', 'revoke-user-key', 'remove-user'):
+            with self.subTest(mode=mode):
+                stopped, _ = self.user_scenario(bad_repeat=mode)
+                self.assertEqual(stopped[-1][0], 'show-user')
+        for list_kind in ('extra', 'missing'):
+            self.user_scenario(list_drift=2, list_kind=list_kind)
+        self.user_scenario(home_drift=True)
+        self.assertFalse(self.mutations())
+
+    def test_listed_users_rejects_duplicate_missing_admin_and_malformed_lists(self):
+        controller = dict(name='ansible', protected=True)
+        admin = dict(name='e2e_admin', sudo='admin')
+        for users, changed in (([controller, admin, admin], False), ([controller], False),
+                               ([dict(controller, protected=False), admin], False),
+                               ([controller, dict(admin, sudo='none')], False),
+                               ([controller, admin], True), ([controller, 'invalid'], False), (None, False)):
+            with self.subTest(users=users, changed=changed), \
+                    patch.object(self.stand, 'cli', return_value=json.dumps(dict(users=users, changed=changed))):
+                with self.assertRaises(ValueError):
+                    self.stand.listed_users()
+
+    def test_user_sudo_probes_execute_safe_commands_and_reject_unexpected_results(self):
+        # Execute the actual probe shell with synthetic functions, never local/guest sudo.
+        name = 'e2e_t_123456789abc'
+        marker = self.base / 'retained-marker'
+        stub = '''fake_id() {
+            if [ "$1" = -un ]; then printf '%s\\n' "$CASE_USER";
+            else printf '%s\\n' "$CASE_UID"; return "$CASE_ID_RC"; fi
+        }
+        fake_sudo() {
+            if [ "$3" = fake_id ] && [ "$CASE_POLICY" != none ]; then
+                printf '0\\n'; return "$CASE_ROOT_RC"
+            elif [ "$CASE_POLICY" = admin ]; then return 0
+            else printf '%s\\n' "$CASE_DENIAL" >&2; return "$CASE_DENIED_RC"; fi
+        }
+        '''
+        defaults = dict(CASE_USER=name, CASE_UID='1001', CASE_ID_RC='0', CASE_ROOT_RC='0',
+                        CASE_DENIED_RC='1', CASE_DENIAL='sudo: a password is required')
+        for policy in ('admin', 'none', 'restricted'):
+            with patch.object(self.stand, 'fixture_ssh') as ssh:
+                self.stand.user_sudo_probe(name, self.base / 'key', policy)
+            script = ssh.call_args.args[2]
+            self.assertNotIn('denied', ssh.call_args.kwargs)
+            self.assertIn('sudo -k -n', script)
+            self.assertNotIn('/bin/sh', script)
+            script = script.replace('/home/' + name + '/.portfolio-e2e-retained', str(marker))
+            script = script.replace('/usr/bin/id', 'fake_id').replace('id -un', 'fake_id -un').replace('sudo -k', 'fake_sudo -k')
+            cases = [({}, True), ({'CASE_UID': '0'}, False), ({'CASE_ID_RC': '1'}, False),
+                     ({'CASE_UID': 'unexpected'}, False), ({'CASE_UID': ''}, False)]
+            if policy != 'none':
+                cases.append(({'CASE_ROOT_RC': '1'}, False))
+            if policy != 'admin':
+                operation = '/usr/bin/id -u' if policy == 'none' else '/usr/bin/true'
+                # The path above is replaced by the test transport's synthetic function.
+                operation = operation.replace('/usr/bin/id', 'fake_id')
+                cases.extend([({'CASE_DENIED_RC': '0'}, False), ({'CASE_DENIED_RC': '2'}, False),
+                              ({'CASE_DENIAL': 'sudo: plugin error'}, False),
+                              ({'CASE_DENIAL': "Sorry, user " + name + " is not allowed to execute '" + operation + "' as root on guest."}, True),
+                              ({'CASE_DENIAL': "Sorry, user " + name + " is not allowed to execute '/other' as root on guest."}, False)])
+            for overrides, allowed in cases:
+                with self.subTest(policy=policy, overrides=overrides):
+                    marker.unlink(missing_ok=True)
+                    result = subprocess.run(['/bin/sh', '-c', stub + script],
+                                            env=dict(os.environ, CASE_POLICY=policy, **(defaults | overrides)),
+                                            capture_output=True, text=True, timeout=5, check=False)
+                    self.assertEqual(result.returncode == 0, allowed, result.stderr)
+                    self.assertEqual(marker.exists(), allowed)
+                    if allowed:
+                        self.assertEqual(marker.read_text(), name)
+
+    def test_home_snapshot_requires_complete_output_and_preserves_query_failures(self):
+        name = 'e2e_t_123456789abc'
+        valid = (hashlib.sha256(name.encode()).hexdigest() + '  /home/' + name + '/.portfolio-e2e-retained\n' +
+                 'a' * 64 + '  /home/' + name + '/.profile\n')
+        with patch.object(self.stand, 'fixture_ssh', return_value=valid) as ssh:
+            self.assertEqual(self.stand.user_home_snapshot(name, self.base / 'controller'), valid)
+        probe = ssh.call_args.args[2]
+        self.assertIn('test ! -L /home/' + name, probe)
+        self.assertIn('-type l) && test -z', probe)
+        self.assertIn('! -path /home/' + name + '/.ssh/authorized_keys', probe)
+        for output in ('', 'unexpected', 'a' * 64 + '  /home/foreign/.profile\n'):
+            with self.subTest(output=output), patch.object(self.stand, 'fixture_ssh', return_value=output):
+                with self.assertRaisesRegex(ValueError, 'snapshot unavailable'):
+                    self.stand.user_home_snapshot(name, self.base / 'controller')
+        with patch.object(self.stand, 'fixture_ssh', return_value='a' * 64 + '  /home/' + name + '/.profile\n'):
+            with self.assertRaisesRegex(ValueError, 'marker changed or missing'):
+                self.stand.user_home_snapshot(name, self.base / 'controller')
+        with patch.object(self.stand, 'fixture_ssh', side_effect=ValueError('query failure')):
+            with self.assertRaisesRegex(ValueError, 'query failure'):
+                self.stand.user_home_snapshot(name, self.base / 'controller')
+
+    def test_standalone_users_probe_failures_never_continue_or_report_success(self):
+        _, ssh = self.user_scenario()
+        for index in range(ssh.call_count):
+            with self.subTest(step=index):
+                _, stopped = self.user_scenario(ssh_failure=index)
+                self.assertEqual(stopped.call_count, index + 1)
         self.assertFalse(self.mutations())
 
     def test_standalone_decline_never_dispatches_mutations(self):
@@ -754,13 +903,16 @@ class StandTests(unittest.TestCase):
         self.assertEqual([(c.args, c.kwargs) for c in cli.call_args_list], [
             (('init-server', 'bootstrap'), {}), (('init-server', 'verify'), {}),
             (('init-server', 'swap'), {'unchanged': True}), (('init-server', 'verify'), {}),
-            (('reboot-host',), {}), (('init-server', 'verify'), {})] + [
+            (('reboot-host',), {}), (('init-server', 'verify'), {}),
+            (('setup-swap',), {'unchanged': True}), (('verify-swap',), {})] + [
                 row for size in (1024, 0, 512) for row in [
                     (('setup-swap',), {'swap_size': size}),
                     (('verify-swap',), {'swap_size': size}),
                     (('setup-swap',), {'unchanged': True, 'swap_size': size}),
                     (('verify-swap',), {'swap_size': size})] + ([
                         (('reboot-host',), {'swap_size': size}),
+                        (('verify-swap',), {'swap_size': size}),
+                        (('setup-swap',), {'unchanged': True, 'swap_size': size}),
                         (('verify-swap',), {'swap_size': size})] if size == 0 else [])])
         self.assertFalse(self.mutations())
 

@@ -285,9 +285,9 @@ make e2e-test-users
 make e2e-test-swap
 ```
 
-`e2e-test-users` creates a disposable account with its own primary group and admin sudo, inspects it and its keys, adds two keys, verifies access, revokes one and proves that only its access disappears, then removes the account and proves access denial for all three keys. It checks retained `ansible`/`e2e_admin` access. New keys stay in the isolated fixture HOME; native passphrase/agent prompts remain.
+`e2e-test-users` exercises separate disposable accounts for `admin`, `none` and `restricted` sudo. It checks exact managed account lists, groups, key ownership, safe allowed/forbidden sudo operations, SSH denial before key registration and after revocation/removal, and repeat operations without state changes. After removal, `getent`, `list-users` and home-file hashes independently prove account absence and file retention. Access for `ansible`/`e2e_admin` is checked again after all operations; new keys remain in fixture HOME and native prompts remain.
 
-`e2e-test-swap` uses existing `setup-swap`/`verify-swap` for 512 → 1024 → 0 → 512 MiB, checks `changed=0` in every state, retains the 1024 MiB file while disabled, and verifies persistence across two reboots (disabled and re-enabled). Final desired size is 512 MiB; the base fixture inventory remains unchanged.
+`e2e-test-swap` uses existing `setup-swap`/`verify-swap` for 512 → 1024 → 0 → 512 MiB, checks `changed=0` in every state and after both existing reboots, retains the 1024 MiB file while disabled, and verifies persistence across two reboots (disabled and re-enabled). Final desired size is 512 MiB; the base fixture inventory remains unchanged.
 
 Neither command bootstraps or runs `init-server`. They retain native safety checks, confirmations and recovery proofs, hold the fixture lock, and stop on errors without reset or automatic cleanup. See [standalone scenario details](docs/local-vm-e2e.md#standalone-tests-on-a-configured-vm).
 
