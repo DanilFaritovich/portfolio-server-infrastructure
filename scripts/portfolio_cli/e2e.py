@@ -114,11 +114,13 @@ def virsh(*args):
     return command(['virsh', '--connect', URI, *args]).strip()
 
 
-def convergence_command(argv, env, pass_fds=()):
+def convergence_command(argv, env, pass_fds=(), *, swap_only=False):
     """Stream interactive output; retain only numeric recap counts, never a log."""
-    smoke = yaml.safe_load((ROOT / 'playbooks/verify-docker.yml').read_text())[0]['name']
+    smoke = None if swap_only else yaml.safe_load((ROOT / 'playbooks/verify-docker.yml').read_text())[0]['name']
+    playbooks = ('setup-swap.yml',) if swap_only else (
+        'setup-swap.yml', 'docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml')
     required = {yaml.safe_load((ROOT / 'playbooks' / name).read_text())[0]['name'] for name in
-                ('setup-swap.yml', 'docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml')}
+                playbooks}
     noops = {message: yaml.safe_load((ROOT / 'playbooks' / (mode + '.yml')).read_text())[0]['name']
              for mode, message in PLAN_NOOP_MESSAGES.items()}
     seen, failed, play = set(), False, None
@@ -141,7 +143,7 @@ def convergence_command(argv, env, pass_fds=()):
             seen.add(play)
             # The existing verifier deliberately creates/runs/removes one
             # smoke container: exactly three changes, not provisioning drift.
-            failed |= int(match[1]) != (3 if play == smoke else 0)
+            failed |= int(match[1]) != (3 if smoke is not None and play == smoke else 0)
 
     def forward(chunk):
         nonlocal pending, oversized
@@ -899,7 +901,8 @@ class Stand:
         argv = ['make', '--no-print-directory', mode]
         with e2e_plan_pipe(inventory, env, mode) as (child_env, descriptors):
             if unchanged:
-                convergence_command(argv, child_env, **({'pass_fds': descriptors} if descriptors else {}))
+                convergence_command(argv, child_env, swap_only=mode == 'setup-swap',
+                                    **({'pass_fds': descriptors} if descriptors else {}))
             else:
                 command(argv, capture=False, timeout=None, env=child_env,
                         **({'pass_fds': descriptors} if descriptors else {}))
@@ -970,7 +973,9 @@ class Stand:
         require(frontier in ('bootstrap', 'swap', 'docker', 'hardening', 'human', 'ssh', 'operations', 'verify'), 'Invalid E2E_FROM.')
         print('E2E plan: initialize from ' + frontier + '; verify all stages; repeat convergence from swap '
               'and require provisioning changed=0; reboot this owned guest; verify again and prove a new boot ID. '
-              'Then resize SWAP 512 -> 1024 MiB, disable while retaining /swapfile, and re-enable 512 MiB; repeat changed=0 and reboot/verify each state. No reset/delete or host installation. Retain guest console recovery.')
+              'Then use setup-swap/verify-swap for 512 -> 1024 -> 0 -> 512 MiB, repeating changed=0 in each state. '
+              'Reboot once more while disabled and verify file retention: two reboots total. '
+              'No reset/delete or host installation. Retain guest console recovery.')
         print('Human key path: ' + env['HUMAN_KEY'] + '; admin account: e2e_admin; sudo: unrestricted NOPASSWD.')
         modes = ['setup-swap', 'docker-host', 'harden', 'add-user', 'secure-ssh', 'setup-operations', 'reboot-host']
         if frontier == 'bootstrap':
@@ -1011,18 +1016,20 @@ class Stand:
             self.cli('init-server', 'verify')
             after = self.independent()
             require(before != after, 'Reboot did not produce a new independently observed boot ID; STOP.')
-            # Every transition uses the real init-server and shared SWAP stage.
+            # Targeted transitions keep the native SWAP preflight/postflight.
             for size in (1024, 0, 512):
-                self.cli('init-server', 'swap', swap_size=size)
-                self.cli('init-server', 'swap', unchanged=True, swap_size=size)
+                self.cli('setup-swap', swap_size=size)
+                self.cli('verify-swap', swap_size=size)
+                self.cli('setup-swap', unchanged=True, swap_size=size)
+                self.cli('verify-swap', swap_size=size)
                 if size == 0:
                     self.swap_file_retained()
                 before = self.independent()
-                self.cli('reboot-host', swap_size=size)
-                self.cli('init-server', 'verify', swap_size=size)
                 if size == 0:
+                    self.cli('reboot-host', swap_size=size)
+                    self.cli('verify-swap', swap_size=size)
                     self.swap_file_retained()
-                require(before != self.independent(), 'SWAP reboot boot ID unchanged; STOP.')
+                    require(before != self.independent(), 'SWAP reboot boot ID unchanged; STOP.')
             print('E2E passed: installation/verification/repeat changed=0/reboot and swap resize/disable/retention.')
 
 
@@ -1047,7 +1054,7 @@ def configure_child():
     local = sys.argv[1:] == ['generate-user-key', '--inventory', str(stand.inventory)]
     require(local or (len(sys.argv) == 6 and sys.argv[2:4] == ['--inventory', str(selected_inventory)]
             and sys.argv[4:] == ['--key', ''] and
-            sys.argv[1] in ('init-server', 'reboot-host', *USER_MODES)),
+            sys.argv[1] in ('init-server', 'reboot-host', 'setup-swap', 'verify-swap', *USER_MODES)),
             'Foreign E2E CLI arguments forbidden.')
     user_operation = sys.argv[1] in USER_MODES
     require(not user_operation or selected_inventory == stand.inventory, 'User commands require the base E2E inventory.')

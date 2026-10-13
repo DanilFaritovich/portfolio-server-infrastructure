@@ -523,19 +523,22 @@ class StandTests(unittest.TestCase):
                 patch.object(e2e, 'command', side_effect=run), \
                 patch.object(self.stand, 'cli') as cli, \
                 patch.object(self.stand, 'swap_file_retained') as retained, \
-                patch.object(self.stand, 'independent', side_effect=['initial', 'before', 'after', 'b1', 'a1', 'b2', 'a2', 'b3', 'a3']), \
+                patch.object(self.stand, 'independent', side_effect=['initial', 'before', 'after', 'resized', 'disabled-before', 'disabled-after', 'enabled']) as independent, \
                 patch.dict(os.environ, E2E_FROM='bootstrap'):
             self.stand.test()
         self.assertEqual(retained.call_count, 2)
+        self.assertEqual(independent.call_count, 7)
         self.assertEqual([(c.args, c.kwargs) for c in cli.call_args_list], [
             (('init-server', 'bootstrap'), {}), (('init-server', 'verify'), {}),
             (('init-server', 'swap'), {'unchanged': True}), (('init-server', 'verify'), {}),
             (('reboot-host',), {}), (('init-server', 'verify'), {})] + [
                 row for size in (1024, 0, 512) for row in [
-                    (('init-server', 'swap'), {'swap_size': size}),
-                    (('init-server', 'swap'), {'unchanged': True, 'swap_size': size}),
-                    (('reboot-host',), {'swap_size': size}),
-                    (('init-server', 'verify'), {'swap_size': size})]])
+                    (('setup-swap',), {'swap_size': size}),
+                    (('verify-swap',), {'swap_size': size}),
+                    (('setup-swap',), {'unchanged': True, 'swap_size': size}),
+                    (('verify-swap',), {'swap_size': size})] + ([
+                        (('reboot-host',), {'swap_size': size}),
+                        (('verify-swap',), {'swap_size': size})] if size == 0 else [])])
         self.assertFalse(self.mutations())
 
     def test_failed_revert_keeps_disk_does_not_start_or_reset_again(self):
@@ -550,6 +553,31 @@ class StandTests(unittest.TestCase):
                 self.stand.reset()
         self.assertEqual([x[0] for x in self.mutations()], ['shutdown', 'snapshot-revert'])
         self.assertTrue(self.stand.disk.exists())
+
+    def test_swap_transition_failure_stops_before_later_actions(self):
+        public = self.stand.root / 'home/.ssh/human/admin_ed25519.pub'
+        public.parent.mkdir(parents=True, exist_ok=True)
+        public.write_text('synthetic public identity')
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        for failed_mode, unchanged in (('setup-swap', False), ('verify-swap', False), ('setup-swap', True)):
+            with self.subTest(mode=failed_mode, unchanged=unchanged):
+                def fail(mode, *args, **kwargs):
+                    if mode == failed_mode and kwargs.get('swap_size') == 1024 and kwargs.get('unchanged', False) == unchanged:
+                        raise e2e.E2EError('synthetic transition failure')
+                with patch.object(e2e.sys.stdin, 'isatty', return_value=True), \
+                        patch('builtins.input', return_value='y'), \
+                        patch.object(self.stand, 'ready'), \
+                        patch.object(e2e, 'command'), \
+                        patch.object(self.stand, 'cli', side_effect=fail) as cli, \
+                        patch.object(self.stand, 'swap_file_retained') as retained, \
+                        patch.object(self.stand, 'independent', side_effect=['initial', 'before', 'after']), \
+                        patch.dict(os.environ, E2E_FROM='bootstrap'):
+                    with self.assertRaisesRegex(ValueError, 'synthetic transition failure'):
+                        self.stand.test()
+                self.assertEqual(cli.call_args.args, (failed_mode,))
+                self.assertEqual(cli.call_args.kwargs.get('unchanged', False), unchanged)
+                retained.assert_not_called()
+                self.assertEqual(sum(call.args == ('reboot-host',) for call in cli.call_args_list), 1)
 
     def test_fresh_prepare_uses_cloud_init_then_stopped_baseline(self):
         self.fresh_prepare('ubuntu-24.04')
@@ -783,6 +811,41 @@ class StandTests(unittest.TestCase):
                 else:
                     e2e.convergence_command(['synthetic'], {})
 
+    def test_swap_repeat_requires_own_zero_change_recap_without_smoke_exception(self):
+        swap = yaml.safe_load((e2e.ROOT / 'playbooks/setup-swap.yml').read_text())[0]['name']
+        verify = yaml.safe_load((e2e.ROOT / 'playbooks/verify-swap.yml').read_text())[0]['name']
+        smoke = yaml.safe_load((e2e.ROOT / 'playbooks/verify-docker.yml').read_text())[0]['name']
+        for title, changed, extra, success in (
+                (swap, 0, '', True), (swap, 1, '', False), (swap, 3, '', False),
+                (verify, 0, '', False),
+                (swap, 0, f'PLAY [{smoke}] ***\ne2e : ok=10 changed=3 failed=0\n', False)):
+            with self.subTest(title=title, changed=changed, extra=extra):
+                output = f'PLAY [{title}] ***\ne2e : ok=10 changed={changed} failed=0\n' + extra
+                class Process:
+                    stdout = io.BufferedReader(io.BytesIO(output.encode()))
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *args):
+                        pass
+                    def wait(self):
+                        return 0
+                with patch.object(e2e.subprocess, 'Popen', return_value=Process()), contextlib.redirect_stdout(io.StringIO()):
+                    if success:
+                        e2e.convergence_command(['synthetic'], {}, swap_only=True)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'changed=0'):
+                            e2e.convergence_command(['synthetic'], {}, swap_only=True)
+
+    def test_swap_cli_repeat_uses_targeted_make_and_inventory(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        self.stand.prepare_swap_inventories()
+        with patch.object(self.stand, 'ready'), patch.object(e2e, 'convergence_command') as convergence:
+            self.stand.cli('setup-swap', unchanged=True, swap_size=1024)
+        args, kwargs = convergence.call_args
+        self.assertEqual(args[0], ['make', '--no-print-directory', 'setup-swap'])
+        self.assertEqual(args[1]['INVENTORY'], str(self.stand.swap_inventory(1024)))
+        self.assertTrue(kwargs['swap_only'])
+
     def test_child_guard_validates_args_environment_and_pins_trust(self):
         e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
         (self.stand.root / 'home/.ssh').mkdir(mode=0o700, parents=True)
@@ -809,6 +872,28 @@ class StandTests(unittest.TestCase):
                 patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', argv):
             with self.assertRaisesRegex(ValueError, 'arguments forbidden'):
                 e2e.configure_child()
+
+    def test_swap_child_guard_accepts_only_exact_owned_profiles(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        self.stand.prepare_swap_inventories()
+        (self.stand.root / 'home/.ssh').mkdir(mode=0o700, parents=True)
+        (self.stand.root / 'home').chmod(0o700)
+        (self.stand.root / 'tmp').mkdir(mode=0o700)
+        for mode in ('setup-swap', 'verify-swap'):
+            for size in (0, 512, 1024):
+                with self.subTest(mode=mode, size=size):
+                    inventory = self.stand.swap_inventory(size)
+                    env = dict(self.stand.child_env(), INVENTORY=str(inventory))
+                    argv = ['access.py', mode, '--inventory', str(inventory), '--key', '']
+                    with patch.object(e2e, 'Stand', return_value=self.stand), \
+                            patch.object(self.stand, 'ready'), \
+                            patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.base))), \
+                            patch.object(e2e.common, 'SSH_BASE', e2e.common.SSH_BASE), \
+                            patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', argv):
+                        e2e.configure_child()
+                        argv[3] = '/production/never-read.yml'
+                        with self.assertRaisesRegex(ValueError, 'arguments forbidden'):
+                            e2e.configure_child()
 
     def test_user_guard_accepts_allowlist_and_keeps_fixture_trust(self):
         e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
