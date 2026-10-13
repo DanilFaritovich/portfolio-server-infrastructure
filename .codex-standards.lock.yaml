@@ -2,7 +2,7 @@ version: 1
 
 source:
   repository: https://github.com/DanilFaritovich/codex-development-standards
-  ref: "984aee11b486ffb8c7f658efa7f3d8f3d40403aa"
+  ref: "e8ff8ad8f96ba68b21861500e581d9dbaa37fd3e"
 
 profile:
   name: ansible-infrastructure

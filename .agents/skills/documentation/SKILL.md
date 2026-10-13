@@ -1,6 +1,6 @@
 ---
 name: documentation
-description: Documentation conventions with opt-in README and docs updates, plus a narrow automatic update to an existing ARCHITECTURE.md for material architecture changes.
+description: Opt-in project documentation, bilingual README standards and portfolio README badges/presentation, plus existing ARCHITECTURE.md maintenance for material changes.
 ---
 
 # Documentation Standard
@@ -67,6 +67,8 @@ Both versions must describe the same project state.
 ## Root README
 
 The root README is the primary entry point.
+
+For an **explicit user request** to create or redesign a README for a public/portfolio project, follow [the portfolio README presentation reference](./references/portfolio-readme.md). Read this reference **only** for that work; do not load it for normal coding, private/internal projects, or unrelated documentation changes. It defines a compact, verified top badge strip (actual stack, CI, license), presentation structure, technical detail boundaries, and bilingual parity. Match established repository style without adding irrelevant technologies, visuals, or claims.
 
 Document only relevant topics, such as:
 
@@ -200,6 +202,7 @@ For explicitly requested documentation, before the local commit or an authorized
 - verify commands;
 - remove stale instructions;
 - ensure language versions stay aligned;
-- ensure architecture descriptions match the actual implementation.
+- ensure architecture descriptions match the actual implementation;
+- for requested portfolio README updates, verify every badge's technology/version, CI workflow, status, license, URL, image and alt text against the actual repository; do not show unsupported claims.
 
 Do not rerun unrelated application tests solely because prose documentation changed after successful code validation, unless documentation generation itself is executable/validated.
