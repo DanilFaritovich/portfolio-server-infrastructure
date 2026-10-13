@@ -363,6 +363,18 @@ selected key paths and recovery inputs; operator key paths become absolute befor
 switching HOME. Inventory/controller identity and trust remain fixture-owned.
 User operations retain native confirmations and recovery proofs, without scenario
 consent grants or VM lifecycle actions.
+Standalone `e2e-test-users` and `e2e-test-swap` require the configured running
+fixture and both administrator proofs. They orchestrate existing Make commands
+under the fixture lock without Bootstrap/init-server. One default-deny execution plan lists exact targets, policies, key paths, SWAP transitions and checks before mutation. An in-memory ordered mutation queue narrows each anonymous child grant to its exact operation and environment/profile; generated public identities are fixed after generation and revalidated thereafter. Decline/EOF changes nothing; native passphrase input and all independent recovery proofs remain. User
+targets and keys are freshly allocated inside fixture HOME; read-only CLI JSON
+proves exact group/sudo/key ownership and removal, and strict SSH probes accept
+only exact public-key authentication denial. SWAP uses the existing profiles,
+convergence parser and reboot wrapper to prove disabled/enabled persistence.
+Failures preserve state without automatic cleanup or reset. Standalone granted
+key generation uses a pipe-bound execution kind to select user-input guard validation;
+full-scenario generation retains its fixed administrator identity. The kind tag grants
+no authority by itself; the receiver consumes the descriptor and verifies its kind,
+mode, inputs, fixture-state hash and selected public identities before dispatch.
 Before importing CLI transports, `access.py` invokes the E2E guard for these
 children: revalidate resources, bridge route/DHCP, exact inventory and fixed child
 inputs, then pin OpenSSH fixture trust. Paramiko uses isolated HOME. Production
@@ -399,4 +411,5 @@ checks clear it. Foreign swap, file adoption and automatic recovery are excluded
 returning `verify-swap` for initialization's existing result-reuse optimization.
 The `swap` frontier is between Bootstrap and Docker. E2E profiles pin three
 exact inventories and exercise creation, resize, disable, convergence and reboot
-through the real initialization wrappers without changing the base fixture.
+through the existing initialization and targeted SWAP/reboot wrappers without
+changing the base fixture.

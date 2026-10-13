@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from .plans import PLAN_NOOP_MESSAGES, plan_code_snapshot, plan_scope, e2e_plan_pipe
+from .plans import PLAN_NOOP_MESSAGES, plan_code_snapshot, plan_scope, e2e_plan_pipe, e2e_execution_plan
 from . import common, e2e_host, e2e_images, e2e_readiness
 from .e2e_images import E2EError, require
 from .common import ROOT
@@ -39,7 +39,7 @@ USER_INPUTS = ('HUMAN_USER', 'HUMAN_SUDO', 'HUMAN_GROUPS', 'HUMAN_GROUPS_APPROVE
                'HUMAN_SUDO_COMMANDS', 'HUMAN_KEY', 'HUMAN_PUBLIC_KEY',
                'RECOVERY_USER', 'RECOVERY_KEY', 'KEY_NAME', 'KEY_FINGERPRINT', 'AGENT_LOAD')
 USER_KEY_INPUTS = ('HUMAN_KEY', 'HUMAN_PUBLIC_KEY', 'RECOVERY_KEY')
-MODES = ('prepare', 'status', 'test', 'reset', 'delete', 'list-distros', *USER_MODES)
+MODES = ('prepare', 'status', 'test', 'test-users', 'test-swap', 'reset', 'delete', 'list-distros', *USER_MODES)
 # The libvirt daemon can translate its error even with client LC_ALL=C.
 # Only these exact, verified disconnected-agent replies permit boot polling.
 AGENT_DISCONNECTED_ERRORS = frozenset({
@@ -888,14 +888,14 @@ class Stand:
                  '--inventory', str(self.inventory), '--key', ''],
                 capture=False, timeout=None, env=self.child_env(inputs))
 
-    def cli(self, mode, frontier=None, unchanged=False, swap_size=512):
+    def cli(self, mode, frontier=None, unchanged=False, swap_size=512, user_inputs=None, capture=False):
         self.load()
         self.check_inventory(self.inventory)
         self.ready(running=True)
-        env = self.child_env()
+        env = self.child_env(user_inputs)
         if frontier:
             env['INIT_FROM'] = frontier
-        inventory = self.swap_inventory(swap_size)
+        inventory = self.swap_inventory(swap_size) if user_inputs is None else self.inventory
         self.check_inventory(inventory)
         env['INVENTORY'] = str(inventory)
         argv = ['make', '--no-print-directory', mode]
@@ -904,8 +904,280 @@ class Stand:
                 convergence_command(argv, child_env, swap_only=mode == 'setup-swap',
                                     **({'pass_fds': descriptors} if descriptors else {}))
             else:
-                command(argv, capture=False, timeout=None, env=child_env,
-                        **({'pass_fds': descriptors} if descriptors else {}))
+                return command(argv, capture=capture, timeout=None, env=child_env,
+                               **({'pass_fds': descriptors} if descriptors else {}))
+
+    def fixture_ssh(self, user, key, probe, *, denied=False):
+        """Strict fixture-only probes; only an exact authentication denial is expected."""
+        self.ready(running=True)
+        self.check_inventory(self.inventory)
+        from .ssh import interactive_ssh_command
+        previous = os.environ.get('HOME')
+        os.environ['HOME'] = str(self.root / 'home')
+        try:
+            argv = interactive_ssh_command(self.ip, 22, user, key)
+        finally:
+            if previous is None:
+                os.environ.pop('HOME', None)
+            else:
+                os.environ['HOME'] = previous
+        argv.remove('-t')
+        if not denied:
+            return command(argv + [probe], timeout=90)
+        result = subprocess.run(argv + [probe], capture_output=True, text=True, timeout=90,
+                                env=self.child_env() | {'LC_ALL': 'C'}, check=False)
+        require(result.returncode == 255 and not result.stdout and
+                result.stderr.strip() == user + '@' + self.ip + ': Permission denied (publickey).',
+                'Expected exact key-only authentication denial; unexpected SSH result; STOP.')
+
+    def standalone_ready(self):
+        self.load()
+        self.check_inventory(self.inventory)
+        self.ready(running=True)
+        require(sys.stdin.isatty(), 'Standalone E2E requires a terminal and native confirmations.')
+        self.independent()
+        self.cli('verify-user', user_inputs={
+            'HUMAN_USER': 'e2e_admin', 'HUMAN_SUDO': 'admin',
+            'HUMAN_KEY': str(self.root / 'home/.ssh/human/admin_ed25519')})
+
+    def listed_users(self):
+        data = json.loads(self.cli('list-users', user_inputs={}, capture=True))
+        require(isinstance(data, dict) and data.get('changed') is False and
+                isinstance(data.get('users'), list) and
+                all(isinstance(entry, dict) and isinstance(entry.get('name'), str) for entry in data['users']),
+                'Invalid managed account list; STOP.')
+        users = {entry['name']: entry for entry in data['users']}
+        require(len(users) == len(data['users']) and users.get('ansible', {}).get('protected') is True and
+                users.get('e2e_admin', {}).get('sudo') == 'admin', 'Managed administrator list changed; STOP.')
+        return users
+
+    def execution_snapshot(self):
+        self.load()
+        self.ready(running=True)
+        self.check_inventory(self.inventory)
+        for size in (0, 512, 1024):
+            profile = self.swap_inventory(size)
+            if profile.exists() or profile.is_symlink():
+                self.check_inventory(profile)
+        controller = Path(self.expected_inventory()['all']['children']['bootstrap']['hosts']['e2e']['ansible_private_key_file'])
+        public_paths = (Path(str(controller) + '.pub'), self.root / 'home/.ssh/human/admin_ed25519.pub')
+        identities = tuple(path.read_bytes() if path.exists() else None for path in public_paths)
+        return (identities, json.dumps(self.state, sort_keys=True), self.inventory.read_bytes(),
+                tuple(sorted(self.child_env().items())), plan_code_snapshot())
+
+    def user_plan_inputs(self, policy, name):
+        return {'HUMAN_USER': name, 'HUMAN_SUDO': policy, 'AGENT_LOAD': 'ask',
+                'HUMAN_SUDO_COMMANDS': '/usr/bin/id' if policy == 'restricted' else '',
+                'RECOVERY_USER': 'e2e_admin',
+                'RECOVERY_KEY': str(self.root / 'home/.ssh/human/admin_ed25519')}
+
+    def user_plan_keys(self, policy, name):
+        return tuple(self.root / 'home/.ssh/human' / (name + '_' + str(index))
+                     for index in range(3 if policy == 'admin' else 1))
+
+    def test_users(self):
+        from .keys import public_fingerprint
+        self.standalone_ready()
+        targets = [(policy, 'e2e_t_' + uuid.uuid4().hex[:12]) for policy in ('admin', 'none', 'restricted')]
+        require(len({name for _, name in targets}) == 3, 'E2E test account collision; STOP.')
+        operations, actions = [], ['Owned VM UUID: ' + self.state['uuid'] +
+                                   '; retain ansible/e2e_admin and guest console recovery.',
+                                   'Read list-users baseline before the three lifecycles.']
+        for policy, name in targets:
+            keys = self.user_plan_keys(policy, name)
+            require(all(not path.exists() and not path.is_symlink() for key in keys
+                        for path in (key, Path(str(key) + '.pub'))), 'Test key path already exists; STOP.')
+            inputs = self.user_plan_inputs(policy, name)
+            actions.append('Prove absence of ' + name + ', home and management/removal records; sudo=' + policy +
+                           '; groups=primary only; commands=' + (inputs['HUMAN_SUDO_COMMANDS'] or ('ALL' if policy == 'admin' else 'none')) + '.')
+            def planned(mode, values, checks):
+                env = self.child_env(values) | {'INVENTORY': str(self.inventory)}
+                if isinstance(env.get('KEY_FINGERPRINT'), Path):
+                    public = env['KEY_FINGERPRINT']
+                    env['KEY_FINGERPRINT'] = lambda public=public: public_fingerprint(public)
+                operations.append((mode, self.inventory, env))
+                actions.append(mode + ' ' + name + ': ' + str(values) + '. ' + checks)
+            for key in keys:
+                planned('generate-user-key', inputs | {'HUMAN_KEY': str(key)},
+                        'Native passphrase; load newly generated identity into existing agent if available.')
+            actions.append('Prove distinct generated fingerprints and exact SSH denial for initial key ' + str(keys[0]) + '.')
+            creation = inputs | {'HUMAN_KEY': str(keys[0]), 'HUMAN_PUBLIC_KEY': str(keys[0]) + '.pub'}
+            planned('add-user', creation, 'verify-user initial key; show-user/list-user-keys exact policy/groups/ledger; compare list-users to baseline plus this account.')
+            planned('add-user', creation, 'Identical repeat; show-user snapshot must be unchanged.')
+            actions.append('Probe login and sudo id/true for ' + name + ' under ' + policy +
+                           ' policy; create non-overwriting retained home marker.')
+            if policy == 'admin':
+                for key in keys[1:]:
+                    actions.append('Prove exact SSH denial before adding ' + str(key) + '.')
+                    addition = inputs | {'HUMAN_PUBLIC_KEY': str(key) + '.pub'}
+                    planned('add-user-key', addition, 'verify-user this key; show-user exact ledger and policy.')
+                    planned('add-user-key', addition, 'Identical repeat; show-user snapshot must be unchanged.')
+                revocation = inputs | {'KEY_FINGERPRINT': Path(str(keys[1]) + '.pub')}
+                planned('revoke-user-key', revocation, 'Revoke only the fingerprint generated at this public path; fresh e2e_admin SSH/sudo recovery proof; show-user exact remaining keys.')
+                planned('revoke-user-key', revocation, 'Identical repeat with fresh recovery proof; show-user snapshot must be unchanged.')
+                actions.append('Prove revoked key SSH denial; verify-user surviving key ' + str(keys[2]) + '.')
+            actions.append('Snapshot retained home hashes including marker for ' + name + '.')
+            planned('remove-user', inputs, 'Fresh e2e_admin SSH/sudo recovery proof; revoke credentials/sudo, non-forced userdel, preserve home; show-user removal receipt.')
+            planned('remove-user', inputs, 'Identical repeat; show-user removal snapshot must be unchanged.')
+            actions.append('Prove getent exit 2, list-users equals baseline and retained home hashes unchanged; '
+                           'prove exact SSH denial for every generated key of ' + name + '.')
+        actions.append('Finally re-prove ansible/e2e_admin SSH/sudo and configured VM state; any error STOP, no reset/retry.')
+        with e2e_execution_plan(operations, actions, self.execution_snapshot):
+            baseline = self.listed_users()
+            for policy, name in targets:
+                self.user_lifecycle(policy, baseline, name)
+            self.standalone_ready()
+        print('Standalone users E2E passed; ansible/e2e_admin access retained.')
+
+    def user_home_snapshot(self, name, controller):
+        home = shlex.quote('/home/' + name)
+        authorized = shlex.quote('/home/' + name + '/.ssh/authorized_keys')
+        # Hash every preserved regular home file, excluding deliberately revoked credentials.
+        # Keep failures out of pipelines so a failed find/hash cannot look unchanged.
+        output = self.fixture_ssh('ansible', controller,
+                                  'sudo -n test -d ' + home + ' && sudo -n test ! -L ' + home +
+                                  ' && links=$(sudo -n find ' + home + ' -xdev -type l) && test -z "$links"' +
+                                  ' && files=$(sudo -n find ' + home + ' -xdev -type f ! -path ' + authorized +
+                                  ' -exec sha256sum -- {} +) && printf \'%s\\n\' "$files" | LC_ALL=C sort')
+        require(output.strip() and all(re.fullmatch(r'[a-f0-9]{64}  /home/' + re.escape(name) + r'/[^\n]+', line)
+                                       for line in output.splitlines()), 'Home file snapshot unavailable; STOP.')
+        marker = hashlib.sha256(name.encode()).hexdigest() + '  /home/' + name + '/.portfolio-e2e-retained'
+        require(output.splitlines().count(marker) == 1, 'Retained home marker changed or missing; STOP.')
+        return output
+
+    def user_sudo_probe(self, name, key, policy):
+        quoted = shlex.quote(name)
+        # id/true have no side effects even if a forbidden sudo command succeeds.
+        denied = '/usr/bin/id -u' if policy == 'none' else '/usr/bin/true'
+        refusal = shlex.quote("Sorry, user " + name + " is not allowed to execute '" + denied + "' as root on ")
+        rejection = ('result=$(LC_ALL=C sudo -k -n ' + denied + ' 2>&1); status=$?; test "$status" = 1 && '
+                     'case "$result" in \'sudo: a password is required\'|' + refusal + '*.) true;; *) false;; esac')
+        probe = ('login=$(id -un) && test "$login" = ' + quoted + ' && uid=$(/usr/bin/id -u) && '
+                 'case "$uid" in \'\'|*[!0-9]*) false;; *) test "$uid" != 0;; esac')
+        if policy != 'none':
+            probe += ' && root_uid=$(sudo -k -n /usr/bin/id -u) && test "$root_uid" = 0'
+        if policy == 'admin':
+            probe += ' && sudo -k -n /usr/bin/true'
+        else:
+            probe += ' && (' + rejection + ')'
+        marker = shlex.quote('/home/' + name + '/.portfolio-e2e-retained')
+        self.fixture_ssh(name, key, probe + ' && (set -C; printf %s ' + quoted + ' > ' + marker + ')')
+
+    def user_lifecycle(self, policy, baseline, name):
+        from .keys import public_fingerprint
+        require(name not in baseline, 'Test account already listed; STOP.')
+        keys = self.user_plan_keys(policy, name)
+        require(all(not p.exists() and not p.is_symlink() for key in keys
+                    for p in (key, Path(str(key) + '.pub'))), 'Test key path already exists; STOP.')
+        controller = Path(self.expected_inventory()['all']['children']['bootstrap']['hosts']['e2e']['ansible_private_key_file'])
+        quoted = shlex.quote(name)
+        self.fixture_ssh('ansible', controller,
+                         'getent passwd ' + quoted + ' >/dev/null; test $? = 2' +
+                         ''.join(' && sudo -n test ! -e ' + shlex.quote(path) +
+                                 ' && sudo -n test ! -L ' + shlex.quote(path) for path in (
+                                     '/home/' + name, '/var/lib/portfolio-human-access/' + name + '.json',
+                                     '/var/lib/portfolio-human-access/' + name + '.keys.json',
+                                     '/var/lib/portfolio-human-access/' + name + '.removed')))
+        inputs = self.user_plan_inputs(policy, name)
+        for key in keys:
+            self.cli('generate-user-key', user_inputs=inputs | {'HUMAN_KEY': str(key)})
+        fingerprints = tuple(public_fingerprint(Path(str(key) + '.pub')) for key in keys)
+        require(len(set(fingerprints)) == len(keys), 'Test keys must have distinct public identities; STOP.')
+
+        def inspect(expected, *, both=False):
+            data = json.loads(self.cli('show-user', user_inputs=inputs, capture=True))
+            require(data.get('name') == name and data.get('sudo') == policy and data.get('groups') == [] and
+                    data.get('commands') == (['ALL'] if policy == 'admin' else ['/usr/bin/id'] if policy == 'restricted' else []) and
+                    isinstance(data.get('keys'), list) and len(data['keys']) == len(expected) and
+                    all(isinstance(entry, dict) and entry.get('managed') is True for entry in data['keys']) and
+                    {entry.get('fingerprint') for entry in data['keys']} == set(expected),
+                    'Unexpected test account policy/key ownership; STOP.')
+            if both:
+                require(json.loads(self.cli('list-user-keys', user_inputs=inputs, capture=True)) == data,
+                        'User/key views disagree; STOP.')
+            return data
+
+        def repeat(mode, values, before):
+            self.cli(mode, user_inputs=values)
+            require(json.loads(self.cli('show-user', user_inputs=inputs, capture=True)) == before,
+                    'Repeated user operation changed state; STOP.')
+
+        def verify(key):
+            self.cli('verify-user', user_inputs=inputs | {'HUMAN_KEY': str(key)})
+
+        creation = inputs | {'HUMAN_KEY': str(keys[0]), 'HUMAN_PUBLIC_KEY': str(keys[0]) + '.pub'}
+        self.fixture_ssh(name, keys[0], 'true', denied=True)
+        self.cli('add-user', user_inputs=creation)
+        verify(keys[0])
+        state = inspect(fingerprints[:1], both=True)
+        require(self.listed_users() == baseline | {name: {k: v for k, v in state.items() if k != 'changed'}},
+                'Managed account list changed unexpectedly after creation; STOP.')
+        repeat('add-user', creation, state)
+        self.user_sudo_probe(name, keys[0], policy)
+        if policy == 'admin':
+            for index in (1, 2):
+                self.fixture_ssh(name, keys[index], 'true', denied=True)
+                addition = inputs | {'HUMAN_PUBLIC_KEY': str(keys[index]) + '.pub'}
+                self.cli('add-user-key', user_inputs=addition)
+                verify(keys[index])
+                state = inspect(fingerprints[:index + 1])
+                repeat('add-user-key', addition, state)
+            revocation = inputs | {'KEY_FINGERPRINT': fingerprints[1]}
+            self.cli('revoke-user-key', user_inputs=revocation)
+            state = inspect((fingerprints[0], fingerprints[2]))
+            repeat('revoke-user-key', revocation, state)
+            self.fixture_ssh(name, keys[1], 'true', denied=True)
+            verify(keys[2])
+        retained_home = self.user_home_snapshot(name, controller)
+        self.cli('remove-user', user_inputs=inputs)
+        removed = json.loads(self.cli('show-user', user_inputs=inputs, capture=True))
+        require(removed.get('name') == name and removed.get('removed') is True and removed.get('files_preserved') is True,
+                'Test account removal not proven; STOP.')
+        repeat('remove-user', inputs, removed)
+        self.fixture_ssh('ansible', controller, 'getent passwd ' + quoted + ' >/dev/null; test $? = 2')
+        require(self.listed_users() == baseline, 'Managed account list changed after removal; STOP.')
+        require(self.user_home_snapshot(name, controller) == retained_home, 'Home files changed after removal; STOP.')
+        for key in keys:
+            self.fixture_ssh(name, key, 'true', denied=True)
+
+    def test_swap(self):
+        self.standalone_ready()
+        operations, actions = [], ['Owned VM UUID: ' + self.state['uuid'] + '; retain guest console recovery.']
+        for index, size in enumerate((512, 1024, 0, 512)):
+            profile = self.swap_inventory(size)
+            env = self.child_env() | {'INVENTORY': str(profile)}
+            for mode in ('setup-swap', 'setup-swap'):
+                operations.append((mode, profile, env))
+            actions.append('setup-swap ' + str(size) + ' MiB using ' + str(profile) +
+                           '; verify-swap; repeat setup changed=0; verify-swap.' +
+                           (' Disable without deleting the 1024 MiB file; prove retention.' if size == 0 else ' Allocate/resize/activate owned /swapfile.'))
+            if index in (2, 3):
+                operations.extend([('reboot-host', profile, env), ('setup-swap', profile, env)])
+                actions.append('Reboot ' + ('disabled' if size == 0 else 'enabled') + ' VM; fresh SSH/sudo/Docker/hardening proof; '
+                               'verify-swap and new boot ID; ' + ('prove file retention; ' if size == 0 else '') +
+                               'repeat setup changed=0; verify-swap (' + str(size) + ' MiB).')
+        actions.append('Two reboots total; final 512 MiB; final administrator/VM proofs; any error STOP without reset/retry.')
+        with e2e_execution_plan(operations, actions, self.execution_snapshot):
+            self.prepare_swap_inventories()
+            for index, size in enumerate((512, 1024, 0, 512)):
+                self.cli('setup-swap', swap_size=size)
+                self.cli('verify-swap', swap_size=size)
+                self.cli('setup-swap', unchanged=True, swap_size=size)
+                self.cli('verify-swap', swap_size=size)
+                if size == 0:
+                    self.swap_file_retained()
+                # Reboot the disabled state and the final re-enabled state only.
+                if index in (2, 3):
+                    before = self.independent()
+                    self.cli('reboot-host', swap_size=size)
+                    self.cli('verify-swap', swap_size=size)
+                    if size == 0:
+                        self.swap_file_retained()
+                    require(before != self.independent(), 'SWAP reboot boot ID unchanged; STOP.')
+                    self.cli('setup-swap', unchanged=True, swap_size=size)
+                    self.cli('verify-swap', swap_size=size)
+            self.standalone_ready()
+        print('Standalone SWAP E2E passed; final desired size is 512 MiB.')
 
     def swap_file_retained(self):
         self.ready(running=True)
@@ -1016,6 +1288,8 @@ class Stand:
             self.cli('init-server', 'verify')
             after = self.independent()
             require(before != after, 'Reboot did not produce a new independently observed boot ID; STOP.')
+            self.cli('setup-swap', unchanged=True)
+            self.cli('verify-swap')
             # Targeted transitions keep the native SWAP preflight/postflight.
             for size in (1024, 0, 512):
                 self.cli('setup-swap', swap_size=size)
@@ -1030,6 +1304,8 @@ class Stand:
                     self.cli('verify-swap', swap_size=size)
                     self.swap_file_retained()
                     require(before != self.independent(), 'SWAP reboot boot ID unchanged; STOP.')
+                    self.cli('setup-swap', unchanged=True, swap_size=size)
+                    self.cli('verify-swap', swap_size=size)
             print('E2E passed: installation/verification/repeat changed=0/reboot and swap resize/disable/retention.')
 
 
@@ -1056,7 +1332,12 @@ def configure_child():
             and sys.argv[4:] == ['--key', ''] and
             sys.argv[1] in ('init-server', 'reboot-host', 'setup-swap', 'verify-swap', *USER_MODES)),
             'Foreign E2E CLI arguments forbidden.')
-    user_operation = sys.argv[1] in USER_MODES
+    # A full-scenario grant must keep its fixed admin identity. Never downgrade
+    # a substituted granted generation into an unplanned local key operation.
+    user_operation = sys.argv[1] in USER_MODES or (
+        local and ('PORTFOLIO_E2E_PLAN_FD' not in os.environ or
+                   os.environ.get('PORTFOLIO_E2E_PLAN_KIND') == 'execution') and
+        os.environ.get('HUMAN_USER') != 'e2e_admin')
     require(not user_operation or selected_inventory == stand.inventory, 'User commands require the base E2E inventory.')
     env = stand.child_env(os.environ if user_operation else None)
     env['INVENTORY'] = str(selected_inventory)
@@ -1075,7 +1356,7 @@ def configure_child():
     require(not any(name.startswith(('HUMAN_', 'RECOVERY_')) and name not in env for name in os.environ),
             'Foreign E2E policy input forbidden.')
     require('INIT_FROM' in os.environ, 'Missing E2E frontier input; STOP.')
-    for name in ('INIT_FROM', 'PORTFOLIO_E2E_PLAN_FD') if not user_operation else ():
+    for name in ('INIT_FROM', 'PORTFOLIO_E2E_PLAN_FD', 'PORTFOLIO_E2E_PLAN_KIND'):
         if name in os.environ:
             env[name] = os.environ[name]
     # Native Ansible and local-key children must not inherit arbitrary injected
@@ -1123,7 +1404,7 @@ def main():
         phase = 'fixture lock'
         with stand_lock(stand.root):
             phase = args.mode
-            result = stand.user_command(args.mode) if args.mode in USER_MODES else getattr(stand, args.mode)()
+            result = stand.user_command(args.mode) if args.mode in USER_MODES else getattr(stand, args.mode.replace('-', '_'))()
         if result is e2e_host.PreparationResult.REBOOT_REQUIRED:
             e2e_host.offer_reboot()
         return 0

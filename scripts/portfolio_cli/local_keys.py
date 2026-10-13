@@ -99,11 +99,15 @@ def local_key(mode):
             try:
                 load_agent_key(key, public, planned=True)
             except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+                if os.environ.get('PORTFOLIO_E2E_ROOT'):
+                    raise
                 print('Key preserved; agent loading failed. ' + str(error), file=sys.stderr)
         elif policy == 'yes':
             try:
                 load_agent_key(key, public)
             except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+                if os.environ.get('PORTFOLIO_E2E_ROOT'):
+                    raise
                 print('Key preserved; agent loading failed. ' + str(error), file=sys.stderr)
         else:
             print('Agent loading skipped. Use make load-user-key when ready.')
