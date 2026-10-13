@@ -1,6 +1,13 @@
 # Portfolio Server Infrastructure
 
-[English](README.md) · [Русский](README.ru.md)
+**English** | [Русский](README.ru.md)
+
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Ansible Core 2.18.6](https://img.shields.io/badge/Ansible_Core-2.18.6-EE0000?logo=ansible&logoColor=white)](https://docs.ansible.com/ansible-core/2.18/)
+[![Docker Engine](https://img.shields.io/badge/Docker-Engine-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/engine/)
+[![Ubuntu Server](https://img.shields.io/badge/Ubuntu-Server-E95420?logo=ubuntu&logoColor=white)](https://ubuntu.com/server)
+[![Offline Ansible validation](https://github.com/DanilFaritovich/portfolio-server-infrastructure/actions/workflows/ci.yml/badge.svg)](https://github.com/DanilFaritovich/portfolio-server-infrastructure/actions/workflows/ci.yml)
+[![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Portfolio Server Infrastructure prepares an Ubuntu VPS for a personal portfolio or other self-hosted applications. An interactive CLI runs Ansible stages, verifies access between changes and leaves you with a Docker-ready server, a host firewall, separate administrator access and a bounded system maintenance policy.
 
@@ -15,6 +22,21 @@ It is intended for operators who can review SSH and sudo permissions and recover
 - **User management:** separate human keys, explicit sudo policies, account/key inspection, additive key registration, exact key revocation and guarded account removal.
 - **System maintenance:** Ubuntu security-origin unattended updates, bounded journald retention and stock maintenance timers, without automatic reboot or package removal.
 - **Failure handling:** strict host trust, default-deny confirmations, unchanged-state checks, locks and pending activation evidence. Failures stop later stages; retained administrator/console access supports deliberate recovery.
+
+## Technology stack
+
+| Technology | Role in this project |
+| --- | --- |
+| Python 3.12 | Project-managed controller runtime for the CLI, validation and local VM lifecycle; the server uses its own `/usr/bin/python3` |
+| Ansible Core 2.18.6 · `ansible.posix` 2.0.0 | Separate provisioning roles and verification playbooks for each server stage |
+| OpenSSH · Paramiko 5.0.0 | Key-only managed access and independent proofs; pinned password-only bootstrap and signed host-trust probes |
+| Docker Engine · Compose · Buildx | Official server packages, bounded container logging and runtime smoke verification; versions come from the Docker APT repository |
+| Ubuntu · systemd · UFW | Target OS, SSH service/socket activation, host firewall, journald and security-update timers |
+| uv 0.12.23 · Make | Checksum-verified local toolchain installation and a common command interface |
+| ansible-lint 25.5.0 · yamllint 1.38.0 · actionlint 1.7.7 · unittest | Offline configuration, workflow and controller regression checks |
+| KVM/QEMU · libvirt · cloud-init | Optional isolated local Ubuntu VM for operator-run integration scenarios |
+
+Controller/tool pins are defined in [requirements-dev.txt](requirements-dev.txt), [collections.yml](collections.yml) and [setup scripts](scripts/setup.sh). Server release limits and recorded platform results are listed under [compatibility](#compatibility); CI runs on Ubuntu 24.04.
 
 ## Architecture
 
@@ -32,7 +54,34 @@ flowchart TD
     H --> I[STOP: application deployment is separate]
 ```
 
+| Boundary | Responsibility |
+| --- | --- |
+| Local controller: `scripts/access.py` → `portfolio_cli` | Validate inputs, select identities, maintain host trust, confirm plans and serialize stage dispatch |
+| Managed VPS: `playbooks/` and `roles/` | Apply the selected stage through Ansible; server-side `library/` and `scripts/user_management.py` remain separate payloads |
+| Independent verification: SSH and streamed inspectors | Prove access and effective server state; read-only inspectors run over stdin without remote payload files |
+| Optional local VM: `scripts/e2e.py` → existing CLI | Own the isolated guest/NAT/snapshots and guard scenario dispatch; reuse provisioning and verification stages |
+
 See [ARCHITECTURE.md](ARCHITECTURE.md) for module responsibilities and security boundaries, and the [operator guide](docs/operator-guide.md) for individual stage procedures.
+
+## Key engineering decisions
+
+| Decision | Rationale and consequence |
+| --- | --- |
+| Separate changes from independent proofs | A successful Ansible recap alone cannot prove future login. Fresh key-only SSH/sudo and stage verifiers gate subsequent operations |
+| Keep authentication transitions explicit | Password bootstrap, managed automation and human administration use distinct access paths. Final SSH restrictions require proven independent administrator access and recovery confirmation |
+| Validate before activation | Full SSH candidates and effective listeners are checked before activation. Docker, Stage 3 SSH and journald pending markers preserve evidence when activation is incomplete |
+| Refuse unsafe drift rather than repair it | Preflights reject unmanaged or ambiguous state; ownership ledgers, snapshots and locks bound approved changes. Operators diagnose failures before explicitly continuing |
+| Install tooling locally | Pinned dependencies and checksum-verified installers avoid system Python/uv requirements and keep Make/Ansible subprocesses on the same toolchain |
+| Reuse the production workflow in isolated E2E | VM scenarios call existing initialization/reboot wrappers with native confirmations. Offline tests mock external commands; real VM and production acceptance remain separate operator checks |
+
+## Documentation and operating routes
+
+Start with [Quick Start](#quick-start) for a fresh VPS, then use the [command reference](#command-reference) for individual operations. Review [security and recovery](#security-limitations-and-recovery) before LIVE changes.
+
+- [Operator guide](docs/operator-guide.md): detailed stage contracts, inventory migration, key/trust transfer and recovery.
+- [Architecture](ARCHITECTURE.md): module responsibilities, dependencies and security boundaries.
+- [Local VM E2E guide](docs/local-vm-e2e.md): host preparation, console checks, snapshots and fixture lifecycle.
+- [Validation record](docs/validation.md): recorded offline and operator-reported results with evidence limits.
 
 ## System requirements
 
