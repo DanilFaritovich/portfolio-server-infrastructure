@@ -1,17 +1,19 @@
 # Git, Documentation, and Delivery Reference
 
-Read this reference when starting/continuing a task branch, preparing documentation, committing, pushing, or creating a Pull Request.
+Read this reference when starting/continuing a task branch, committing, or (only when explicitly requested) changing documentation, pushing, or creating a Pull Request.
 
 ## Branch setup
 
-Use the repository's configured development branch, normally `develop`.
+New task branches must start **only from `develop`**, never directly from `main`.
 
 Before editing:
 
-1. check current branch;
-2. check working tree;
-3. preserve unrelated user changes and untracked files;
-4. create or continue a dedicated task branch.
+1. Check current branch, working tree (including staged, unstaged and untracked changes), and local/remote `develop` availability.
+2. On an existing non-base task branch, **continue there**; do not create another branch or rebase it automatically.
+3. On `develop`, create a descriptive task branch from its current tip.
+4. On `main`, first resolve `develop`: switch to the existing local branch, or create a local tracking branch from `origin/develop` if only the remote branch exists. If neither exists, create **local `develop` from `main`**, then create the task branch **from `develop`**. Never branch directly from `main` and never push the new `develop` without an explicit request.
+5. Preserve unrelated changes; if checkout would overwrite work, stop and ask. Do not force-switch, stash, reset, rebase, or discard without authorization; do not silently update an existing branch.
+6. On detached HEAD, ambiguous/unrelated branch, or uncertain base identity, ask before modifying files.
 
 Typical prefixes:
 
@@ -25,7 +27,7 @@ Do not perform normal task development directly in `develop` or `main`.
 
 ## Documentation timing
 
-Update affected documentation only after implementation and required validation are stable.
+Update routine documentation **only if explicitly requested**, after implementation and validation are stable. Do not make README or other documentation changes during routine feature/fix cleanup. Exception: make a **minimal update to existing `ARCHITECTURE.md`** when the implemented work materially changes architecture, responsibilities, boundaries, dependencies, major data flows or deployment topology. Avoid unrelated rewrites and do not create the architecture file unless requested.
 
 Potential files include:
 
@@ -77,11 +79,13 @@ Never include:
 - unrelated untracked files;
 - accidental generated artifacts.
 
-Create the planned logical commits, then push only the task branch.
+Create the planned logical commits **locally and stop**. Do not push any branch, open/update a PR, or merge by default.
+
+Only explicit user authorization permits remote publication. A direct request to create a PR also authorizes the necessary task-branch push, but not merging.
 
 ## Push authentication failures
 
-If `git push` fails because authentication or credentials are unavailable:
+During explicitly authorized remote delivery only, if `git push` fails because authentication or credentials are unavailable:
 
 - do not retry the same push repeatedly;
 - do not automatically switch the remote between HTTPS and SSH;
@@ -95,13 +99,13 @@ After credentials are fixed by the developer or environment, retry the push once
 
 ## Pull Request and CI
 
-Normal flow:
+Default flow:
 
 ```text
-task branch -> develop
+task branch -> local commit -> STOP
 ```
 
-GitHub Actions performs the full independent CI validation.
+When explicitly requested, push/open a PR against the configured development branch (normally `develop`); GitHub Actions then performs independent CI. Do not create or update a PR just because local checks passed.
 
 If CI fails:
 
@@ -143,11 +147,14 @@ Codex must not automatically merge the Pull Request.
 Responsibility:
 
 ```text
-Codex:
-analyze -> implement -> validate -> document -> commit -> push -> PR -> CI
+Codex by default:
+analyze -> implement -> validate -> local commit -> STOP
+
+Codex only on explicit request:
+push / Pull Request / CI inspection
 
 Developer:
-review -> merge
+review -> merge (unless separately authorized)
 ```
 
 Merge only when the user explicitly requests that separate action.
@@ -161,9 +168,9 @@ Include:
 - what changed;
 - tests/checks performed;
 - whether extended verification was needed;
-- documentation changes;
-- branch/commit;
-- push/PR/CI status;
+- requested documentation changes (or confirmation none);
+- branch/local commit;
+- push/PR/CI status, including steps intentionally left to the developer;
 - remaining limitations.
 
 Do not include long successful logs or a chronological list of tool calls.

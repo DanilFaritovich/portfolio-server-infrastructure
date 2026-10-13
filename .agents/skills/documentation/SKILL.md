@@ -1,30 +1,36 @@
 ---
 name: documentation
-description: Project documentation conventions for English and Russian README files, component documentation, AGENTS.md, ARCHITECTURE.md, code comments, and updating docs only after implementation stabilizes.
+description: Documentation conventions with opt-in README and docs updates, plus a narrow automatic update to an existing ARCHITECTURE.md for material architecture changes.
 ---
 
 # Documentation Standard
 
 Documentation should describe the final, working state of the project.
 
+**Default: do not create, edit, regenerate, or synchronize documentation unless explicitly requested.** This includes README files, `docs/`, `AGENTS.md`, API docs, changelogs, examples and documentation-only docstring rewrites. Feature/fix work, successful tests and planned commits do not implicitly authorize such edits.
+
+**Narrow exception:** when the actual implementation materially changes the system architecture, update the relevant sections of an **existing `ARCHITECTURE.md`** automatically so future Codex work follows the true structure. This does not authorize creating that file if absent or modifying any other documentation.
+
+An explicit request to write/update documentation or install/update project-local standards/instructions authorizes only the relevant documentation scope. Keep necessary code comments accurate during code changes without broad unsolicited documentation rewrites.
+
 Do not continuously rewrite documentation while implementation is still changing.
 
 ## Documentation timing
 
-Update documentation after:
+For an **explicitly requested** documentation task, or an existing `ARCHITECTURE.md` update triggered by a material architecture change, update documentation after:
 
-1. implementation is complete;
+1. implementation is complete (if any);
 2. required tests are added or updated;
 3. targeted checks pass;
 4. the standard project check passes;
 5. extended verification is complete when required;
 6. the final implementation is stable.
 
-Then synchronize the affected documentation before commit/push/PR.
+Before local commit, synchronize only the requested documentation or the minimal warranted `ARCHITECTURE.md` changes. Push/PR require separate explicit approval.
 
 ## Supported README languages
 
-During project initialization, determine the desired README language mode:
+When README creation is explicitly requested during project initialization, determine the desired language mode:
 
 - English only;
 - Russian only;
@@ -119,7 +125,7 @@ It should contain:
 - project-specific rules;
 - references to deeper documentation/skills.
 
-Update it when project structure, important commands, or development rules change.
+Update it only when the user explicitly requests changes to project instructions (including requested standards installation or synchronization).
 
 Do not force the agent to read every documentation file before every task.
 
@@ -137,7 +143,14 @@ Use `ARCHITECTURE.md` for deeper architecture documentation:
 - architectural decisions;
 - important invariants and constraints.
 
-Update it when architecture changes, not after every implementation detail.
+Update an **existing** `ARCHITECTURE.md` automatically when implementation materially changes one or more of:
+
+- module/component responsibilities or architectural boundaries;
+- dependency direction, interfaces or integration contracts;
+- major data/control flows or persistence architecture;
+- infrastructure/deployment topology or key architectural invariants.
+
+Keep changes small and grounded in the final implementation. Do not update it for ordinary bug fixes, minor refactoring, formatting, or renames that do not change the architecture. If the file is absent, do not generate it without an explicit request. This exception never authorizes README, `docs/`, or `AGENTS.md` edits.
 
 ## Code documentation
 
@@ -181,7 +194,7 @@ Commands shown in README should be real commands from the repository.
 
 ## Documentation review
 
-Before a Pull Request:
+For explicitly requested documentation, before the local commit or an authorized Pull Request:
 
 - verify links;
 - verify commands;
