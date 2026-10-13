@@ -285,11 +285,11 @@ make e2e-test-users
 make e2e-test-swap
 ```
 
-`e2e-test-users` exercises separate disposable accounts for `admin`, `none` and `restricted` sudo. It checks exact managed account lists, groups, key ownership, safe allowed/forbidden sudo operations, SSH denial before key registration and after revocation/removal, and repeat operations without state changes. After removal, `getent`, `list-users` and home-file hashes independently prove account absence and file retention. Access for `ansible`/`e2e_admin` is checked again after all operations; new keys remain in fixture HOME and native prompts remain.
+`e2e-test-users` exercises separate disposable accounts for `admin`, `none` and `restricted` sudo. It checks exact managed account lists, groups, key ownership, safe allowed/forbidden sudo operations, SSH denial before key registration and after revocation/removal, and repeat operations without state changes. After removal, `getent`, `list-users` and home-file hashes independently prove account absence and file retention. Access for `ansible`/`e2e_admin` is checked again after all operations; new keys remain in fixture HOME and native SSH passphrase input remains.
 
 `e2e-test-swap` uses existing `setup-swap`/`verify-swap` for 512 → 1024 → 0 → 512 MiB, checks `changed=0` in every state and after both existing reboots, retains the 1024 MiB file while disabled, and verifies persistence across two reboots (disabled and re-enabled). Final desired size is 512 MiB; the base fixture inventory remains unchanged.
 
-Neither command bootstraps or runs `init-server`. They retain native safety checks, confirmations and recovery proofs, hold the fixture lock, and stop on errors without reset or automatic cleanup. See [standalone scenario details](docs/local-vm-e2e.md#standalone-tests-on-a-configured-vm).
+Neither command bootstraps or runs `init-server`. Each prints the full ordered execution plan (exact users, key paths, sudo policies, repeats or SWAP profiles and two reboots) and asks once: `Authorize this E2E execution plan? [y/N]`. Decline or EOF changes nothing. Approval covers only this invocation and owned VM; child grants bind exact operations/inputs and generated public identities. They retain native safety checks and fresh recovery proofs, hold the fixture lock, and stop on errors without reset or automatic cleanup. See [standalone scenario details](docs/local-vm-e2e.md#standalone-tests-on-a-configured-vm).
 
 In the running guest, follow the [operator guide](docs/operator-guide.md#exercise-users-and-keys) to create a user, verify both keys, revoke the extra key and remove the account. Keep console access and a separate recovery administrator. Wrappers neither start nor reset the VM; fixture deletion requires separate confirmation.
 

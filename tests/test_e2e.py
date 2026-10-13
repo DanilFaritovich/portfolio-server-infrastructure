@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from portfolio_cli import e2e
+from portfolio_cli import e2e, plans
 
 CONFIRM = e2e.confirm
 
@@ -81,6 +81,12 @@ class StandTests(unittest.TestCase):
         self.commands = patch.object(e2e, 'command', side_effect=self.command)
         self.commands.start()
         self.addCleanup(self.commands.stop)
+        self.plan_input = patch('builtins.input', return_value='y')
+        self.plan_input.start()
+        self.addCleanup(self.plan_input.stop)
+        self.plan_tty = patch.object(sys.stdin, 'isatty', return_value=True)
+        self.plan_tty.start()
+        self.addCleanup(self.plan_tty.stop)
         self.confirm = patch.object(e2e, 'confirm')
         self.confirm.start()
         self.addCleanup(self.confirm.stop)
@@ -532,6 +538,8 @@ class StandTests(unittest.TestCase):
                         ('b' if changed else 'a') * 64 + '  /home/' + name + '/.profile\n')
             return ''
 
+        if not self.stand.inventory.exists():
+            e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
         with patch.object(self.stand, 'standalone_ready') as readiness, \
                 patch.object(e2e.uuid, 'uuid4', side_effect=[SimpleNamespace(hex=name[6:]) for name in names]), \
                 patch('portfolio_cli.keys.public_fingerprint', side_effect=fingerprint), \
@@ -695,9 +703,10 @@ class StandTests(unittest.TestCase):
         self.assertFalse(self.mutations())
 
     def test_standalone_decline_never_dispatches_mutations(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
         for method in (self.stand.test_users, self.stand.test_swap):
             with self.subTest(method=method.__name__), patch.object(self.stand, 'standalone_ready'), \
-                    patch.object(e2e, 'confirm', side_effect=ValueError('declined')), \
+                    patch('builtins.input', return_value='n'), \
                     patch.object(self.stand, 'cli') as cli, patch.object(self.stand, 'fixture_ssh') as ssh:
                 with self.assertRaisesRegex(ValueError, 'declined'):
                     method()
@@ -1294,7 +1303,8 @@ class StandTests(unittest.TestCase):
                 for name, value in inputs.items():
                     self.assertEqual(os.environ[name], value)
                 self.assertNotIn('ANSIBLE_SSH_EXECUTABLE', os.environ)
-                self.assertNotIn('PORTFOLIO_E2E_PLAN_FD', os.environ)
+                if mode != 'generate-user-key':
+                    self.assertEqual(os.environ['PORTFOLIO_E2E_PLAN_FD'], '123')
                 self.assertIn(str(self.stand.root / 'home/.ssh/known_hosts'), e2e.common.SSH_BASE)
                 for name, value in (('HOME', '/production'), ('AUTOMATION_KEY', '/production/key'),
                                     ('HUMAN_UNKNOWN', 'unsafe'), ('RECOVERY_UNKNOWN', 'unsafe'),

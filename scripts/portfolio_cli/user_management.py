@@ -7,7 +7,7 @@ import re
 import sys
 
 from .ansible import prerequisites
-from .plans import plan_confirm
+from .plans import plan_confirm, planned_action
 from .common import SSH_BASE, require
 from .host_trust import known_host
 from .inspection import operations_probe, user_probe
@@ -95,11 +95,15 @@ def user_management(mode, inventory, override=None):
     elif mode == 'revoke-user-key':
         print('Fingerprint to revoke: ' + params['fingerprint'])
     print('LIVE / MUTATING: ' + mode + ' for ' + name + '. Keep provider console recovery available.', flush=True)
-    plan_confirm(['Remote sudo: ' + mode + ' for ' + name + '. ' +
-                  ('Revoke keys/sudo and run non-forced userdel; preserve files; require independent recovery access.'
-                   if mode == 'remove-user' else 'Change only the selected authorized key and its protected ownership ledger.')],
-                 validate=lambda: require(probe({'action': 'show-user', 'name': name})['token'] == before['token'],
-                                          'Account plan changed; STOP before mutation.'))
+    validate = lambda: require(probe({'action': 'show-user', 'name': name})['token'] == before['token'],
+                               'Account plan changed; STOP before mutation.')
+    if planned_action(mode):
+        validate()
+    else:
+        plan_confirm(['Remote sudo: ' + mode + ' for ' + name + '. ' +
+                      ('Revoke keys/sudo and run non-forced userdel; preserve files; require independent recovery access.'
+                       if mode == 'remove-user' else 'Change only the selected authorized key and its protected ownership ledger.')],
+                     validate=validate)
     result = probe(params | {'confirmed': True})
     # The remote engine verifies exact key/account results. Fresh controller proof
     # after mutation detects a lost automation route; failures never trigger retries.

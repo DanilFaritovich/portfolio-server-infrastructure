@@ -493,6 +493,30 @@ class WrapperTests(unittest.TestCase):
             access.user_management('remove-user', Path('/synthetic/inventory'))
         self.assertEqual(['managed-proof', 'inspect', 'inspect', 'recovery-proof', 'confirm', 'inspect', 'mutate', 'managed-proof'], self.events)
 
+    def test_planned_remove_keeps_recovery_and_fresh_snapshot_without_second_prompt(self):
+        with patch('builtins.input', side_effect=lambda *args: self.events.append('confirm') or 'yes') as consent:
+            with access.plan_scope(['remove-user'], lambda: 'exact synthetic child contract'):
+                access.user_management('remove-user', Path('/synthetic/inventory'))
+            consent.assert_called_once()
+        self.assertEqual(['confirm', 'managed-proof', 'inspect', 'inspect', 'recovery-proof',
+                          'inspect', 'mutate', 'managed-proof'], self.events)
+        self.assertIsNone(access.PLAN_SCOPE.get())
+
+    def test_planned_remove_still_stops_on_changed_server_snapshot(self):
+        original = self.probe
+        def changed(*args):
+            result = original(*args)
+            if self.events.count('inspect') == 3:
+                result['token'] = 'changed'
+            return result
+        with patch('builtins.input', return_value='y') as consent, patch.object(access, 'user_probe', side_effect=changed):
+            with access.plan_scope(['remove-user'], lambda: 'exact synthetic child contract'):
+                with self.assertRaisesRegex(ValueError, 'Account plan changed'):
+                    access.user_management('remove-user', Path('/synthetic/inventory'))
+            consent.assert_called_once()
+        self.assertIn('recovery-proof', self.events)
+        self.assertNotIn('mutate', self.events)
+
     def test_existing_user_import_skips_account_role_and_never_needs_import_private_key(self):
         with tempfile.TemporaryDirectory() as directory:
             public = Path(directory) / 'other-pc.pub'

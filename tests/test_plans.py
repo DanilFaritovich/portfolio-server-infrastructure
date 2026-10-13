@@ -173,7 +173,7 @@ def dispatch(args, selected):
               'init-server': ['bootstrap-user', 'docker-host', 'harden', 'add-user',
                               'secure-ssh', 'setup-operations'],
               'reboot-host': ['reboot-host']}
-    for stage in stages[args.mode]:
+    for stage in stages.get(args.mode, [args.mode]):
         assert plans.planned_action(stage)
     try:
         plans.planned_action('apply-apt-policy')
@@ -188,6 +188,10 @@ def dispatch(args, selected):
         pass
     else:
         raise AssertionError('grant accepted changed inputs')
+    if args.mode == 'generate-user-key' and os.environ['HUMAN_USER'] != 'e2e_admin':
+        public = Path(os.environ['HUMAN_KEY'] + '.pub')
+        public.parent.mkdir(parents=True, exist_ok=True)
+        public.write_text('synthetic planned public output')
     print('OFFLINE DISPATCH ' + args.mode)
     return 0
 sys.argv = sys.argv[1:]
@@ -205,11 +209,11 @@ with contextlib.ExitStack() as stack:
         self.modes = ['generate-user-key', 'bootstrap-user', 'docker-host', 'harden',
                       'add-user', 'secure-ssh', 'setup-operations', 'reboot-host']
 
-    def make_child(self, mode, *, target=None, overrides=None, change=None):
-        env = self.stand.child_env()
+    def make_child(self, mode, *, target=None, overrides=None, change=None, user_inputs=None):
+        env = self.stand.child_env(user_inputs)
         if mode == 'init-server':
             env['INIT_FROM'] = 'bootstrap'
-        with plans.plan_scope(self.modes, lambda: 'fixed'):
+        with contextlib.nullcontext() if plans.PLAN_SCOPE.get() else plans.plan_scope(self.modes, lambda: 'fixed'):
             with plans.e2e_plan_pipe(self.inventory, env, mode) as (child_env, descriptors):
                 expected_file = Path(self.temp) / 'expected-snapshot.json'
                 with patch.dict(os.environ, env, clear=True):
@@ -237,6 +241,20 @@ with contextlib.ExitStack() as stack:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn('OFFLINE DISPATCH ' + mode, result.stdout)
         self.answer.assert_called_once()
+
+    def test_real_make_user_mutations_receive_single_mode_scoped_grants(self):
+        modes = ['generate-user-key', 'add-user', 'add-user-key', 'revoke-user-key', 'remove-user']
+        inputs = {'HUMAN_USER': 'disposable', 'HUMAN_KEY': str(self.stand.root / 'home/.ssh/human/disposable'), 'HUMAN_SUDO': 'restricted',
+                  'HUMAN_SUDO_COMMANDS': '/usr/bin/id', 'RECOVERY_USER': 'e2e_admin',
+                  'KEY_FINGERPRINT': 'SHA256:synthetic'}
+        env = self.stand.child_env(inputs)
+        operations = [(mode, self.inventory, env) for mode in modes]
+        with plans.e2e_execution_plan(operations, ['exact offline user lifecycle'], lambda: 'fixed'):
+            for mode in modes:
+                result = self.make_child(mode, user_inputs=inputs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('OFFLINE DISPATCH ' + mode, result.stdout)
+        self.answer.assert_called_once_with('Authorize this E2E execution plan? [y/N] ')
 
     def test_real_make_rejects_substituted_operation_and_frontier(self):
         for mode in ('generate-user-key', 'init-server', 'reboot-host'):
@@ -275,6 +293,99 @@ with contextlib.ExitStack() as stack:
         result = self.make_child('init-server', change=lambda: self.inventory.write_text('changed inventory'))
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('OFFLINE DISPATCH', result.stdout)
+
+
+class ExactE2EPlanTests(unittest.TestCase):
+    setUp = PlanTests.setUp
+
+    def environment(self, **values):
+        return {'PORTFOLIO_E2E_ROOT': self.temp, 'INIT_FROM': '', 'HUMAN_USER': 'disposable',
+                'HUMAN_SUDO': 'admin', 'RECOVERY_USER': 'e2e_admin',
+                'RECOVERY_KEY': '/fixture/recovery', 'AGENT_LOAD': 'no'} | values
+
+    def invoke(self, mode, env):
+        with plans.e2e_plan_pipe(self.inventory, env, mode) as (child, descriptors):
+            self.assertEqual(len(descriptors), 1)
+            # Receiver consumes its own inherited copy, as a real child would.
+            child['PORTFOLIO_E2E_PLAN_FD'] = str(os.dup(descriptors[0]))
+            with patch.dict(os.environ, child, clear=True), plans.e2e_child_plan(self.inventory, mode):
+                self.assertTrue(plans.planned_action(mode))
+                with self.assertRaisesRegex(ValueError, 'outside'):
+                    plans.planned_action('apply-apt-policy')
+
+    def test_exact_sequence_prompts_once_and_authority_expires(self):
+        env = self.environment()
+        modes = ['add-user', 'add-user', 'add-user-key', 'revoke-user-key', 'remove-user', 'remove-user']
+        operations = [(mode, self.inventory, env) for mode in modes]
+        with plans.e2e_execution_plan(operations, ['exact synthetic lifecycle'], lambda: 'fixed'):
+            for mode in modes:
+                self.invoke(mode, env)
+            with self.assertRaisesRegex(ValueError, 'Additional'):
+                self.invoke('remove-user', env)
+        self.answer.assert_called_once_with('Authorize this E2E execution plan? [y/N] ')
+        self.assertIsNone(plans.E2E_EXECUTION.get())
+        self.assertFalse(plans.planned_action('remove-user'))
+
+    def test_decline_eof_and_interrupt_do_not_open_child_grant(self):
+        for response in ('n', EOFError(), KeyboardInterrupt()):
+            with self.subTest(response=response), patch('builtins.input', side_effect=[response]), \
+                    patch.object(plans.os, 'pipe') as pipe:
+                with self.assertRaisesRegex(ValueError, 'declined'):
+                    with plans.e2e_execution_plan([('remove-user', self.inventory, self.environment())],
+                                                  ['remove disposable'], lambda: 'fixed'):
+                        self.fail('declined plan dispatched')
+                pipe.assert_not_called()
+                self.assertIsNone(plans.E2E_EXECUTION.get())
+
+    def test_changed_user_policy_key_recovery_profile_and_order_stop(self):
+        env = self.environment(HUMAN_PUBLIC_KEY='/fixture/exact.pub')
+        changes = [{'HUMAN_USER': 'foreign'}, {'HUMAN_SUDO': 'none'},
+                   {'HUMAN_PUBLIC_KEY': '/foreign.pub'}, {'RECOVERY_USER': 'foreign'},
+                   {'RECOVERY_KEY': '/foreign'}, {'AGENT_LOAD': 'yes'}]
+        for change in changes:
+            with self.subTest(change=change), plans.e2e_execution_plan(
+                    [('add-user', self.inventory, env)], ['exact account/key/policy'], lambda: 'fixed'):
+                with self.assertRaisesRegex(ValueError, 'operation/inputs changed'), patch.object(plans.os, 'pipe') as pipe:
+                    self.invoke('add-user', env | change)
+                pipe.assert_not_called()
+        with plans.e2e_execution_plan([('setup-swap', self.inventory, env)], ['512 MiB'], lambda: 'fixed'):
+            with self.assertRaisesRegex(ValueError, 'operation/inputs changed'):
+                with plans.e2e_plan_pipe(Path(self.temp) / '1024-profile', env, 'setup-swap'):
+                    self.fail('profile substitution accepted')
+            with self.assertRaisesRegex(ValueError, 'operation/inputs changed'):
+                self.invoke('reboot-host', env)
+            with self.assertRaisesRegex(ValueError, 'Additional'):
+                self.invoke('connect-controller', env)
+
+    def test_generated_key_output_is_bound_to_following_registration_and_revocation(self):
+        private = Path(self.temp) / 'new-key'
+        public = Path(str(private) + '.pub')
+        generate = self.environment(HUMAN_KEY=str(private))
+        register = self.environment(HUMAN_PUBLIC_KEY=str(public))
+        revoke = self.environment(KEY_FINGERPRINT=lambda: 'SHA256:planned')
+        operations = [('generate-user-key', self.inventory, generate),
+                      ('add-user-key', self.inventory, register), ('revoke-user-key', self.inventory, revoke)]
+        with self.assertRaisesRegex(ValueError, 'identity changed'), \
+                plans.e2e_execution_plan(operations, ['generate/register/revoke exact new identity'], lambda: 'fixed'):
+            with plans.e2e_plan_pipe(self.inventory, generate, 'generate-user-key'):
+                public.write_text('synthetic PUBLIC identity')
+            self.invoke('add-user-key', register)
+            self.invoke('revoke-user-key', self.environment(KEY_FINGERPRINT='SHA256:planned'))
+            public.write_text('substituted PUBLIC identity')
+            plans.validate_current_plan()
+        self.answer.assert_called_once()
+
+    def test_fixture_state_and_child_policy_drift_stop_before_dispatch(self):
+        state = Path(self.temp) / 'state.json'
+        state.write_text('synthetic owned UUID')
+        env = self.environment()
+        with plans.e2e_execution_plan([('remove-user', self.inventory, env)], ['remove disposable'], lambda: 'fixed'):
+            with plans.e2e_plan_pipe(self.inventory, env, 'remove-user') as (child, descriptors):
+                child['PORTFOLIO_E2E_PLAN_FD'] = str(os.dup(descriptors[0]))
+                state.write_text('different VM UUID')
+                with patch.dict(os.environ, child, clear=True), self.assertRaisesRegex(ValueError, 'inputs changed'):
+                    with plans.e2e_child_plan(self.inventory, 'remove-user'):
+                        self.fail('foreign VM accepted')
 
 
 class OperationsPlanTests(unittest.TestCase):
