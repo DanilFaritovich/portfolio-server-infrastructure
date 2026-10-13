@@ -351,7 +351,9 @@ The scenario performs:
 - Existing `reboot-host`, explicitly included in the scenario plan, full final verification and
   independent probes again. Independently obtained boot IDs must differ.
 
-The SWAP scenario uses exact generated, private inventory profiles `inventory-swap-512.yml`, `inventory-swap-1024.yml` and `inventory-swap-0.yml`; the original fixture inventory remains unchanged, including legacy schema-1 fixtures. Initial `init-server` creates/activates 512 MiB. Further real `init-server INIT_FROM=swap` calls resize to 1024 MiB, disable with zero while independently proving the 1024 MiB file remains, and re-enable 512 MiB. Each state repeats provisioning with `changed=0`, reboots through the existing wrapper, verifies the full pipeline and proves a changed boot ID; disabled-file retention is checked again after reboot. Profile drift fails before dispatch. The plan explicitly lists these transitions and reboots.
+The full scenario uses exact private profiles `inventory-swap-512.yml`, `inventory-swap-1024.yml` and `inventory-swap-0.yml`; the base fixture inventory remains unchanged, including schema-1 fixtures. Initial `init-server` creates/activates 512 MiB, verifies all stages and repeats convergence. After the first reboot and full verification, targeted `setup-swap`/`verify-swap` calls resize to 1024 MiB, disable with zero and re-enable 512 MiB; every state repeats with `changed=0`. The second reboot occurs while disabled: a new boot ID, disabled SWAP and retention of the 1024 MiB file are proven before re-enabling. There are **two reboots total**, rather than one for every SWAP state. Profile drift blocks dispatch; the plan lists the transitions and both reboots.
+
+The operator reports successful full E2E validation on a separate Ubuntu VM with nested virtualization. This is an operator-reported full-scenario result; the new standalone commands in this change were validated offline without running a VM scenario or connecting to a VPS.
 
 Failures stop immediately, retain guest/local state and never reset/retry.
 There is no automatic success report after a partial test. Sanitized native init
@@ -363,6 +365,24 @@ For the separate user/key lifecycle checks on a running, provisioned fixture,
 see [Exercise users and keys](operator-guide.md#exercise-users-and-keys). Those
 wrappers retain their own confirmations and independent recovery proofs; the
 scenario plan does not authorize them.
+
+## Standalone tests on a configured VM
+
+These are independent interactive commands, outside `make check`/CI. Use an already initialized, running fixture with final SSH policy, Docker and server operations configured, trusted host identity, and working key-only SSH/sudo for `ansible` and `e2e_admin`. Keep guest console recovery. Neither command starts the VM, repeats Bootstrap or runs full `init-server`; neither uses the full scenario's consent grants. Each prints its own default-deny preliminary plan, followed by the existing commands' native confirmations. Caller inventory, human account/key and recovery overrides do not select scenario targets.
+
+```bash
+make e2e-test-users
+# Independently, on the same configured fixture:
+make e2e-test-swap
+```
+
+`e2e-test-users` selects a fresh random `e2e_t_<12 hex digits>` username and three dedicated key paths under the fixture's `home/.ssh/human/`. It proves the account, home and management/removal records are absent before generation; it never adopts a same-name account. `generate-user-key` retains native passphrase and optional loading into the invoking shell's existing agent. Load encrypted identities there when needed; unrelated agent keys remain ineligible.
+
+The existing Make commands perform the lifecycle: `add-user` creates the account with one initial key, primary group only and unrestricted NOPASSWD admin sudo; `verify-user`, `show-user` and `list-user-keys` prove login, groups, effective sudo and exact ledger ownership. Two `add-user-key` calls each get an independent access verification. `revoke-user-key` revokes the first added key using fresh `e2e_admin` recovery proof. Only an exact SSH public-key authentication denial counts as revoked access; network, trust and protocol failures stop. The second added key and initial key must still pass verification. `remove-user` uses its own recovery proof/confirmation; `show-user` proves the removal receipt and all three keys must fail authentication. Fresh checks confirm retained `ansible` and `e2e_admin` access.
+
+`e2e-test-swap` uses the same exact generated profiles and existing `setup-swap`/`verify-swap` commands for 512 → 1024 → 0 → 512 MiB. The first step creates or converges owned SWAP according to its existing state. Every state repeats setup with `changed=0` evidence and independent verification. Zero disables SWAP without deleting the 1024 MiB file. Existing `reboot-host` runs twice, while disabled and after final re-enabling; each reboot must change the independently observed boot ID and pass `verify-swap`. File retention is checked before and after the disabled reboot. Final desired size is 512 MiB, with the base inventory unchanged; runtime verification may run Docker's existing disposable smoke test.
+
+The fixture lock covers the whole invocation; every child revalidates VM ownership, DHCP/bridge route, exact inventory and isolated trust. Native preflight, pending-state blockers and destructive recovery checks remain. Any failure stops immediately without retry, reset or cleanup. Keys, preserved user home and removal receipts remain for diagnosis; a later explicit invocation uses a new username and does not resume a partial lifecycle. Inspect the console/state and diagnose before another run. Do not clear receipts or pending markers. Fixture reset/deletion remain separate confirmed operations.
 
 ## SSH socket diagnosis (read-only)
 

@@ -390,6 +390,229 @@ class StandTests(unittest.TestCase):
         self.assertNotIn('/production', json.dumps(env))
         self.assertEqual(env['HOME'], str(self.stand.root / 'home'))
 
+    def test_standalone_readiness_requires_configured_vm_and_both_admins(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        with patch.object(e2e.sys.stdin, 'isatty', return_value=True), \
+                patch.object(self.stand, 'independent') as independent, patch.object(self.stand, 'cli') as cli:
+            self.stand.standalone_ready()
+            independent.assert_called_once()
+            self.assertEqual(cli.call_args.args, ('verify-user',))
+            self.assertEqual(cli.call_args.kwargs['user_inputs']['HUMAN_USER'], 'e2e_admin')
+            with patch.object(e2e.sys.stdin, 'isatty', return_value=False), self.assertRaises(ValueError):
+                self.stand.standalone_ready()
+            cli.reset_mock()
+            self.domain.find('uuid').text = 'foreign'
+            with self.assertRaises(ValueError):
+                self.stand.standalone_ready()
+            cli.assert_not_called()
+
+    def test_standalone_swap_transitions_and_two_persistence_proofs(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        with patch.object(self.stand, 'standalone_ready') as readiness, \
+                patch.object(self.stand, 'cli') as cli, \
+                patch.object(self.stand, 'swap_file_retained') as retained, \
+                patch.object(self.stand, 'independent', side_effect=['a', 'b', 'c', 'd']):
+            self.stand.test_swap()
+        self.assertEqual(readiness.call_count, 2)
+        self.assertEqual(retained.call_count, 2)
+        expected = []
+        for index, size in enumerate((512, 1024, 0, 512)):
+            expected.extend([(('setup-swap',), dict(swap_size=size)),
+                             (('verify-swap',), dict(swap_size=size)),
+                             (('setup-swap',), dict(unchanged=True, swap_size=size)),
+                             (('verify-swap',), dict(swap_size=size))])
+            if index in (2, 3):
+                expected.extend([(('reboot-host',), dict(swap_size=size)),
+                                 (('verify-swap',), dict(swap_size=size))])
+        self.assertEqual([(c.args, c.kwargs) for c in cli.call_args_list], expected)
+        self.assertFalse(self.mutations())
+
+    def test_standalone_swap_stops_at_every_failed_step_without_reset(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        for failure in range(20):
+            calls = []
+
+            def dispatch(*args, **kwargs):
+                calls.append((args, kwargs))
+                if len(calls) == failure + 1:
+                    raise e2e.E2EError('synthetic failure')
+
+            with self.subTest(step=failure), patch.object(self.stand, 'standalone_ready'), \
+                    patch.object(self.stand, 'cli', side_effect=dispatch), \
+                    patch.object(self.stand, 'swap_file_retained'), \
+                    patch.object(self.stand, 'independent', side_effect=['a', 'b', 'c', 'd']):
+                with self.assertRaisesRegex(ValueError, 'synthetic failure'):
+                    self.stand.test_swap()
+            self.assertEqual(len(calls), failure + 1)
+            self.assertFalse(self.mutations())
+
+    def test_standalone_swap_unchanged_boot_id_stops_before_reenable(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        with patch.object(self.stand, 'standalone_ready'), patch.object(self.stand, 'cli') as cli, \
+                patch.object(self.stand, 'swap_file_retained'), \
+                patch.object(self.stand, 'independent', return_value='same'):
+            with self.assertRaisesRegex(ValueError, 'boot ID unchanged'):
+                self.stand.test_swap()
+        self.assertEqual(cli.call_args.args, ('verify-swap',))
+        self.assertEqual(cli.call_args.kwargs['swap_size'], 0)
+        self.assertFalse(self.mutations())
+
+    def user_scenario(self, *, failure=None, bad_inspection=False, ssh_failure=None):
+        calls, fingerprints = [], ['SHA256:' + letter * 43 for letter in 'abc']
+        active, removed = [], False
+        name = 'e2e_t_123456789abc'
+
+        def dispatch(mode, **kwargs):
+            nonlocal removed
+            inputs = kwargs['user_inputs']
+            calls.append((mode, inputs, kwargs.get('capture', False)))
+            if failure is not None and len(calls) == failure + 1:
+                raise e2e.E2EError('synthetic failure')
+            if mode == 'add-user':
+                active.append(fingerprints[0])
+            elif mode == 'add-user-key':
+                active.append(fingerprints[len(active)])
+            elif mode == 'revoke-user-key':
+                active.remove(inputs['KEY_FINGERPRINT'])
+            elif mode == 'remove-user':
+                removed = True
+            elif mode in ('show-user', 'list-user-keys'):
+                return json.dumps({'name': name, 'removed': True} if removed else {
+                    'name': name, 'sudo': 'none' if bad_inspection else 'admin', 'groups': [], 'commands': ['ALL'],
+                    'keys': [{'fingerprint': digest, 'managed': True} for digest in active]})
+
+        ssh_steps = []
+
+        def probe(*args, **kwargs):
+            ssh_steps.append(args)
+            if ssh_failure is not None and len(ssh_steps) == ssh_failure + 1:
+                raise e2e.E2EError('synthetic SSH failure')
+
+        with patch.object(self.stand, 'standalone_ready') as readiness, \
+                patch.object(e2e.uuid, 'uuid4', return_value=SimpleNamespace(hex='123456789abcdef0')), \
+                patch('portfolio_cli.keys.public_fingerprint', side_effect=fingerprints), \
+                patch.object(self.stand, 'fixture_ssh', side_effect=probe) as ssh, patch.object(self.stand, 'cli', side_effect=dispatch):
+            if failure is not None or bad_inspection or ssh_failure is not None:
+                with self.assertRaises(ValueError):
+                    self.stand.test_users()
+                self.assertEqual(readiness.call_count, 1)
+            else:
+                self.stand.test_users()
+                self.assertEqual(readiness.call_count, 2)
+        return calls, ssh
+
+    def test_standalone_users_owned_lifecycle_recovery_and_negative_access(self):
+        calls, ssh = self.user_scenario()
+        modes = [row[0] for row in calls]
+        self.assertEqual(modes[:4], ['generate-user-key'] * 3 + ['add-user'])
+        self.assertEqual(modes.count('add-user-key'), 2)
+        self.assertEqual(modes.count('verify-user'), 5)
+        self.assertEqual(modes.count('remove-user'), 1)
+        for mode, inputs, capture in calls:
+            self.assertEqual(inputs['HUMAN_USER'], 'e2e_t_123456789abc')
+            self.assertEqual(inputs['HUMAN_SUDO'], 'admin')
+            self.assertEqual(inputs['RECOVERY_USER'], 'e2e_admin')
+            self.assertEqual(inputs['RECOVERY_KEY'], str(self.stand.root / 'home/.ssh/human/admin_ed25519'))
+            if 'HUMAN_KEY' in inputs:
+                self.assertTrue(Path(inputs['HUMAN_KEY']).is_relative_to(self.stand.root / 'home/.ssh/human'))
+            self.assertEqual(capture, mode in ('show-user', 'list-user-keys'))
+        denials = [c for c in ssh.call_args_list if c.kwargs.get('denied')]
+        self.assertEqual(len(denials), 4)
+        self.assertTrue(str(denials[0].args[1]).endswith('_1'))
+        self.assertTrue(all(c.args[0] == 'e2e_t_123456789abc' for c in denials))
+        self.assertIn('test $? = 2', ssh.call_args_list[0].args[2])
+        self.assertFalse(self.mutations())
+
+    def test_standalone_users_failures_do_not_continue_or_reset(self):
+        calls, _ = self.user_scenario()
+        for index in range(len(calls)):
+            with self.subTest(step=index):
+                stopped, _ = self.user_scenario(failure=index)
+                self.assertEqual(len(stopped), index + 1)
+        stopped, _ = self.user_scenario(bad_inspection=True)
+        self.assertEqual(stopped[-1][0], 'show-user')
+        self.assertFalse(self.mutations())
+
+    def test_standalone_users_probe_failures_never_remove_or_report_success(self):
+        stopped, ssh = self.user_scenario(ssh_failure=0)
+        self.assertEqual(stopped, [])
+        self.assertEqual(ssh.call_count, 1)
+        stopped, ssh = self.user_scenario(ssh_failure=1)
+        self.assertNotIn('remove-user', [call[0] for call in stopped])
+        self.assertEqual(ssh.call_count, 2)
+        for index in (2, 3, 4):
+            stopped, ssh = self.user_scenario(ssh_failure=index)
+            self.assertEqual(ssh.call_count, index + 1)
+        self.assertFalse(self.mutations())
+
+    def test_standalone_decline_never_dispatches_mutations(self):
+        for method in (self.stand.test_users, self.stand.test_swap):
+            with self.subTest(method=method.__name__), patch.object(self.stand, 'standalone_ready'), \
+                    patch.object(e2e, 'confirm', side_effect=ValueError('declined')), \
+                    patch.object(self.stand, 'cli') as cli, patch.object(self.stand, 'fixture_ssh') as ssh:
+                with self.assertRaisesRegex(ValueError, 'declined'):
+                    method()
+                cli.assert_not_called()
+                ssh.assert_not_called()
+        self.assertFalse(self.mutations())
+
+    def test_fixture_authentication_denial_rejects_network_trust_and_protocol_errors(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        denied = 'alice@' + self.stand.ip + ': Permission denied (publickey).\n'
+        cases = [(255, '', denied, True), (0, '', '', False), (255, '', 'Connection refused', False),
+                 (255, '', 'Host key verification failed.', False), (255, '', denied + 'unexpected', False),
+                 (255, 'unexpected', denied, False), (1, '', denied, False)]
+        for code, stdout, stderr, allowed in cases:
+            with self.subTest(code=code, stderr=stderr), \
+                    patch('portfolio_cli.ssh.interactive_ssh_command', return_value=['ssh', '-t', 'synthetic']) as transport, \
+                    patch.object(e2e.subprocess, 'run', return_value=SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)) as run:
+                previous = os.environ.get('HOME')
+                if allowed:
+                    self.stand.fixture_ssh('alice', self.base / 'selected', 'true', denied=True)
+                else:
+                    with self.assertRaisesRegex(ValueError, 'authentication denial'):
+                        self.stand.fixture_ssh('alice', self.base / 'selected', 'true', denied=True)
+                self.assertEqual(os.environ.get('HOME'), previous)
+                self.assertEqual(transport.call_args.args, (self.stand.ip, 22, 'alice', self.base / 'selected'))
+                self.assertEqual(run.call_args.kwargs['env']['HOME'], str(self.stand.root / 'home'))
+                self.assertEqual(run.call_args.kwargs['env']['LC_ALL'], 'C')
+
+    def test_standalone_user_cli_uses_make_without_consent_grant_or_production_inputs(self):
+        e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
+        with patch.dict(os.environ, INVENTORY='/production', HUMAN_USER='foreign', PORTFOLIO_E2E_PLAN_FD='999'), \
+                patch.object(e2e, 'command', side_effect=self.command) as run:
+            self.stand.cli('add-user', user_inputs={'HUMAN_USER': 'e2e_t_new', 'HUMAN_SUDO': 'admin'})
+        self.assertEqual(run.call_args.args[0], ['make', '--no-print-directory', 'add-user'])
+        env = run.call_args.kwargs['env']
+        self.assertEqual(env['INVENTORY'], str(self.stand.inventory))
+        self.assertEqual(env['HUMAN_USER'], 'e2e_t_new')
+        self.assertNotIn('PORTFOLIO_E2E_PLAN_FD', env)
+        self.assertNotIn('/production', json.dumps(env))
+
+    def test_standalone_entrypoints_hold_lock_and_report_stop(self):
+        for mode in ('test-users', 'test-swap'):
+            events = []
+
+            @contextlib.contextmanager
+            def lock(root):
+                events.append('lock')
+                yield
+                events.append('unlock')
+
+            with self.subTest(mode=mode), patch.object(e2e, 'Stand', return_value=self.stand), \
+                    patch.object(e2e, 'stand_lock', side_effect=lock), patch.object(os, 'getuid', return_value=1000), \
+                    patch.object(os, 'umask'), patch.dict(os.environ, E2E_INVENTORY=''), \
+                    patch.object(sys, 'argv', ['e2e.py', mode]), \
+                    patch.object(self.stand, mode.replace('-', '_'), side_effect=lambda: events.append(mode)) as scenario:
+                self.assertEqual(e2e.main(), 0)
+                self.assertEqual(events, ['lock', mode, 'unlock'])
+                scenario.side_effect = e2e.E2EError('synthetic failure')
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(e2e.main(), 1)
+                self.assertIn('E2E STOP (' + mode + ')', stderr.getvalue())
+                self.assertIn('No automatic reset/retry', stderr.getvalue())
+                self.assertFalse(self.mutations())
+
     def test_user_commands_forward_only_explicit_inputs_without_plan_grants(self):
         e2e.write_new(self.stand.inventory, yaml.safe_dump(self.stand.expected_inventory()))
         inputs = dict(HUMAN_USER='alice', HUMAN_SUDO='restricted', HUMAN_GROUPS='readers',
@@ -903,10 +1126,14 @@ class StandTests(unittest.TestCase):
         inputs = dict(HUMAN_USER='alice', HUMAN_KEY=str(self.base / 'alice'),
                       HUMAN_PUBLIC_KEY=str(self.base / 'alice.pub'), RECOVERY_USER='bob',
                       RECOVERY_KEY=str(self.base / 'bob'), HUMAN_GROUPS_APPROVED='readers')
-        for mode in e2e.USER_MODES:
+        for mode in (*e2e.USER_MODES, 'generate-user-key'):
             env = self.stand.child_env(inputs)
-            env.update(ANSIBLE_SSH_EXECUTABLE='/foreign', PORTFOLIO_E2E_PLAN_FD='123')
-            argv = ['access.py', mode, '--inventory', str(self.stand.inventory), '--key', '']
+            env.update(ANSIBLE_SSH_EXECUTABLE='/foreign')
+            if mode != 'generate-user-key':
+                env['PORTFOLIO_E2E_PLAN_FD'] = '123'
+            argv = ['access.py', mode, '--inventory', str(self.stand.inventory)]
+            if mode != 'generate-user-key':
+                argv += ['--key', '']
             with self.subTest(mode=mode), patch.object(e2e, 'Stand', return_value=self.stand), \
                     patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.base))), \
                     patch.object(e2e.common, 'SSH_BASE', e2e.common.SSH_BASE), \
@@ -961,7 +1188,7 @@ class StandTests(unittest.TestCase):
                           'from pathlib import Path\n'
                           'Path(os.environ["RECORD"]).write_text(json.dumps([sys.argv[1:], dict(os.environ)]))\n')
         binary.chmod(0o700)
-        for mode in e2e.USER_MODES:
+        for mode in (*e2e.USER_MODES, 'test-users', 'test-swap'):
             with self.subTest(mode=mode):
                 result = subprocess.run(['make', '--no-print-directory', 'e2e-' + mode,
                                          'HUMAN_USER=alice; touch SHOULD_NOT_EXIST', 'HUMAN_GROUPS_APPROVED=readers',

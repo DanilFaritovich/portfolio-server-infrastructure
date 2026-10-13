@@ -39,7 +39,7 @@ USER_INPUTS = ('HUMAN_USER', 'HUMAN_SUDO', 'HUMAN_GROUPS', 'HUMAN_GROUPS_APPROVE
                'HUMAN_SUDO_COMMANDS', 'HUMAN_KEY', 'HUMAN_PUBLIC_KEY',
                'RECOVERY_USER', 'RECOVERY_KEY', 'KEY_NAME', 'KEY_FINGERPRINT', 'AGENT_LOAD')
 USER_KEY_INPUTS = ('HUMAN_KEY', 'HUMAN_PUBLIC_KEY', 'RECOVERY_KEY')
-MODES = ('prepare', 'status', 'test', 'reset', 'delete', 'list-distros', *USER_MODES)
+MODES = ('prepare', 'status', 'test', 'test-users', 'test-swap', 'reset', 'delete', 'list-distros', *USER_MODES)
 # The libvirt daemon can translate its error even with client LC_ALL=C.
 # Only these exact, verified disconnected-agent replies permit boot polling.
 AGENT_DISCONNECTED_ERRORS = frozenset({
@@ -888,14 +888,14 @@ class Stand:
                  '--inventory', str(self.inventory), '--key', ''],
                 capture=False, timeout=None, env=self.child_env(inputs))
 
-    def cli(self, mode, frontier=None, unchanged=False, swap_size=512):
+    def cli(self, mode, frontier=None, unchanged=False, swap_size=512, user_inputs=None, capture=False):
         self.load()
         self.check_inventory(self.inventory)
         self.ready(running=True)
-        env = self.child_env()
+        env = self.child_env(user_inputs)
         if frontier:
             env['INIT_FROM'] = frontier
-        inventory = self.swap_inventory(swap_size)
+        inventory = self.swap_inventory(swap_size) if user_inputs is None else self.inventory
         self.check_inventory(inventory)
         env['INVENTORY'] = str(inventory)
         argv = ['make', '--no-print-directory', mode]
@@ -904,8 +904,130 @@ class Stand:
                 convergence_command(argv, child_env, swap_only=mode == 'setup-swap',
                                     **({'pass_fds': descriptors} if descriptors else {}))
             else:
-                command(argv, capture=False, timeout=None, env=child_env,
-                        **({'pass_fds': descriptors} if descriptors else {}))
+                return command(argv, capture=capture, timeout=None, env=child_env,
+                               **({'pass_fds': descriptors} if descriptors else {}))
+
+    def fixture_ssh(self, user, key, probe, *, denied=False):
+        """Strict fixture-only probes; only an exact authentication denial is expected."""
+        self.ready(running=True)
+        self.check_inventory(self.inventory)
+        from .ssh import interactive_ssh_command
+        previous = os.environ.get('HOME')
+        os.environ['HOME'] = str(self.root / 'home')
+        try:
+            argv = interactive_ssh_command(self.ip, 22, user, key)
+        finally:
+            if previous is None:
+                os.environ.pop('HOME', None)
+            else:
+                os.environ['HOME'] = previous
+        argv.remove('-t')
+        if not denied:
+            return command(argv + [probe], timeout=90)
+        result = subprocess.run(argv + [probe], capture_output=True, text=True, timeout=90,
+                                env=self.child_env() | {'LC_ALL': 'C'}, check=False)
+        require(result.returncode == 255 and not result.stdout and
+                result.stderr.strip() == user + '@' + self.ip + ': Permission denied (publickey).',
+                'Expected exact key-only authentication denial; unexpected SSH result; STOP.')
+
+    def standalone_ready(self):
+        self.load()
+        self.check_inventory(self.inventory)
+        self.ready(running=True)
+        require(sys.stdin.isatty(), 'Standalone E2E requires a terminal and native confirmations.')
+        self.independent()
+        self.cli('verify-user', user_inputs={
+            'HUMAN_USER': 'e2e_admin', 'HUMAN_SUDO': 'admin',
+            'HUMAN_KEY': str(self.root / 'home/.ssh/human/admin_ed25519')})
+
+    def test_users(self):
+        self.standalone_ready()
+        from .keys import public_fingerprint
+        name = 'e2e_t_' + uuid.uuid4().hex[:12]
+        keys = tuple(self.root / 'home/.ssh/human' / (name + '_' + str(index)) for index in range(3))
+        require(all(not p.exists() and not p.is_symlink() for key in keys
+                    for p in (key, Path(str(key) + '.pub'))), 'Test key path already exists; STOP.')
+        print('Standalone users plan: new disposable admin ' + name +
+              '; create, inspect groups/sudo, add two keys, revoke one, remove account; '
+              'retain ansible/e2e_admin. Keys and preserved home remain for diagnosis. '
+              'Every native confirmation remains; no bootstrap/init/reset.')
+        confirm('Run this user lifecycle on the owned, configured E2E VM?')
+        controller = Path(self.expected_inventory()['all']['children']['bootstrap']['hosts']['e2e']['ansible_private_key_file'])
+        # Do not adopt even a same-name managed account or a retained removal receipt.
+        quoted = shlex.quote(name)
+        self.fixture_ssh('ansible', controller,
+                         'getent passwd ' + quoted + ' >/dev/null; test $? = 2' +
+                         ''.join(' && sudo -n test ! -e ' + shlex.quote(path) +
+                                 ' && sudo -n test ! -L ' + shlex.quote(path) for path in (
+                                     '/home/' + name, '/var/lib/portfolio-human-access/' + name + '.json',
+                                     '/var/lib/portfolio-human-access/' + name + '.keys.json',
+                                     '/var/lib/portfolio-human-access/' + name + '.removed')))
+        inputs = {'HUMAN_USER': name, 'HUMAN_SUDO': 'admin', 'AGENT_LOAD': 'ask',
+                  'RECOVERY_USER': 'e2e_admin',
+                  'RECOVERY_KEY': str(self.root / 'home/.ssh/human/admin_ed25519')}
+        for key in keys:
+            self.cli('generate-user-key', user_inputs=inputs | {'HUMAN_KEY': str(key)})
+        fingerprints = tuple(public_fingerprint(Path(str(key) + '.pub')) for key in keys)
+        require(len(set(fingerprints)) == 3, 'Test keys must have distinct public identities; STOP.')
+
+        def inspect(expected):
+            for mode in ('show-user', 'list-user-keys'):
+                data = json.loads(self.cli(mode, user_inputs=inputs, capture=True))
+                require(data.get('name') == name and data.get('sudo') == 'admin' and data.get('groups') == [] and
+                        data.get('commands') == ['ALL'] and isinstance(data.get('keys'), list) and
+                        len(data['keys']) == len(expected) and
+                        all(isinstance(entry, dict) and entry.get('managed') is True for entry in data['keys']) and
+                        {entry.get('fingerprint') for entry in data['keys']} == set(expected),
+                        'Unexpected test account policy/key ownership; STOP.')
+
+        def verify(key):
+            self.cli('verify-user', user_inputs=inputs | {'HUMAN_KEY': str(key)})
+
+        self.cli('add-user', user_inputs=inputs | {'HUMAN_KEY': str(keys[0]), 'HUMAN_PUBLIC_KEY': str(keys[0]) + '.pub'})
+        verify(keys[0])
+        inspect(fingerprints[:1])
+        for index in (1, 2):
+            self.cli('add-user-key', user_inputs=inputs | {'HUMAN_PUBLIC_KEY': str(keys[index]) + '.pub'})
+            verify(keys[index])
+            inspect(fingerprints[:index + 1])
+        self.cli('revoke-user-key', user_inputs=inputs | {'KEY_FINGERPRINT': fingerprints[1]})
+        inspect((fingerprints[0], fingerprints[2]))
+        self.fixture_ssh(name, keys[1], 'true', denied=True)
+        verify(keys[2])
+        verify(keys[0])
+        self.cli('remove-user', user_inputs=inputs)
+        removed = json.loads(self.cli('show-user', user_inputs=inputs, capture=True))
+        require(removed.get('name') == name and removed.get('removed') is True,
+                'Test account removal not proven; STOP.')
+        for key in keys:
+            self.fixture_ssh(name, key, 'true', denied=True)
+        self.standalone_ready()
+        print('Standalone users E2E passed; ansible/e2e_admin access retained.')
+
+    def test_swap(self):
+        self.standalone_ready()
+        print('Standalone SWAP plan: setup/verify 512 -> 1024 -> 0 -> 512 MiB; '
+              'repeat each state with changed=0; reboot disabled and enabled (two reboots), '
+              'prove boot IDs and disabled file retention. No bootstrap/init/reset.')
+        confirm('Run these SWAP transitions and two reboots on the owned, configured E2E VM?')
+        self.prepare_swap_inventories()
+        for index, size in enumerate((512, 1024, 0, 512)):
+            self.cli('setup-swap', swap_size=size)
+            self.cli('verify-swap', swap_size=size)
+            self.cli('setup-swap', unchanged=True, swap_size=size)
+            self.cli('verify-swap', swap_size=size)
+            if size == 0:
+                self.swap_file_retained()
+            # Reboot the disabled state and the final re-enabled state only.
+            if index in (2, 3):
+                before = self.independent()
+                self.cli('reboot-host', swap_size=size)
+                self.cli('verify-swap', swap_size=size)
+                if size == 0:
+                    self.swap_file_retained()
+                require(before != self.independent(), 'SWAP reboot boot ID unchanged; STOP.')
+        self.standalone_ready()
+        print('Standalone SWAP E2E passed; final desired size is 512 MiB.')
 
     def swap_file_retained(self):
         self.ready(running=True)
@@ -1056,7 +1178,10 @@ def configure_child():
             and sys.argv[4:] == ['--key', ''] and
             sys.argv[1] in ('init-server', 'reboot-host', 'setup-swap', 'verify-swap', *USER_MODES)),
             'Foreign E2E CLI arguments forbidden.')
-    user_operation = sys.argv[1] in USER_MODES
+    # A full-scenario grant must keep its fixed admin identity. Never downgrade
+    # a substituted granted generation into an unplanned local key operation.
+    user_operation = sys.argv[1] in USER_MODES or (
+        local and 'PORTFOLIO_E2E_PLAN_FD' not in os.environ and os.environ.get('HUMAN_USER') != 'e2e_admin')
     require(not user_operation or selected_inventory == stand.inventory, 'User commands require the base E2E inventory.')
     env = stand.child_env(os.environ if user_operation else None)
     env['INVENTORY'] = str(selected_inventory)
@@ -1123,7 +1248,7 @@ def main():
         phase = 'fixture lock'
         with stand_lock(stand.root):
             phase = args.mode
-            result = stand.user_command(args.mode) if args.mode in USER_MODES else getattr(stand, args.mode)()
+            result = stand.user_command(args.mode) if args.mode in USER_MODES else getattr(stand, args.mode.replace('-', '_'))()
         if result is e2e_host.PreparationResult.REBOOT_REQUIRED:
             e2e_host.offer_reboot()
         return 0

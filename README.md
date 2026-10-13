@@ -246,6 +246,8 @@ Checks run YAML/Ansible/workflow lint, Ansible syntax validation and offline Pyt
 
 Real E2E on an Ubuntu Server 24.04 LTS amd64 guest with an Ubuntu 26.04 controller was run manually by the operator: [PR #11](https://github.com/DanilFaritovich/portfolio-server-infrastructure/pull/11) supports preparation/initialization, and the operator's subsequent confirmation covers repeat execution, reboot, user management and deletion. These are existing recorded results, not new runs during documentation editing; see the [validation record](docs/validation.md) for detailed provenance and limits.
 
+The operator also reports a successful full E2E run on a separate Ubuntu VM with nested virtualization. The standalone commands introduced below have been checked offline only in this change; no real E2E or VPS connection was performed.
+
 | Check | Recorded result |
 | --- | --- |
 | Offline / CI: lint, Ansible syntax, Python tests | Passed |
@@ -274,7 +276,20 @@ Run each command only after the previous one succeeds. Before creating a VM, rea
 
 The scenario creates a separate `e2e_admin`, initializes and verifies the server, requires provisioning convergence with `changed=0` and checks state after reboot. See [scenario details](docs/local-vm-e2e.md#isolation-and-scenario-execution) and [reset/deletion/recovery](docs/local-vm-e2e.md#reset-deletion-and-incomplete-preparation).
 
-### Exercise users and keys
+### Run standalone checks on a configured VM
+
+After successful full initialization, the owned guest must already be running with working `ansible` and `e2e_admin` key-only SSH/sudo and existing fixture trust. In a terminal, run either independent command:
+
+```bash
+make e2e-test-users
+make e2e-test-swap
+```
+
+`e2e-test-users` creates a disposable account with its own primary group and admin sudo, inspects it and its keys, adds two keys, verifies access, revokes one and proves that only its access disappears, then removes the account and proves access denial for all three keys. It checks retained `ansible`/`e2e_admin` access. New keys stay in the isolated fixture HOME; native passphrase/agent prompts remain.
+
+`e2e-test-swap` uses existing `setup-swap`/`verify-swap` for 512 → 1024 → 0 → 512 MiB, checks `changed=0` in every state, retains the 1024 MiB file while disabled, and verifies persistence across two reboots (disabled and re-enabled). Final desired size is 512 MiB; the base fixture inventory remains unchanged.
+
+Neither command bootstraps or runs `init-server`. They retain native safety checks, confirmations and recovery proofs, hold the fixture lock, and stop on errors without reset or automatic cleanup. See [standalone scenario details](docs/local-vm-e2e.md#standalone-tests-on-a-configured-vm).
 
 In the running guest, follow the [operator guide](docs/operator-guide.md#exercise-users-and-keys) to create a user, verify both keys, revoke the extra key and remove the account. Keep console access and a separate recovery administrator. Wrappers neither start nor reset the VM; fixture deletion requires separate confirmation.
 
