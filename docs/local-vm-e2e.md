@@ -1,5 +1,7 @@
 # Local Ubuntu VM E2E
 
+**English** | [Русский](local-vm-e2e.ru.md)
+
 This is an **interactive local integration test**, outside `make check` and CI.
 It uses KVM, `qemu:///system`, virt-install, a registry-selected official Ubuntu
 amd64 cloud image and cloud-init. virt-manager can inspect the same guest. GNOME Boxes is not used.
@@ -241,7 +243,7 @@ console), log in as root, and:
    guest and create the baseline. The wrapper revalidates the owned resources and
    waits up to 300 seconds for automatic guest readiness through the local
    QEMU guest-agent channel: the guest UUID must match, cloud-init must finish
-   without errors, SSH configuration must validate, SSH and `systemd-logind`
+   without errors, SSH configuration must validate, `ssh.service` and `systemd-logind`
    must be active, and a Power Button input device must exist. The probe runs
    short read-only commands and collects only exit codes, never command output.
    No SSH connection, password or host-trust acceptance is involved. This
@@ -331,7 +333,9 @@ The scenario performs:
 
 - An operator-selected `INIT_FROM` frontier via `E2E_FROM` or the native prompt:
   fresh installation uses `bootstrap`; continuation uses an explicitly diagnosed
-  frontier. Native earlier-stage verification remains mandatory.
+  frontier. Supported values are `bootstrap`, `docker`, `hardening`, `human`,
+  `ssh`, `operations` and `verify`; there is no default. Native earlier-stage
+  verification remains mandatory.
 - `init-server` verification of all stages; separate SSH probes check fixture
   UUID, managed identity, sudo, Docker active/enabled/runtime, UFW active,
   stock SSH listener, final root/password denial, maintenance timers and journald.
@@ -352,6 +356,11 @@ There is no automatic success report after a partial test. Sanitized native init
 JSONL logs remain in the fixture's `tmp/`; they do not authorize continuation.
 If output/probes fail, inspect console and the existing native read-only
 inspectors. Do not clear pending activation markers/receipts or infer cancellation.
+
+For the separate user/key lifecycle checks on a running, provisioned fixture,
+see [Exercise users and keys](operator-guide.md#exercise-users-and-keys). Those
+wrappers retain their own confirmations and independent recovery proofs; the
+scenario plan does not authorize them.
 
 ## SSH socket diagnosis (read-only)
 

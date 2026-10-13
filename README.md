@@ -83,7 +83,7 @@ Start with [Quick Start](#quick-start) for a fresh VPS, then use the [command re
 
 - [Operator guide](docs/operator-guide.md): detailed stage contracts, inventory migration, key/trust transfer and recovery.
 - [Architecture](ARCHITECTURE.md): module responsibilities, dependencies and security boundaries.
-- [Local VM E2E guide](docs/local-vm-e2e.md): host preparation, console checks, snapshots and fixture lifecycle.
+- [Local VM E2E guide](docs/local-vm-e2e.md) ([Русский](docs/local-vm-e2e.ru.md)): host preparation, console checks, snapshots and fixture lifecycle.
 - [Validation record](docs/validation.md): recorded offline and operator-reported results with evidence limits.
 
 ## System requirements
