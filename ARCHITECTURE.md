@@ -16,6 +16,7 @@ the same commands, arguments, output formats and exit codes.
 | Module | Responsibility |
 | --- | --- |
 | `cli.py` | Argument parsing, locked server command dispatch, umask and sanitized failure/interruption errors. |
+| `initialization.py` | Seven-stage initialization (including SWAP), explicit mutation frontier, independent verification boundaries and private status/timing JSONL under the whole-run CLI lock. |
 | `common.py` | Repository root, default automation key path, SSH policy constants and validation guards. |
 | `plans.py` | Default-deny plans, snapshots of inputs/implementation, bounded nested consent and anonymous E2E child grants. |
 | `inventory.py` | Exclusive inventory creation, static inventory validation, access selection and hardening port inputs. |

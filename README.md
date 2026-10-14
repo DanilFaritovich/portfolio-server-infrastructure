@@ -45,7 +45,8 @@ The controller is your local computer; the managed host is the Ubuntu server. Th
 ```mermaid
 flowchart LR
     subgraph Controller["Local controller"]
-        CLI["Make / Python CLI"] --> Ansible["Ansible: roles and playbooks"]
+        State["Local inventory · keys · host trust"] --> CLI["Make / Python CLI"]
+        CLI --> Ansible["Ansible: roles and playbooks"]
         CLI --> Checks["Independent SSH/sudo checks and inspectors"]
         Ansible --> SSH["SSH: OpenSSH / Paramiko"]
         Checks --> SSH
@@ -55,7 +56,7 @@ flowchart LR
     VPS -. "effective state" .-> Checks
 ```
 
-**Initialization order:** local setup → automation access → Docker → SSH ports/UFW → human administrator → final SSH policy → confirmed system operations → STOP. Each stage must pass independent verification before the next; applications are deployed separately.
+**Initialization order:** local setup → automation access → SWAP → Docker → SSH ports/UFW → human administrator → final SSH policy → confirmed system operations → STOP. Each stage must pass independent verification before the next; applications are deployed separately.
 
 | Boundary | Responsibility |
 | --- | --- |
@@ -176,9 +177,27 @@ This verifies the full pipeline without provisioning. Docker verification create
 
 After an error, **stop and diagnose before continuing**. `INIT_FROM` also accepts `swap`, `docker`, `hardening`, `human`, `ssh` or `operations`; earlier stages must pass fresh verification. Choosing a later stage is an explicit decision after diagnosis, not automatic recovery. See [interrupted stages](docs/operator-guide.md#interrupted-stages-and-safe-repetition).
 
+### Seven initialization stages
+
+The CLI numbers the following stages **1/7–7/7**. The older Stage 1–5 names in the detailed guide group related capabilities; they are not the seven-step CLI counter.
+
+| Step | `INIT_FROM` | Apply target | Independent verifier |
+| --- | --- | --- | --- |
+| 1 | `bootstrap` | `make bootstrap-user` | `make verify-access` |
+| 2 | `swap` | `make setup-swap` | `make verify-swap` |
+| 3 | `docker` | `make docker-host` | `make verify-docker` |
+| 4 | `hardening` | `make harden` | `make verify-hardening` |
+| 5 | `human` | `make add-user` | `make verify-user` |
+| 6 | `ssh` | `make secure-ssh` | `make verify-ssh-security` |
+| 7 | `operations` | `make setup-operations` | `make verify-operations` |
+
+Without `INIT_FROM`, the CLI prompts with no default. `INIT_FROM=verify` checks all seven stages. Other values authorize application from the selected stage onward; earlier stages must verify successfully. Review the [deployment flow and port 22 → 2222 procedure](docs/operator-guide.md#deployment-sequence-and-ssh-port-22--2222).
+
+The plan is displayed before execution; its single default-deny approval is requested when a mutation needs authorization, after applicable read-only preflight. An already converged or verification-only run may need no mutation approval. Approval is limited to the listed actions and inputs for this invocation and includes recovery attestation for final SSH policy. Native authentication and host-trust prompts remain separate. Individual mutating commands outside this plan require their own confirmations.
+
 ### SWAP between Bootstrap and Docker
 
-Set the sole inventory input `swap_size_mb: 2048` for 2 GiB; existing inventories must add an explicit integer before `init-server`. Initialization applies and independently verifies SWAP after Bootstrap and before Docker. `INIT_FROM=swap` verifies Bootstrap, then applies SWAP and later stages. The successful wrapper postflight is reused within this invocation, preserving the PR #13 optimization.
+Set the sole inventory input `swap_size_mb: 2048` for 2 GiB; existing inventories must add an explicit integer before `init-server`. Initialization applies and independently verifies SWAP after Bootstrap and before Docker. `INIT_FROM=swap` verifies Bootstrap, then applies SWAP and later stages. A successful independent wrapper postflight is reused only at that stage boundary in the same invocation; subsequent invocations verify afresh.
 
 `make setup-swap` requires managed key-only SSH/sudo and default-deny plan confirmation; `make verify-swap` independently checks without configuration changes. Positive sizes allocate and activate `/swapfile` with root:root 0600 permissions and an exact managed `/etc/fstab` entry. Zero disables it and removes that entry while retaining the file; an absent file stays absent. Other swap files/partitions remain untouched.
 
@@ -244,19 +263,17 @@ make check
 
 Checks run YAML/Ansible/workflow lint, Ansible syntax validation and offline Python tests with synthetic fixtures and mocked SSH, downloads and hypervisor commands. They use the example inventory, require no production credentials and do not contact a server or launch a VM. [GitHub Actions](.github/workflows/ci.yml) runs `make deps-ci` followed by `make ci` on Ubuntu 24.04.
 
-Real E2E on an Ubuntu Server 24.04 LTS amd64 guest with an Ubuntu 26.04 controller was run manually by the operator: [PR #11](https://github.com/DanilFaritovich/portfolio-server-infrastructure/pull/11) supports preparation/initialization, and the operator's subsequent confirmation covers repeat execution, reboot, user management and deletion. These are existing recorded results, not new runs during documentation editing; see the [validation record](docs/validation.md) for detailed provenance and limits.
+## Real-world validation
 
-The operator also reports a successful full E2E run on a separate Ubuntu VM with nested virtualization. The standalone commands introduced below have been checked offline only in this change; no real E2E or VPS connection was performed.
+These are operator-confirmed completed runs supplied for this documentation update, not live tests performed while editing. VM and production results are separate; [the validation record](docs/validation.md) describes provenance and limits.
 
-| Check | Recorded result |
+| Environment | Confirmed result |
 | --- | --- |
-| Offline / CI: lint, Ansible syntax, Python tests | Passed |
-| E2E: VM creation and full Stage 1–5 initialization | Passed |
-| E2E: final verification, repeat convergence and verification after reboot | Passed; smoke-test runtime changes remain expected |
-| E2E: user creation/verification, key addition/revocation, user and fixture deletion | Passed |
-| External production VPS, other platforms | Not established by this run |
+| Separate Ubuntu VM through GNOME Boxes | Full E2E from scratch: dependency preparation, infrastructure initialization, user management, SSH and SWAP |
+| Real production VPS | All seven `init-server` stages completed; SSH on port 2222; repeat verification and verification after reboot succeeded |
+| Production initialization time | **36 minutes 36.97 seconds**, from the operator-reported JSONL run report |
 
-Offline success does not prove live access, idempotency or provider recovery; a VM result does not establish acceptance on every allowed release or platform.
+The VM time and production per-stage times were not supplied. This does not claim production user-deletion tests, production SWAP resizing, `changed=0` on production or acceptance of every supported release. Offline checks and Docker's disposable runtime smoke tests have distinct evidence and effects.
 
 ## E2E on a real Ubuntu VM
 

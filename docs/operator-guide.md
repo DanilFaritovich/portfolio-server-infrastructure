@@ -65,7 +65,7 @@ make init-server INIT_FROM=bootstrap HUMAN_USER=operator HUMAN_SUDO=admin \
 ```
 
 This is **LIVE / MUTATING**: bootstrap → SWAP → Docker → SSH/UFW hardening → human access
-→ final SSH security → separately confirmed server operations, with mandatory
+→ final SSH security → server operations covered by the invocation plan, with mandatory
 verification between stages. One preliminary plan and default-deny confirmation
 cover the listed changes for this invocation, including the tested provider-console
 recovery attestation. Native password/passphrase, sudo and host-trust prompts remain
@@ -92,15 +92,52 @@ One controller lock covers the whole run, confirmations and postflight. Terminal
 progress and the final report show verified stages. A new local `portfolio-init-*.jsonl`
 file in the temporary directory (normally `/tmp`, mode 0600) stores only schema,
 stage, status and elapsed seconds for that stage (`run` events use total run time).
-Application emits `applying → verifying → completed/failed`; skipped stages emit
+Application emits `applying`, optionally `verifying`, then `completed` (or `failed`/`interrupted`); a successful wrapper postflight can supply the verification without a separate event. Skipped stages emit
 `verifying → verified_skip`. Its path is printed; retain/delete it manually.
 Inventory, identities, keys, passwords, exception text and subprocess output are
 never captured. Log-write errors stop later dispatch and may leave the last record
 incomplete. Terminal errors include the active command and an allowlisted static
 cause or safe process/I/O category, without arbitrary exception text or raw stderr.
 Ctrl+D at stage selection or plan confirmation cancels before mutation without
-traceback. Stage diagnostics remain in the terminal. Offline checks do not prove
+traceback; read-only preflight may already have contacted the server. Stage diagnostics remain in the terminal. Offline checks do not prove
 live access, repeat-run idempotency or provider recovery.
+
+### Deployment sequence and SSH port 22 → 2222
+
+The seven CLI stages include SWAP and split human access from final SSH policy. Historical Stage 3/4/5 names below refer to capability groups, not CLI step numbers. Each arrow in this flow requires a successful independent verifier. Earlier stages selected by `INIT_FROM` run verification only; a failure anywhere stops dispatch. A successful wrapper postflight can satisfy its verifier without a duplicate call.
+
+```mermaid
+flowchart TD
+    Plan["TTY · INIT_FROM · plan / consent"] --> B["1. bootstrap-user → verify-access"]
+    B --> S["2. setup-swap → verify-swap"]
+    S --> D["3. docker-host → verify-docker"]
+    D --> H["4. inspect-hardening → harden → verify-hardening"]
+    H --> U["5. add-user → verify-user"]
+    U --> SSH["6. secure-ssh → verify-ssh-security"]
+    SSH --> O["7. setup-operations → verify-operations"]
+    O --> End["STOP · applications separate"]
+```
+
+The plan is printed before stage execution. Its single default-deny mutation approval is requested only when needed, after applicable read-only preflight; fully converged and verification-only paths may not prompt. It covers only the listed stages/inputs in this invocation, including final-policy recovery attestation. Native password, passphrase, sudo and host-trust prompts remain separate. Standalone mutations and reboot have their own consent. No stage automatically reboots the server.
+
+For a fresh server initially reached on 22, use this deliberate transition:
+
+1. Test provider-console recovery, retain an administrator session and allow TCP 22 and 2222 in the provider firewall. In the ignored inventory set:
+
+   ```yaml
+   ansible_port: 22
+   ssh_listen_ports: [22, 2222]
+   ssh_verify_ports: [22, 2222]
+   ```
+
+2. Run the initialization command above with `INIT_FROM=bootstrap` and the independent human admin key. Hardening first validates the candidate, manages SSH/UFW and proves access on both ports before later stages proceed. Cross-port verifiers use the existing inventory endpoint's trusted identity via `HostKeyAlias`; this does not save trust for a new inventory endpoint. On any failure, STOP and inspect through the retained route/console.
+3. After the whole run succeeds, change only `ansible_port` to `2222` in the local inventory; retain both port lists. Run `make connect-controller`. If trust for 2222 is missing, this interactive command can prove the same host identity through a signed host-only handshake, then request separate default-deny consent to record it. It never changes the listener or inventory. Check the selected account and `sudo -n id -u` in the session, then exit. Missing/conflicting trust or a failed handshake blocks access; never disable strict checking. See [cross-port trust](#switch-to-another-ssh-port-with-existing-server-trust).
+4. Run the same initialization command with `INIT_FROM=verify` and the same human inputs. With inventory port 2222 this freshly verifies all seven stages, including managed/human access on the selected routes. Keep the retained session and console until successful.
+5. A reboot is a separately authorized operation: `make reboot-host` confirms before reboot and checks access, Docker and Stage 3 hardening afterward. Then repeat `INIT_FROM=verify` with the human inputs to cover SWAP, human access, final policy and operations as well. Stop after any error; never blindly repeat reboot.
+
+This establishes 2222 as the controller route while retaining 22. Removing port 22 is a separate reviewed migration: the hardening preflight refuses existing UFW SSH rules outside the desired lists and never deletes them. Do not simply change the lists to `[2222]` and expect automatic cleanup. Review the exact old rules, independently prove retained human/automation access on 2222 and console recovery, and separately authorize any manual firewall-rule removal before converging the listener lists. Keep the current inventory port in both lists throughout. A changed SSH port does not replace key-only authentication or host trust.
+
+After partial failure, use `inspect-hardening` / `inspect-operations` only over a still-proven route, or inspect from retained administrator/console access if normal checks refuse pending state. Preserve pending markers and ownership receipts; confirm remote work ended before any repair. Then choose an explicit `INIT_FROM` frontier. JSONL is a timing/status record, never permission to skip verification or replay a failed stage.
 
 ## Access and security
 
@@ -336,7 +373,9 @@ state or adopt partially created accounts to bypass a refusal.
 Pending final SSH policy also blocks normal hardening and its consumers; use its
 protected receipt recovery procedure, rather than activating it through Stage 3.
 
-New activation markers block repeat mutation and normal verification:
+SWAP also refuses pending state at `/var/lib/portfolio-swap/pending`; use the [SWAP diagnosis contract](#swap-management), preserving its receipt and any staged file. The activation-marker procedure below does not authorize clearing SWAP evidence.
+
+Activation markers block repeat mutation and normal verification:
 
 | Stage | Pending marker | Required recovery evidence |
 | --- | --- | --- |
@@ -815,7 +854,7 @@ A VM needs a configured shared clipboard or another reviewed transfer channel.
    Review the displayed details; enter `yes` only after independently verifying
    the source. Enter, N, EOF or interruption cancels. Non-interactive import fails
    without reading input or writing trust.
-   For JSON `132.243.166.145:2222` and inventory `132.243.166.145:22`, the CLI displays
+   For JSON `vps.example.invalid:2222` and inventory `vps.example.invalid:22`, the CLI displays
    both endpoints and asks `Import verified trust for port 2222? [y/N]:`.
    Confirmation saves only the source endpoint `:2222`. It then offers
    `Verify and trust configured port 22 now? [y/N]:`. Accepting runs the same signed
@@ -1510,7 +1549,7 @@ retained admin session. Use disposable usernames/keys for revocation and removal
    unchanged recovery/controller access and an unchanged repeated removal. Recreation
    must fail. Busy accounts and unmanaged keys must block removal before revocation.
 6. **Stage 1–5 regression and STOP.** From both candidate inventories run `verify-access`,
-   `verify-docker`, `verify-hardening`, `verify-ssh-security` with the retained human admin,
+   `verify-swap`, `verify-docker`, `verify-hardening`, `verify-user` and `verify-ssh-security` with the retained human admin,
    and `verify-operations`, in that order. Docker verification may populate its image
    cache. Only after success deliberately select the candidate inventory. Repeated
    provisioning and `changed=0` checks require separate approval; do not reboot or rerun

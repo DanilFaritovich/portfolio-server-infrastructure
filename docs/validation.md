@@ -1,35 +1,30 @@
 # Validation record
 
-[English](validation.md) · [Русский](validation.ru.md) · [README](../README.md#testing-and-recorded-results)
+[English](validation.md) · [Русский](validation.ru.md) · [README](../README.md#real-world-validation)
 
-This record distinguishes implementation evidence from operator-reported integration results. It records the run supplied for the user guide; it does not claim a new live run during documentation work.
+## Real-world validation
 
-## Environment and evidence
+The operator confirmed the following completed runs for this documentation update. No VPS or VM was contacted during documentation work. The original JSONL report was not independently opened; the production duration below is the value supplied by the operator from that report. Private inventory, host addresses, credentials, fingerprints and raw transcripts are intentionally not reproduced.
 
-| Component | Recorded environment |
-| --- | --- |
-| Main computer / controller | Ubuntu 26.04, according to the operator; no independent OS probe was performed for this documentation task |
-| E2E guest | Ubuntu Server 24.04 LTS |
-| GitHub Actions | Ubuntu 24.04, as configured in [ci.yml](../.github/workflows/ci.yml) |
-| External production VPS | Not part of the confirmed E2E run |
+| Environment | Confirmed scope | Timing |
+| --- | --- | --- |
+| Separate Ubuntu VM through GNOME Boxes | Full E2E from scratch, including dependency preparation, infrastructure configuration, user management, SSH and SWAP | Not supplied |
+| Real production VPS | All seven initialization stages: bootstrap, SWAP, Docker, SSH/UFW hardening, human access, final SSH security and operations; SSH on 2222; successful repeat verification and verification after reboot | **36 minutes 36.97 seconds**, from the reported initialization JSONL |
 
-[PR #11](https://github.com/DanilFaritovich/portfolio-server-infrastructure/pull/11) describes successful offline lint, Ansible syntax and Python checks, operator-confirmed VM preparation (`ready`, baseline present), initialization through all stages and an independent SSH/sudo/Docker/UFW/systemd/final-policy probe.
+GNOME Boxes identifies the separate VM validation environment. The repository's automated fixture uses KVM/system libvirt, virt-install and cloud-init; it does not manage Boxes itself. The current [full and standalone scenarios](local-vm-e2e.md#isolation-and-scenario-execution) are documented from the implementation. No unreported VM release, nested topology, standalone-command transcript or per-check measurement is inferred from the latest confirmation.
 
-Its validation section also records an earlier repeat-convergence interruption at a hidden confirmation and leaves live validation of the fix, complete idempotency and reboot pending. The PR body is therefore evidence for preparation/initialization, not proof of every later scenario result.
+The production timing describes initialization, not controller dependency installation, later verification, reboot or application deployment. The CLI records `elapsed_seconds` for each stage and whole-run time on `stage=run` events. For a successful run the terminal prints the path of a private temporary `portfolio-init-*.jsonl` file; the `run` / `completed` event is the total elapsed run time. It includes time spent in prompts during that run, but not plan/input preparation before execution starts. Do not sum stage events or interpret the log as automatic-resume evidence.
 
-The operator's subsequent confirmation supplied with this documentation task reports successful:
+Production confirmation does not establish user deletion/revocation exercises, SWAP resize/disable cycles or repeat provisioning with `changed=0` there. Those are distinct VM scenario capabilities/results, not production guarantees. The report contains no production OS-release acceptance matrix, performance benchmark or availability guarantee.
 
-- Final verification, repeat execution and idempotency.
-- Guest reboot and verification after reboot.
-- User creation, SSH verification, key addition and revocation, and user removal.
-- Safe deletion of the E2E fixture.
+## Earlier VM validation record
 
-The [README results table](../README.md#testing-and-recorded-results) combines these sources with their provenance stated. No test count, transcript, private inventory or credentials are reproduced here.
+The earlier operator record identified an Ubuntu 26.04 controller and Ubuntu Server 24.04 LTS guest. [PR #11](https://github.com/DanilFaritovich/portfolio-server-infrastructure/pull/11) recorded offline checks, fixture preparation/initialization and an independent SSH/sudo/Docker/UFW/systemd/final-policy probe. That PR left complete repeat convergence and reboot pending after an earlier confirmation interruption. Later operator confirmation recorded final verification, repeat execution/idempotency, reboot persistence, user creation and verification, key addition/revocation, user removal and fixture deletion. These historical results do not specify the production environment or expand the latest VM report's platform details.
 
-## Interpretation and limits
+## Offline evidence and limits
 
-Offline checks do not prove remote access or runtime behavior. A VM result does not establish acceptance on an external production VPS, every permitted Ubuntu release, other controller distributions/architectures or WSL2.
+`make check` validates YAML, offline Ansible lint, playbook syntax with the example inventory, GitHub Actions syntax and Python tests using synthetic fixtures and mocked external commands. [CI](../.github/workflows/ci.yml) installs dependencies with `make deps-ci` and runs `make ci` on Ubuntu 24.04. Offline success cannot prove remote access, provider-console recovery or live idempotency.
 
-Repeat provisioning is expected to converge without managed configuration changes. Docker smoke verification still creates, runs and removes a disposable container and may populate the image cache; those runtime changes do not imply a provisioning idempotency failure.
+Docker smoke verification creates, runs and removes a disposable container and may populate the image cache. Those runtime effects are expected and are separate from provisioning convergence. A VM or VPS result does not prove all allowed Ubuntu releases, controller distributions/architectures or WSL2.
 
-Reproduction is a separately authorized real local operation. Follow the [E2E guide](local-vm-e2e.md), keep guest-console recovery and preserve failed fixtures for diagnosis. Production checks require their own authorization and recovery preparation.
+Reproduction requires separately authorized live operations and tested recovery access. Use the [operator guide](operator-guide.md#unified-initialization) for VPS deployment and the [E2E guide](local-vm-e2e.md) for owned fixtures. Preserve failed state for diagnosis; do not retry, reset or clear pending evidence automatically.
