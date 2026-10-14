@@ -4,7 +4,7 @@
 
 This is an **interactive local integration test**, outside `make check` and CI.
 It uses KVM, `qemu:///system`, virt-install, a registry-selected official Ubuntu
-amd64 cloud image and cloud-init. virt-manager can inspect the same guest. GNOME Boxes is not used.
+amd64 cloud image and cloud-init. virt-manager can inspect the same guest. The fixture lifecycle is managed by this CLI, not by GNOME Boxes. A separate operator-confirmed validation environment used GNOME Boxes; see the [validation record](validation.md).
 No application deployment is included. Offline success does not demonstrate live
 access, package compatibility, snapshot support or idempotency.
 
@@ -353,7 +353,7 @@ The scenario performs:
 
 The full scenario uses exact private profiles `inventory-swap-512.yml`, `inventory-swap-1024.yml` and `inventory-swap-0.yml`; the base fixture inventory remains unchanged, including schema-1 fixtures. Initial `init-server` creates/activates 512 MiB, verifies all stages and repeats convergence. After the first reboot and full verification, targeted `setup-swap`/`verify-swap` calls resize to 1024 MiB, disable with zero and re-enable 512 MiB; every state repeats with `changed=0`. The second reboot occurs while disabled: a new boot ID, disabled SWAP and retention of the 1024 MiB file are proven before re-enabling. After each existing reboot, targeted SWAP setup must again report `changed=0` and pass verification. There are **two reboots total**, rather than one for every SWAP state. Profile drift blocks dispatch; the plan lists the transitions and both reboots.
 
-The operator reports successful full E2E validation on a separate Ubuntu VM with nested virtualization. This is an operator-reported full-scenario result; the new standalone commands in this change were validated offline without running a VM scenario or connecting to a VPS.
+The operator confirms full E2E from scratch in a separate Ubuntu VM through GNOME Boxes, including dependencies, infrastructure, user management, SSH and SWAP. This report is separate from production validation and does not imply a new VM run during documentation editing; see the [validation record](validation.md).
 
 Failures stop immediately, retain guest/local state and never reset/retry.
 There is no automatic success report after a partial test. Sanitized native init
