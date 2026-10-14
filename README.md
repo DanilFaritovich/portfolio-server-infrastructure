@@ -273,7 +273,7 @@ These are operator-confirmed completed runs supplied for this documentation upda
 | Real production VPS | All seven `init-server` stages completed; SSH on port 2222; repeat verification and verification after reboot succeeded |
 | Production initialization time | **36 minutes 36.97 seconds**, from the operator-reported JSONL run report |
 
-The VM time and production per-stage times were not supplied. This does not claim production user-deletion tests, production SWAP resizing, `changed=0` on production or acceptance of every supported release. Offline checks and Docker's disposable runtime smoke tests have distinct evidence and effects.
+The VM time was not supplied. Production timing includes stage execution and verification, and possible confirmation waits; see the [stage durations](docs/validation.md#production-stage-durations). This does not claim production user-deletion tests, production SWAP resizing, `changed=0` on production or acceptance of every supported release. Offline checks and Docker's disposable runtime smoke tests have distinct evidence and effects.
 
 ## E2E on a real Ubuntu VM
 

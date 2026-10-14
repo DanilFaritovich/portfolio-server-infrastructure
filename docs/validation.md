@@ -4,7 +4,7 @@
 
 ## Real-world validation
 
-The operator confirmed the following completed runs for this documentation update. No VPS or VM was contacted during documentation work. The original JSONL report was not independently opened; the production duration below is the value supplied by the operator from that report. Private inventory, host addresses, credentials, fingerprints and raw transcripts are intentionally not reproduced.
+The operator confirmed the following completed runs for this documentation update. No VPS or VM was contacted during documentation work. The original JSONL report was not independently opened; the production durations below are values supplied by the operator from that report. Private inventory, host addresses, credentials, fingerprints and raw transcripts are intentionally not reproduced.
 
 | Environment | Confirmed scope | Timing |
 | --- | --- | --- |
@@ -13,7 +13,22 @@ The operator confirmed the following completed runs for this documentation updat
 
 GNOME Boxes identifies the separate VM validation environment. The repository's automated fixture uses KVM/system libvirt, virt-install and cloud-init; it does not manage Boxes itself. The current [full and standalone scenarios](local-vm-e2e.md#isolation-and-scenario-execution) are documented from the implementation. No unreported VM release, nested topology, standalone-command transcript or per-check measurement is inferred from the latest confirmation.
 
-The production timing describes initialization, not controller dependency installation, later verification, reboot or application deployment. The CLI records `elapsed_seconds` for each stage and whole-run time on `stage=run` events. For a successful run the terminal prints the path of a private temporary `portfolio-init-*.jsonl` file; the `run` / `completed` event is the total elapsed run time. It includes time spent in prompts during that run, but not plan/input preparation before execution starts. Do not sum stage events or interpret the log as automatic-resume evidence.
+### Production stage durations
+
+The operator supplied these actual elapsed times from the initialization JSONL report. Measurements include stage execution and verification, and may include time waiting for confirmations within the run.
+
+| Stage | Elapsed time |
+| --- | ---: |
+| Bootstrap | 82.58 s |
+| SWAP | 60.45 s |
+| Docker | 582.12 s |
+| Hardening | 388.54 s |
+| Human | 369.85 s |
+| SSH Security | 496.00 s |
+| Operations | 217.44 s |
+| **Total run time** | **36 min 36.97 s** |
+
+The production timing describes initialization, not controller dependency installation, later verification, reboot or application deployment. The CLI records `elapsed_seconds` for each stage and whole-run time on `stage=run` events. For a successful run the terminal prints the path of a private temporary `portfolio-init-*.jsonl` file; the `run` / `completed` event is the total elapsed run time. It includes time spent in prompts during that run, but not plan/input preparation before execution starts. Use the final stage event for each stage; intermediate events are cumulative from that stage's start, so do not sum all stage events or interpret the log as automatic-resume evidence.
 
 Production confirmation does not establish user deletion/revocation exercises, SWAP resize/disable cycles or repeat provisioning with `changed=0` there. Those are distinct VM scenario capabilities/results, not production guarantees. The report contains no production OS-release acceptance matrix, performance benchmark or availability guarantee.
 

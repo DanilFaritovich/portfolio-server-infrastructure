@@ -116,6 +116,8 @@ flowchart TD
     U --> SSH["6. secure-ssh → verify-ssh-security"]
     SSH --> O["7. setup-operations → verify-operations"]
     O --> End["STOP · applications separate"]
+    B & S & D & H & U & SSH & O -.-> Failed["Verification failed"]
+    Failed --> Stop["STOP · diagnose through recovery"]
 ```
 
 The plan is printed before stage execution. Its single default-deny mutation approval is requested only when needed, after applicable read-only preflight; fully converged and verification-only paths may not prompt. It covers only the listed stages/inputs in this invocation, including final-policy recovery attestation. Native password, passphrase, sudo and host-trust prompts remain separate. Standalone mutations and reboot have their own consent. No stage automatically reboots the server.
@@ -134,6 +136,16 @@ For a fresh server initially reached on 22, use this deliberate transition:
 3. After the whole run succeeds, change only `ansible_port` to `2222` in the local inventory; retain both port lists. Run `make connect-controller`. If trust for 2222 is missing, this interactive command can prove the same host identity through a signed host-only handshake, then request separate default-deny consent to record it. It never changes the listener or inventory. Check the selected account and `sudo -n id -u` in the session, then exit. Missing/conflicting trust or a failed handshake blocks access; never disable strict checking. See [cross-port trust](#switch-to-another-ssh-port-with-existing-server-trust).
 4. Run the same initialization command with `INIT_FROM=verify` and the same human inputs. With inventory port 2222 this freshly verifies all seven stages, including managed/human access on the selected routes. Keep the retained session and console until successful.
 5. A reboot is a separately authorized operation: `make reboot-host` confirms before reboot and checks access, Docker and Stage 3 hardening afterward. Then repeat `INIT_FROM=verify` with the human inputs to cover SWAP, human access, final policy and operations as well. Stop after any error; never blindly repeat reboot.
+
+If port 22 becomes unreachable from the operator's network after switching to the independently proven port 2222, use this local inventory configuration before repeating verification:
+
+```yaml
+ansible_port: 2222
+ssh_listen_ports: [22, 2222]
+ssh_verify_ports: [2222]
+```
+
+`ssh_listen_ports` defines the required server listeners and UFW SSH rules; both ports remain checked on the server. `ssh_verify_ports` selects the routes for independent external key-only SSH and `sudo -n` checks. It must be a non-empty subset of the listening ports and include `ansible_port`; by default it includes all listening ports. Here external checks use only 2222. Port 22 remains listening and open in the server's UFW rules; this configuration neither closes it nor proves its external reachability. Keep the intended provider firewall rules, proven host trust for 2222, the retained administrator session and tested console recovery. Repeat `INIT_FROM=verify` with the same human inputs; any failure still means STOP and diagnosis, not an automatic retry or policy relaxation.
 
 This establishes 2222 as the controller route while retaining 22. Removing port 22 is a separate reviewed migration: the hardening preflight refuses existing UFW SSH rules outside the desired lists and never deletes them. Do not simply change the lists to `[2222]` and expect automatic cleanup. Review the exact old rules, independently prove retained human/automation access on 2222 and console recovery, and separately authorize any manual firewall-rule removal before converging the listener lists. Keep the current inventory port in both lists throughout. A changed SSH port does not replace key-only authentication or host trust.
 
