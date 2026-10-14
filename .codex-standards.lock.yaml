@@ -1,0 +1,20 @@
+version: 1
+
+source:
+  repository: https://github.com/DanilFaritovich/codex-development-standards
+  ref: "e8ff8ad8f96ba68b21861500e581d9dbaa37fd3e"
+
+profile:
+  name: ansible-infrastructure
+  version: 1
+
+skills:
+  - task-development-workflow
+  - standards-sync
+  - code-quality
+  - ansible
+  - github-actions
+  - documentation
+  - licensing
+
+optional_skills: []

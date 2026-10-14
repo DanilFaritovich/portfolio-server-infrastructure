@@ -1,0 +1,10 @@
+---
+- name: Independently verify human key-only access and selected sudo policy
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Verify human access using the shared independent login checks
+      ansible.builtin.import_role:
+        name: human_access
+        tasks_from: verify

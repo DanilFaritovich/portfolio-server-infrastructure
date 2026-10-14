@@ -1,0 +1,7 @@
+---
+- name: Apply the separately confirmed final SSH authentication policy
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - role: ssh_security

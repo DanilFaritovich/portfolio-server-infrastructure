@@ -1,0 +1,21 @@
+---
+- name: Configure the owned swapfile
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Require managed key-only OpenSSH access
+      ansible.builtin.assert:
+        that:
+          - ansible_user != 'root'
+          - ansible_connection == 'ssh'
+          - ansible_private_key_file is defined
+          - ansible_host_key_checking | bool
+          - swap_size_mb is defined
+          - swap_size_mb is integer
+          - swap_size_mb is not boolean
+          - swap_size_mb >= 0
+          - swap_size_mb <= 1048576
+        quiet: true
+  roles:
+    - role: swap

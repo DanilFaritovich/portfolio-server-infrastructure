@@ -1,0 +1,15 @@
+.git
+.venv
+.tools
+.ansible
+inventories
+secrets
+**/*.pem
+**/*.key
+**/*.pub
+.env
+.env.*
+**/*_ed25519
+**/id_ed25519
+**/id_rsa
+**/id_ecdsa

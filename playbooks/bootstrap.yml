@@ -1,0 +1,8 @@
+---
+- name: Bootstrap a managed automation account
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  serial: 1
+  roles:
+    - role: bootstrap_user

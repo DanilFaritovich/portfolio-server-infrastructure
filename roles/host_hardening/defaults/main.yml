@@ -1,0 +1,4 @@
+---
+# The first transition must preserve the currently verified SSH route.
+ssh_listen_ports: "{{ [ansible_port | int] }}" # noqa var-naming[no-role-prefix]
+firewall_allowed_tcp_ports: [80, 443] # noqa var-naming[no-role-prefix]

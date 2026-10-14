@@ -1,0 +1,21 @@
+---
+- name: Verify final SSH policy without changing managed state
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Inspect converged Stage 3 state
+      portfolio_hardening_info:
+        current_port: "{{ ansible_port | int }}"
+        ssh_ports: "{{ ssh_listen_ports }}"
+        tcp_ports: "{{ firewall_allowed_tcp_ports }}"
+        verify: true
+      become: true
+      register: security_verified
+
+    - name: Require final effective SSH authentication policy and no pending activation
+      portfolio_ssh_security:
+        operation: verify
+        sources: "{{ security_verified.ssh_sources }}"
+        ssh_ports: "{{ ssh_listen_ports }}"
+      become: true

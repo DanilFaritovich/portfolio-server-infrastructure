@@ -1,0 +1,30 @@
+---
+# Explicit release/architecture allowlists; unsupported hosts fail before mutation.
+docker_host_releases: [jammy, noble, resolute]
+docker_host_architectures:
+  x86_64: amd64
+  aarch64: arm64
+  armv7l: armhf
+  ppc64le: ppc64el
+  s390x: s390x
+docker_host_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+docker_host_conflicting_packages:
+  - docker.io
+  - docker-compose
+  - docker-compose-v2
+  - docker-doc
+  - docker-buildx
+  - podman-docker
+  - containerd
+  - runc
+docker_host_daemon_config:
+  log-driver: local
+  log-opts:
+    max-size: 20m
+    max-file: "5"
+docker_host_key_checksum: "sha256:1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570"
