@@ -15,7 +15,7 @@ It is intended for operators who can review SSH and sudo permissions and recover
 
 ## Features
 
-- **Guided initialization:** `make init-server` coordinates bootstrap, SWAP, Docker, hardening, human access, final SSH security and server operations, with independent verification between stages.
+- **Guided initialization:** `make init-server` coordinates bootstrap, SWAP, Docker, hardening, human access, final SSH security, server operations and deployment prerequisites (`gh 2.102.0`), with independent verification between stages.
 - **Ansible provisioning:** reviewable roles and idempotent configuration; converged provisioning avoids unnecessary changes and service restarts.
 - **Docker host:** official Docker Engine packages, Compose and Buildx, bounded `local` container logs and a disposable runtime smoke test.
 - **SSH and UFW:** validated listening ports, IPv4/IPv6 firewall rules and final key-only SSH with root, password and keyboard-interactive login disabled. Stock SSH service and socket activation modes are preserved.
@@ -38,6 +38,8 @@ It is intended for operators who can review SSH and sudo permissions and recover
 
 Controller/tool pins are defined in [requirements-dev.txt](requirements-dev.txt), [collections.yml](collections.yml) and [setup scripts](scripts/setup.sh). Server release limits and recorded platform results are listed under [compatibility](#compatibility); CI runs on Ubuntu 24.04.
 
+Ansible collection acquisition uses the immutable official Git commit in `collections.yml`, with full-tree SHA256 validation from `collections.lock.json`. CI caches verified collection contents and uv download data; Galaxy outages do not affect collection installation. Cold setup still requires GitHub/Python registry access.
+
 ## Architecture
 
 The controller is your local computer; the managed host is the Ubuntu server. The CLI owns local keys, trust, confirmations and sequencing. Ansible roles apply server configuration; independent SSH and server inspectors verify it.
@@ -56,7 +58,7 @@ flowchart LR
     VPS -. "effective state" .-> Checks
 ```
 
-**Initialization order:** local setup → automation access → SWAP → Docker → SSH ports/UFW → human administrator → final SSH policy → confirmed system operations → STOP. Each stage must pass independent verification before the next; applications are deployed separately.
+**Initialization order:** local setup → automation access → SWAP → Docker → SSH ports/UFW → human administrator → final SSH policy → confirmed system operations → Deployment Prerequisites (`gh`) → STOP. Each stage must pass independent verification before the next; applications are deployed separately.
 
 | Boundary | Responsibility |
 | --- | --- |
@@ -94,6 +96,7 @@ Start with [Quick Start](#quick-start) for a fresh VPS, then use the [command re
 | Controller | Linux x86_64 or arm64 with glibc; Git, Make, POSIX shell, curl, tar/gzip, coreutils including `sha256sum`, and OpenSSH clients (`ssh`, `ssh-keygen`, `ssh-keyscan`, `scp`, `sftp`) |
 | Local tooling | Setup downloads pinned uv, managed Python 3.12, Ansible, Paramiko, collections and validation tools into the project. Preinstalled Python/uv, Go and sshpass are unnecessary |
 | Managed host | Ubuntu Server with systemd, `/usr/bin/python3`, `python3-apt`, `/bin/bash`, sudo, `/usr/sbin/visudo` and an active `/etc/sudoers.d` include. Docker's release allowlist is Jammy 22.04, Noble 24.04 and Resolute 26.04; this is not an E2E acceptance claim for each release |
+| Stage 08 / full initialization | Ubuntu 24.04 AMD64 host; Linux AMD64 controller for preparation of the missing executable; controller HTTPS access to GitHub release assets |
 | Initial access | A fresh host with SSH password access as root, or an existing password-capable administrator with sudo. A verified provider host-key fingerprint, tested recovery console and a retained administrative session |
 | Network | Controller access to dependency registries; server access to Ubuntu/Docker repositories and Docker Hub. Provider firewall rules must allow the intended SSH ports |
 | Optional local E2E | Linux x86_64, hardware virtualization, KVM and system libvirt, at least 2 available CPU cores, 4 GiB guest RAM and space for a 25 GiB disk, image and snapshots |
@@ -163,7 +166,7 @@ make init-server INIT_FROM=bootstrap HUMAN_USER=portfolio_admin HUMAN_SUDO=admin
 
 Review the preliminary plan and recovery attestation. Default-deny approval covers only the listed operations in this invocation; native host-trust, password and passphrase prompts remain. On first connection, compare the displayed host fingerprint with the provider console/panel before trusting it. A network scan alone does not establish identity. The bootstrap password is entered through Ansible's native prompt and is not stored by the project.
 
-Initialization verifies each stage before proceeding. Final SSH security requires independently proven human administrator and automation access. It disables root/password/keyboard-interactive SSH only after those proofs; Stage 5 configures scheduled security updates and log limits. No application deployment or reboot is included.
+Initialization verifies each stage before proceeding. Final SSH security requires independently proven human administrator and automation access. It disables root/password/keyboard-interactive SSH only after those proofs; the operations stage configures scheduled security updates and log limits, then Stage 08 prepares pinned `gh`. No application deployment or reboot is included.
 
 ### 5. Verify the completed server
 
@@ -175,11 +178,11 @@ make init-server INIT_FROM=verify HUMAN_USER=portfolio_admin HUMAN_SUDO=admin \
 
 This verifies the full pipeline without provisioning. Docker verification creates/removes a smoke container and may populate the image cache. `make connect-user HUMAN_USER=portfolio_admin` opens an interactive human session after verification.
 
-After an error, **stop and diagnose before continuing**. `INIT_FROM` also accepts `swap`, `docker`, `hardening`, `human`, `ssh` or `operations`; earlier stages must pass fresh verification. Choosing a later stage is an explicit decision after diagnosis, not automatic recovery. See [interrupted stages](docs/operator-guide.md#interrupted-stages-and-safe-repetition).
+After an error, **stop and diagnose before continuing**. `INIT_FROM` also accepts `swap`, `docker`, `hardening`, `human`, `ssh`, `operations` or `deployment-prerequisites`; earlier stages must pass fresh verification. Choosing a later stage is an explicit decision after diagnosis, not automatic recovery. See [interrupted stages](docs/operator-guide.md#interrupted-stages-and-safe-repetition).
 
-### Seven initialization stages
+### Eight initialization stages
 
-The CLI numbers the following stages **1/7–7/7**. The older Stage 1–5 names in the detailed guide group related capabilities; they are not the seven-step CLI counter.
+The CLI numbers the following stages **1/8–8/8**. The older Stage 1–5 names in the detailed guide group related capabilities; they are not the eight-step CLI counter.
 
 | Step | `INIT_FROM` | Apply target | Independent verifier |
 | --- | --- | --- | --- |
@@ -190,10 +193,28 @@ The CLI numbers the following stages **1/7–7/7**. The older Stage 1–5 names 
 | 5 | `human` | `make add-user` | `make verify-user` |
 | 6 | `ssh` | `make secure-ssh` | `make verify-ssh-security` |
 | 7 | `operations` | `make setup-operations` | `make verify-operations` |
+| 8 | `deployment-prerequisites` | `make setup-deployment-prerequisites` | `make verify-deployment-prerequisites` |
 
-Without `INIT_FROM`, the CLI prompts with no default. `INIT_FROM=verify` checks all seven stages. Other values authorize application from the selected stage onward; earlier stages must verify successfully. Review the [deployment flow and port 22 → 2222 procedure](docs/operator-guide.md#deployment-sequence-and-ssh-port-22--2222).
+Without `INIT_FROM`, the CLI prompts with no default. `INIT_FROM=verify` checks all eight stages. Other values authorize application from the selected stage onward; earlier stages must verify successfully. Review the [deployment flow and port 22 → 2222 procedure](docs/operator-guide.md#deployment-sequence-and-ssh-port-22--2222).
 
 The plan is displayed before execution; its single default-deny approval is requested when a mutation needs authorization, after applicable read-only preflight. An already converged or verification-only run may need no mutation approval. Approval is limited to the listed actions and inputs for this invocation and includes recovery attestation for final SSH policy. Native authentication and host-trust prompts remain separate. Individual mutating commands outside this plan require their own confirmations.
+
+### Deployment Prerequisites — Stage 08
+
+The final stage installs only **GitHub CLI 2.102.0** at `/usr/bin/gh` (`root:root`, `0755`) on Ubuntu 24.04 AMD64. The full pipeline now requires that host OS; preparing an absent executable requires a Linux AMD64 controller. Existing individual stages retain their platform contracts.
+
+```bash
+make prepare-deployment-prerequisites  # LOCAL-only download/validation; no inventory/VPS access
+# The following are LIVE: run only after separate owner authorization:
+make setup-deployment-prerequisites
+make verify-deployment-prerequisites
+```
+
+The official [v2.102.0 release](https://github.com/cli/cli/releases/tag/v2.102.0) is pinned by archive and executable SHA256. Preparation verifies the archive before reading its sole ELF AMD64 executable, then checks the binary and `--version`. Private temporary artifacts have no persistent cache; installation repeats preparation after consent. The VPS downloads nothing from GitHub. Independent read-only verification streams its inspector over SSH stdin without remote payload/cache files.
+
+`INIT_FROM=deployment-prerequisites` first verifies all seven predecessors; any failure stops. `bootstrap` includes Stage 08; `verify` checks all eight without installing `gh`. The preliminary plan names `gh` explicitly, with default-deny mutation consent. An exact matching file skips downloads and server changes. Conflicts or incomplete installation block repetition; see [Stage 08 diagnosis](docs/operator-guide.md#deployment-prerequisites-stage-08).
+
+Infrastructure prepares the OS and tool. Deployment Manager, GitOps, trusted releases, Caddy and applications remain separate; no credentials or `gh auth login` are configured.
 
 ### SWAP between Bootstrap and Docker
 
@@ -233,6 +254,8 @@ See the operator guide for [keys and interactive SSH](docs/operator-guide.md#loc
 | `make add-user` / `make verify-user` | Register human access / prove the selected key and sudo policy |
 | `make secure-ssh` / `make verify-ssh-security` | Apply final authentication policy / verify policy and independent access |
 | `make inspect-operations` | Read-only system maintenance readiness report |
+| `make prepare-deployment-prerequisites` | LOCAL-only: validate the pinned official binary and remove temporary artifacts |
+| `make setup-deployment-prerequisites` / `make verify-deployment-prerequisites` | LIVE: install only absent `gh` / independently verify it |
 | `make setup-operations` / `make verify-operations` | Configure security updates, logs and timers / verify policy and services |
 | `make preview-apt-policy` / `make apply-apt-policy` | LIVE check-diff / confirmed exact missing-line APT migration, with wider drift refused |
 | `make reboot-host` | Confirm reboot; then verify access, Docker and Stage 3 hardening |
@@ -270,7 +293,7 @@ These are operator-confirmed completed runs supplied for this documentation upda
 | Environment | Confirmed result |
 | --- | --- |
 | Separate Ubuntu VM through GNOME Boxes | Full E2E from scratch: dependency preparation, infrastructure initialization, user management, SSH and SWAP |
-| Real production VPS | All seven `init-server` stages completed; SSH on port 2222; repeat verification and verification after reboot succeeded |
+| Real production VPS | Historical seven stages before Stage 08 completed; `gh` has not been LIVE-validated; SSH on port 2222; repeat verification and verification after reboot succeeded |
 | Production initialization time | **36 minutes 36.97 seconds**, from the operator-reported JSONL run report |
 
 The VM time was not supplied. Production timing includes stage execution and verification, and possible confirmation waits; see the [stage durations](docs/validation.md#production-stage-durations). This does not claim production user-deletion tests, production SWAP resizing, `changed=0` on production or acceptance of every supported release. Offline checks and Docker's disposable runtime smoke tests have distinct evidence and effects.

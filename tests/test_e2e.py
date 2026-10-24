@@ -887,6 +887,17 @@ class StandTests(unittest.TestCase):
                 self.stand.reset()
         self.assertFalse(self.mutations())
 
+    def test_full_stage08_scenario_refuses_jammy_before_any_child(self):
+        with patch.object(self.stand, 'load'), \
+                patch.object(e2e.e2e_images, 'select', return_value={'version': '22.04'}), \
+                patch.object(self.stand, 'cli') as child, \
+                patch.object(self.stand, 'ready') as ready:
+            with self.assertRaisesRegex(ValueError, 'requires Ubuntu 24.04'):
+                self.stand.test()
+        child.assert_not_called()
+        ready.assert_not_called()
+        self.assertFalse(self.mutations())
+
     def test_test_sequence_uses_one_bound_plan(self):
         public = self.stand.root / 'home/.ssh/human/admin_ed25519.pub'
         public.parent.mkdir(parents=True, exist_ok=True)
@@ -1150,10 +1161,10 @@ class StandTests(unittest.TestCase):
 
     def test_repeat_recaps_enforce_zero_provisioning_allow_exact_smoke(self):
         names = [yaml.safe_load((e2e.ROOT / 'playbooks' / n).read_text())[0]['name'] for n in
-                 ('setup-swap.yml', 'docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml', 'verify-docker.yml')]
+                 ('setup-swap.yml', 'docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml', 'setup-deployment-prerequisites.yml', 'verify-docker.yml')]
         for drift in (False, True):
             text = ''.join('PLAY [' + name + '] ***\n' +
-                           'e2e : ok=10 changed=' + str(3 if index == 5 else int(drift)) + ' failed=0\n'
+                           'e2e : ok=10 changed=' + str(3 if index == len(names) - 1 else int(drift)) + ' failed=0\n'
                            for index, name in enumerate(names))
             class Process:
                 stdout = io.BufferedReader(io.BytesIO(text.encode()))

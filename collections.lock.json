@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "collections": {
+    "ansible.posix": {
+      "version": "2.0.0",
+      "source": "git+https://github.com/ansible-collections/ansible.posix.git,4c6898ee6ef4e945f72ef3752203ed767a6e0e7f",
+      "tree_sha256": "e83ec92026b2ece9492c4c8b4a9705c2574d77680d8fe3213c086de287409b6d",
+      "metadata_sha256": "2ea87ecc088c774db2ec9d1e12430057285595bd72cc242e7408e7dac41051eb",
+      "symlinks": {
+        "tests/utils/shippable/aix.sh": "remote.sh",
+        "tests/utils/shippable/aws.sh": "cloud.sh",
+        "tests/utils/shippable/azure.sh": "cloud.sh",
+        "tests/utils/shippable/cs.sh": "cloud.sh",
+        "tests/utils/shippable/freebsd.sh": "remote.sh",
+        "tests/utils/shippable/hcloud.sh": "cloud.sh",
+        "tests/utils/shippable/macos.sh": "remote.sh",
+        "tests/utils/shippable/osx.sh": "remote.sh",
+        "tests/utils/shippable/rhel.sh": "remote.sh",
+        "tests/utils/shippable/tower.sh": "cloud.sh"
+      }
+    }
+  }
+}

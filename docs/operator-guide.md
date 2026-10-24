@@ -18,6 +18,8 @@ installation reconciles the pinned requirements, and existing collections and
 compatible actionlint are reused. Setup needs network access to dependency
 sources; it never contacts a VPS.
 
+The ansible.posix 2.0.0 collection now comes from its immutable official Git commit, not the Galaxy download service. Native `ansible-galaxy ... --offline --no-deps` still fetches that Git commit on a cold install, but cannot query Galaxy. Git is required on the controller. `collections.lock.json` pins the SHA256 tree of all 218 published files, collection metadata and the exact internal test-runner links; setup verifies installed/cache contents before use. An existing exact Galaxy installation is compatible. Altered or incomplete contents stop without automatic cleanup; inspect the local dependency tree before retrying. CI caches only the selected collection and uv download data with dependency-bound keys, never treats a cache hit as verification, and never skips tests. Fresh runners still need GitHub/Python registry availability.
+
 Collection versions are pinned in `collections.yml` and installed explicitly by
 setup/deps. This filename avoids ansible-lint's automatic requirements discovery;
 `make check` keeps `--offline` and still reports missing collections. Make places
@@ -65,14 +67,14 @@ make init-server INIT_FROM=bootstrap HUMAN_USER=operator HUMAN_SUDO=admin \
 ```
 
 This is **LIVE / MUTATING**: bootstrap → SWAP → Docker → SSH/UFW hardening → human access
-→ final SSH security → server operations covered by the invocation plan, with mandatory
+→ final SSH security → server operations → deployment prerequisites covered by the invocation plan, with mandatory
 verification between stages. One preliminary plan and default-deny confirmation
 cover the listed changes for this invocation, including the tested provider-console
 recovery attestation. Native password/passphrase, sudo and host-trust prompts remain
 separate. No application deployment, reboot or automatic recovery.
 
 `INIT_FROM` chooses the first stage authorized for application: `bootstrap`, `swap`,
-`docker`, `hardening`, `human`, `ssh`, `operations`; omit it for interactive selection
+`docker`, `hardening`, `human`, `ssh`, `operations`, `deployment-prerequisites`; omit it for interactive selection
 with no default. Earlier stages are skipped only after successful server verification.
 Remaining stages run existing idempotent wrappers and explicit verification; completed
 hardening, final SSH policy, operations and managed-key registration can skip
@@ -104,7 +106,7 @@ live access, repeat-run idempotency or provider recovery.
 
 ### Deployment sequence and SSH port 22 → 2222
 
-The seven CLI stages include SWAP and split human access from final SSH policy. Historical Stage 3/4/5 names below refer to capability groups, not CLI step numbers. Each arrow in this flow requires a successful independent verifier. Earlier stages selected by `INIT_FROM` run verification only; a failure anywhere stops dispatch. A successful wrapper postflight can satisfy its verifier without a duplicate call.
+The eight CLI stages include SWAP and split human access from final SSH policy. Historical Stage 3/4/5 names below refer to capability groups, not CLI step numbers. Each arrow in this flow requires a successful independent verifier. Earlier stages selected by `INIT_FROM` run verification only; a failure anywhere stops dispatch. A successful wrapper postflight can satisfy its verifier without a duplicate call.
 
 ```mermaid
 flowchart TD
@@ -115,8 +117,9 @@ flowchart TD
     H --> U["5. add-user → verify-user"]
     U --> SSH["6. secure-ssh → verify-ssh-security"]
     SSH --> O["7. setup-operations → verify-operations"]
-    O --> End["STOP · applications separate"]
-    B & S & D & H & U & SSH & O -.-> Failed["Verification failed"]
+    O --> P["8. setup-deployment-prerequisites → verify-deployment-prerequisites"]
+    P --> End["STOP · applications separate"]
+    B & S & D & H & U & SSH & O & P -.-> Failed["Verification failed"]
     Failed --> Stop["STOP · diagnose through recovery"]
 ```
 
@@ -134,7 +137,7 @@ For a fresh server initially reached on 22, use this deliberate transition:
 
 2. Run the initialization command above with `INIT_FROM=bootstrap` and the independent human admin key. Hardening first validates the candidate, manages SSH/UFW and proves access on both ports before later stages proceed. Cross-port verifiers use the existing inventory endpoint's trusted identity via `HostKeyAlias`; this does not save trust for a new inventory endpoint. On any failure, STOP and inspect through the retained route/console.
 3. After the whole run succeeds, change only `ansible_port` to `2222` in the local inventory; retain both port lists. Run `make connect-controller`. If trust for 2222 is missing, this interactive command can prove the same host identity through a signed host-only handshake, then request separate default-deny consent to record it. It never changes the listener or inventory. Check the selected account and `sudo -n id -u` in the session, then exit. Missing/conflicting trust or a failed handshake blocks access; never disable strict checking. See [cross-port trust](#switch-to-another-ssh-port-with-existing-server-trust).
-4. Run the same initialization command with `INIT_FROM=verify` and the same human inputs. With inventory port 2222 this freshly verifies all seven stages, including managed/human access on the selected routes. Keep the retained session and console until successful.
+4. Run the same initialization command with `INIT_FROM=verify` and the same human inputs. With inventory port 2222 this freshly verifies all eight stages, including managed/human access on the selected routes. Keep the retained session and console until successful.
 5. A reboot is a separately authorized operation: `make reboot-host` confirms before reboot and checks access, Docker and Stage 3 hardening afterward. Then repeat `INIT_FROM=verify` with the human inputs to cover SWAP, human access, final policy and operations as well. Stop after any error; never blindly repeat reboot.
 
 If port 22 becomes unreachable from the operator's network after switching to the independently proven port 2222, use this local inventory configuration before repeating verification:
@@ -1579,7 +1582,7 @@ or sudo were revoked requires manual recovery inspection, without blind retries.
 ## Local Ubuntu VM E2E
 
 The optional interactive KVM/libvirt fixture tests the existing `make init-server`
-on a disposable Ubuntu Server 24.04 (default) or 22.04 amd64 guest. It uses `qemu:///system`, virt-install,
+on a disposable Ubuntu Server 24.04 amd64 guest. Lifecycle and standalone scenarios retain Ubuntu 22.04 support; the full eight-stage scenario refuses 22.04 before changes. It uses `qemu:///system`, virt-install,
 cloud-init and a dedicated NAT; virt-manager can open its serial console.
 Defaults are 2 vCPU, 4 GiB RAM and 25 GiB qcow2, configurable for new fixtures.
 Production inventory, keys and host trust are excluded. Real VM commands are
@@ -1690,3 +1693,99 @@ Prepare also includes explicitly approved completion of an empty dedicated disk
 directory left at 0750 by an earlier setgid bug, verifying ownership/group and
 unchanged state before sudo chmod 2750. No extra shell command is needed;
 other directory drift or existing data remains blocking.
+
+## Deployment Prerequisites (Stage 08)
+
+Stage 08 is the final `init-server` dependency boundary, after successful Bootstrap,
+SWAP, Docker, hardening, human access, final SSH policy and operations verification.
+It manages only GitHub CLI. Infrastructure does not install Deployment Manager,
+configure GitOps/release trust or credentials, run Caddy, or deploy applications.
+No `gh auth login`, APT upgrades, service changes, reboot or previous-marker cleanup
+belongs to this stage.
+
+The fixed contract is Ubuntu **24.04 AMD64**, `/usr/bin/gh`, regular file with one
+hard link, `root:root`, mode `0755`, no extended attributes, and safe root-owned
+ancestry without symlinks, access ACLs or group/world write permissions.
+The version is **2.102.0**; neither inventory nor CLI can override it.
+
+- [Official release archive](https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz): `gh_2.102.0_linux_amd64.tar.gz`.
+- Archive SHA256: `bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386`.
+- Executable SHA256: `7469124f706944133d6a169691dd1c6c3511b12e85878d255e044e2948df4c9b`.
+
+During implementation, the official downloaded archive, the release API asset digest
+and the official checksums asset agreed; the extracted executable matched the pinned
+binary digest and its local `--version` check passed. This is origin/digest evidence,
+not evidence of a VPS installation or a separate provenance-attestation audit.
+
+```sh
+make prepare-deployment-prerequisites  # LOCAL-only; no inventory or VPS access
+```
+
+Preparation requires a Linux AMD64 controller to execute the verified binary's
+`--version`. It downloads only the official URL, permitting HTTPS asset redirects
+only to `release-assets.githubusercontent.com`, with no environment proxy routing.
+The archive is bounded to 64 MiB and checked before parsing. Only the exact regular,
+non-sparse `gh_2.102.0_linux_amd64/bin/gh` member (42,086,560 bytes) is read, without
+extracting archive paths. ELF64 AMD64, binary digest and version are verified.
+Files are exclusive in a private temporary directory and removed on completion or
+handled failure. There is deliberately no persistent artifact cache to adopt or
+repair; the local command validates availability, and installation repeats the same
+preparation after consent. No binary enters Git.
+
+The following commands are **LIVE** and require separate owner authorization before
+use against a VPS. They reuse the selected inventory, managed identity, strict
+existing host trust and `sudo -n`; no initial-password access or new sudo rights.
+
+```sh
+make setup-deployment-prerequisites    # MUTATING, default-deny TTY plan if absent
+make verify-deployment-prerequisites   # read-only, no download or installation
+
+make init-server INIT_FROM=deployment-prerequisites HUMAN_USER=operator HUMAN_SUDO=admin \
+  HUMAN_KEY="$HOME/.ssh/portfolio-infra/operator_ed25519" \
+  HUMAN_PUBLIC_KEY="$HOME/.ssh/portfolio-infra/operator_ed25519.pub"
+```
+
+The standalone setup checks managed access, OS and the destination contract; it does
+not orchestrate earlier stages. The `init-server` route verifies all seven earlier
+stages first and stops on any failure. `INIT_FROM=bootstrap` includes all eight;
+`INIT_FROM=verify` independently verifies all eight without installing `gh` (the
+existing Docker smoke test can still change the image cache). All previous frontiers
+retain their order and now include the final stage. The preliminary plan explicitly
+lists the possible `gh` installation; default-deny consent precedes preparation and
+all remote writes. The controller lock covers preflight through postflight; input
+snapshots are checked again after preparation. LIVE Stage 08 commands are refused
+when `CI` is nonempty. Check/CI dependencies remain strictly offline.
+
+An exact installed file produces a no-op without download or remote file writes,
+followed by an independent verification. Absence alone permits planned installation;
+a conflicting file, link, unsafe owner/mode/ancestry, unsupported OS or pending state
+stops. The role exclusively creates `/usr/bin/.portfolio-gh-2.102.0.upload` (`0700`)
+and uses Ansible copy for the verified public binary. A narrow remote module rechecks
+its digest/metadata, exclusively writes and fsyncs
+`/usr/bin/.portfolio-gh-2.102.0.pending`, then publishes with a no-replace hard-link
+operation. Only validated complete bytes become `/usr/bin/gh`; the temporary extra
+link is removed before final verification. The protected staging directory remains
+until validation succeeds. A directory flock serializes publication by this installer;
+other controllers and unrelated root writers still require manual serialization.
+The independent controller postflight streams the same read-only contract inspector
+through SSH stdin (`-I -B`), without remote payload/cache files or executing `gh`.
+
+On failure or interruption, **STOP**: remote completion may be uncertain. Do not
+retry setup, replace a file or clear markers automatically. After confirming remote
+work has ended, use retained administrator access/provider console to inspect the
+exact target, upload directory and pending inode: type, ownership, permissions,
+ancestry, link count, sizes, SHA256 and any extended attributes. A failure after
+publication can leave two links or an upload directory despite a complete target;
+normal verification intentionally refuses this state. Preserve evidence and diagnose
+which step completed. Any explicit cleanup is a separate operator recovery decision,
+limited to proven artifacts; unknown `/usr/bin/gh` is never adopted, removed or
+replaced by this workflow. Then independently verify before selecting a new frontier.
+There is no whole-install transaction or protection against unrelated root edits,
+and a controller crash may leave private local temporary files.
+
+The full pipeline and full VM scenario now require Ubuntu 24.04 AMD64. Older
+standalone stages and VM lifecycle/standalone scenarios retain their prior OS
+contracts; existing 22.04 fixtures are never migrated or replaced automatically.
+Offline synthetic tests cover the new boundary and failures. A real disposable VM
+installation, repeat `changed=0`, interrupted-install recovery and production
+acceptance remain separately authorized operator checks.
