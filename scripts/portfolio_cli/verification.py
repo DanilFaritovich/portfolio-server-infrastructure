@@ -3,6 +3,8 @@
 import subprocess
 
 from .ansible import run_playbook
+from .common import require
+from .inspection import operations_probe
 from .keys import check_key, public_key_file
 
 
@@ -36,3 +38,11 @@ def verify_human(inventory, alias, host, port, managed, inputs, human, key):
                                 'ansible_ssh_args': managed['ansible_ssh_args']
                                 + f' -o HostKeyAlias={identity}'}
         run_playbook(inventory, alias, connection | human | {'portfolio_automation_user': managed['ansible_user']}, 'verify-user.yml')
+
+
+def deployment_probe(host, port, interpreter, key, user, verify=False):
+    result = operations_probe(host, port, interpreter, key, 'portfolio_deployment_prerequisites.py',
+                              {'verify': verify}, user)
+    require(type(result.get('present')) is bool, 'Invalid deployment prerequisites response; STOP.')
+    require(not verify or result['present'], 'Pinned gh verification failed; STOP.')
+    return result['present']

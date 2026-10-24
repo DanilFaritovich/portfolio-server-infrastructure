@@ -16,7 +16,7 @@ the same commands, arguments, output formats and exit codes.
 | Module | Responsibility |
 | --- | --- |
 | `cli.py` | Argument parsing, locked server command dispatch, umask and sanitized failure/interruption errors. |
-| `initialization.py` | Seven-stage initialization (including SWAP), explicit mutation frontier, independent verification boundaries and private status/timing JSONL under the whole-run CLI lock. |
+| `initialization.py` | Eight-stage initialization (including SWAP and deployment prerequisites), explicit mutation frontier, independent verification boundaries and private status/timing JSONL under the whole-run CLI lock. |
 | `common.py` | Repository root, default automation key path, SSH policy constants and validation guards. |
 | `plans.py` | Default-deny plans, snapshots of inputs/implementation, bounded nested consent and anonymous E2E child grants. |
 | `inventory.py` | Exclusive inventory creation, static inventory validation, access selection and hardening port inputs. |
@@ -32,6 +32,8 @@ the same commands, arguments, output formats and exit codes.
 | `human_access.py` | Human policy inputs, confirmed public-key registration, account creation/additive access and final SSH security orchestration. |
 | `user_management.py` | User queries and mutations, including fresh independent recovery access proof and confirmation. |
 | `operations.py` | Operations inspection/setup/verification and separately confirmed APT policy preview/application. |
+| `deployment_artifact.py` | Ephemeral controller preparation of fixed official gh archive/executable, hashes, ELF and version; no VPS access. |
+| `deployment_prerequisites.py` | Confirmed Stage 08 orchestration through managed access and independent streamed file verification. |
 | `compat.py` | Isolated flat helper namespaces for legacy file-based imports of `access.py`. |
 
 Dependencies are explicit relative imports and form an acyclic graph. `common`
@@ -40,7 +42,7 @@ has no package dependencies. `plans` depends on `common`. `keys`, `ansible` and
 `keys` and `plans`; `host_trust` uses `inventory`, `keys` and `clipboard`.
 `local_keys` uses `keys`, `clipboard` and `plans`;
 `ssh` uses `inventory`, `keys`, `local_keys` and `host_trust`. `verification`
-uses `ansible` and `keys`.
+uses `ansible`, `keys`, `common` and the shared `inspection` stream transport.
 
 The stage modules compose these lower-level services. `human_access` also uses
 `ssh` authentication probes and shared `verification`; `user_management` uses
@@ -60,7 +62,8 @@ local setup -> password bootstrap -> managed access verification
 -> firewall/SSH hardening -> hardening verification
 -> human access -> human verification
 -> final SSH policy -> SSH security verification
--> separately confirmed server operations -> operations verification -> STOP
+-> separately confirmed server operations -> operations verification
+-> deployment prerequisites (pinned gh) -> independent file verification -> STOP
 ```
 
 `init-server` is the whole-pipeline exception: `initialization.py` calls existing
@@ -414,3 +417,39 @@ The `swap` frontier is between Bootstrap and Docker. E2E profiles pin three
 exact inventories and exercise creation, resize, disable, convergence and reboot
 through the existing initialization and targeted SWAP/reboot wrappers without
 changing the base fixture.
+
+## Deployment prerequisites boundary
+
+Stage 08 is last in initialization and its fixed log schema. The existing plans,
+controller lock, input snapshots, dispatch and verifier-result reuse cover it.
+All predecessors must verify before initialization reaches this stage; standalone
+setup checks only its managed access/OS/file preflight. `verification.deployment_probe`
+uses `inspection.operations_probe` and the read-only stream entry point in
+`library/portfolio_deployment_prerequisites.py`, without remote files/cache writes.
+
+`deployment_artifact.prepared_gh` prepares only official gh 2.102.0 Linux AMD64 in
+exclusive temporary files: bounded HTTPS download with a restricted GitHub CDN
+redirect, archive SHA256 before member reads, exact regular member, executable hash,
+ELF architecture and local version check. The cloud-image downloader's no-redirect
+contract is unsuitable for GitHub assets and remains unchanged. No cache, credentials,
+remote downloads or generic package-manager abstraction is introduced.
+
+The minimal `deployment_prerequisites` role stages the verified public binary via
+Ansible copy in an exclusively created root-only directory under `/usr/bin`.
+The narrow module fixes all destination paths and hashes, validates Ubuntu 24.04
+AMD64 plus root-owned safe ancestry, file type, ownership, permissions, link count,
+size, attributes and bytes, and refuses unknown or pending state. It exclusively
+writes/fsyncs a pending inode and publishes complete bytes with no-replace `link`,
+then removes the extra link and its proven temporary upload after validation.
+A directory flock serializes publication; other controllers/root edits remain
+manually serialized. Interrupted upload/publication retains blocking evidence;
+there is no replacement, automatic rollback, resume or marker repair. A matching
+file needs no artifact preparation or remote writes and still gets an independent
+postflight. Stage 08 refuses execution in CI; offline checks use synthetic paths.
+
+The full eight-stage pipeline and full E2E scenario require Ubuntu 24.04 AMD64;
+local preparation of an absent executable requires Linux AMD64. Existing individual
+stages and VM lifecycle/standalone scenarios retain their previous OS contracts.
+The full scenario refuses 22.04 before changes without migrating existing fixtures.
+Infrastructure ends after this prerequisite; Deployment Manager and application
+release/authentication/container/proxy workflows remain outside this repository.

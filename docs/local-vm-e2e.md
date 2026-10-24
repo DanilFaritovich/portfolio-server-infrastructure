@@ -334,7 +334,7 @@ The scenario performs:
 - An operator-selected `INIT_FROM` frontier via `E2E_FROM` or the native prompt:
   fresh installation uses `bootstrap`; continuation uses an explicitly diagnosed
   frontier. Supported values are `bootstrap`, `swap`, `docker`, `hardening`, `human`,
-  `ssh`, `operations` and `verify`; there is no default. Native earlier-stage
+  `ssh`, `operations`, `deployment-prerequisites` and `verify`; there is no default. Native earlier-stage
   verification remains mandatory.
 - `init-server` verification of all stages; separate SSH probes check fixture
   UUID, managed identity, sudo, Docker active/enabled/runtime, UFW active,
@@ -525,3 +525,5 @@ including a read-only seed ISO after shutdown. These still block status/deletion
 the new XML policy applies only to new fixtures and does not repair existing
 file ownership or resume partial preparation.
 No secret cloud-init files or VM exports should be attached to public bug reports.
+
+The full `e2e-test` now includes Stage 08 (`gh 2.102.0`) and requires Ubuntu 24.04 AMD64; it refuses 22.04 before changes. Registry, lifecycle and standalone scenarios retain 22.04 support without replacing fixtures. The plan explicitly includes `gh` installation, and repetition requires exact no-op evidence. Synthetic tests cover this extension; a real eight-stage VM run remains a separately authorized operator check.

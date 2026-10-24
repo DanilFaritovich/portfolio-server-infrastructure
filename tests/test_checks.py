@@ -113,7 +113,7 @@ fi
         self.assertIn('PASS (7 tests)', lines[4])
         self.assertEqual(lines[5:], ['', 'make check: PASSED'])
         commands = calls.read_text().splitlines()
-        self.assertEqual(len(commands), 19)
+        self.assertEqual(len(commands), 20)
         self.assertTrue(all(command.startswith(('yamllint ', 'ansible-lint --offline ',
                                                 'ansible-playbook --syntax-check ',
                                                 'actionlint ', 'python -m unittest '))

@@ -10,6 +10,7 @@ import sys
 from .common import ROOT, require
 
 PLAN_ACTIONS = {
+    'setup-deployment-prerequisites': 'Prepare official GitHub CLI 2.102.0 Linux AMD64 locally with pinned archive and binary SHA256; install only absent /usr/bin/gh as root:root 0755 on Ubuntu 24.04 (remote sudo). Refuse conflicts/pending state; verify independently. No authentication, application deployment or service changes.',
     'setup-swap': 'Manage only owned /swapfile using inventory swap_size_mb (remote sudo): allocate/activate, stage a safe resize, or disable without deletion; maintain fstab and verify independently. Conflicts or insufficient RAM/disk stop; retain recovery access.',
     'generate-user-key': 'Generate the selected missing human Ed25519 key pair locally without overwrite (directory 0700, private 0600); native passphrase input. Load only the new identity into the existing SSH agent when selected; no agent is started.',
     'bootstrap-user': 'Create/reuse the dedicated local automation key; create the managed account, authorized key and unrestricted NOPASSWD sudo (remote root; native login/sudo authentication).',
@@ -27,6 +28,7 @@ PLAN_ACTIONS = {
 PLAN_SCOPE = ContextVar('portfolio_plan_scope', default=None)
 E2E_EXECUTION = ContextVar('portfolio_e2e_execution', default=None)
 PLAN_NOOP_MESSAGES = {
+    'setup-deployment-prerequisites': 'Pinned gh already matches; no changes required.',
     'harden': 'Hardening already matches; no changes required.',
     'secure-ssh': 'Final SSH policy already matches; no changes required.',
     'setup-operations': 'Managed configuration already matches; no changes required.',
