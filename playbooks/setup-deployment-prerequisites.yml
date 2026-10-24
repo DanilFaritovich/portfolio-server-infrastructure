@@ -1,0 +1,17 @@
+---
+- name: Install pinned deployment prerequisites
+  hosts: bootstrap
+  gather_facts: false
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Require managed key-only access and explicit installation consent
+      ansible.builtin.assert:
+        that:
+          - ansible_user != 'root'
+          - ansible_connection == 'ssh'
+          - ansible_private_key_file is defined
+          - ansible_host_key_checking | bool
+          - deployment_prerequisites_confirmed | default(false) | bool
+        quiet: true
+  roles:
+    - role: deployment_prerequisites

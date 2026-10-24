@@ -14,6 +14,7 @@ import tempfile
 import time
 
 from .common import require
+from .deployment_prerequisites import DEPLOYMENT_MODES, deployment_prerequisites
 from .human_access import human_access, human_inputs
 from .inventory import managed_access, load_host, hardening_inputs, swap_input
 from .keys import check_key, human_key_path
@@ -30,6 +31,7 @@ INIT_STAGES = (
     ('human', 'add-user', 'verify-user'),
     ('ssh', 'secure-ssh', 'verify-ssh-security'),
     ('operations', 'setup-operations', 'verify-operations'),
+    ('deployment-prerequisites', 'setup-deployment-prerequisites', 'verify-deployment-prerequisites'),
 )
 
 # Exact fixed controller diagnostics only. Validation errors can also originate
@@ -91,6 +93,8 @@ def init_input(prompt):
 def init_stage(mode, inventory, key):
     """Call directly: the CLI owns the whole-run lock."""
     validate_current_plan()
+    if mode in DEPLOYMENT_MODES:
+        return deployment_prerequisites(mode, inventory, key)
     if mode in ('add-user', 'verify-user', 'secure-ssh', 'verify-ssh-security'):
         return human_access(mode, inventory, key)
     elif mode in ('setup-operations', 'verify-operations'):
@@ -117,7 +121,7 @@ def init_server(inventory, key=None):
         print('Choose the first stage authorized for mutation: ' + ', '.join(choices) +
               '. Earlier stages will only be verified. verify checks everything.')
         frontier = init_input('INIT_FROM (no default): ').strip()
-    require(frontier in choices, 'Set INIT_FROM to bootstrap, swap, docker, hardening, human, ssh, operations or verify.')
+    require(frontier in choices, 'Set INIT_FROM to bootstrap, swap, docker, hardening, human, ssh, operations, deployment-prerequisites or verify.')
     managed_user, _ = managed_access(inventory, key)
     human = human_inputs(managed_user=managed_user)
     require(human['human_access_user_sudo'] == 'admin', 'init-server requires HUMAN_SUDO=admin and an independent human key.')

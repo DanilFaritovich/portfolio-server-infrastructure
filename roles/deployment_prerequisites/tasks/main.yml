@@ -1,0 +1,43 @@
+---
+- name: Require the confirmed fixed artifact contract
+  ansible.builtin.assert:
+    that:
+      - deployment_prerequisites_confirmed | default(false) | bool
+      - deployment_prerequisites_source is defined
+    quiet: true
+
+- name: Inspect the destination before any managed change
+  portfolio_deployment_prerequisites:
+  become: true
+  register: deployment_prerequisites_before
+
+- name: Install only the missing pinned executable
+  when: not deployment_prerequisites_before.present
+  become: true
+  block:
+    - name: Exclusively prepare protected upload directory
+      portfolio_deployment_prerequisites:
+        prepare: true
+        confirmed: "{{ deployment_prerequisites_confirmed }}"
+
+    - name: Transfer the verified controller executable
+      ansible.builtin.copy:
+        src: "{{ deployment_prerequisites_source }}"
+        dest: /usr/bin/.portfolio-gh-2.102.0.upload/gh
+        owner: root
+        group: root
+        mode: "0755"
+        force: false
+      when: not ansible_check_mode
+
+    - name: Verify staged bytes and publish without replacement
+      portfolio_deployment_prerequisites:
+        source: /usr/bin/.portfolio-gh-2.102.0.upload/gh
+        confirmed: "{{ deployment_prerequisites_confirmed }}"
+      when: not ansible_check_mode
+
+- name: Independently verify the final file contract
+  portfolio_deployment_prerequisites:
+    verify: true
+  become: true
+  when: not ansible_check_mode

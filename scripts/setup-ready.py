@@ -2,7 +2,6 @@
 """Read-only dependency readiness; never inspect real inventory or private keys."""
 
 import importlib.metadata
-import json
 from pathlib import Path
 import sys
 
@@ -15,10 +14,7 @@ try:
             name, version = line.split('==')
             if importlib.metadata.version(name) != version:
                 sys.exit(1)
-    import yaml
-    for collection in yaml.safe_load((root / 'collections.yml').read_text())['collections']:
-        path = root / '.ansible/collections/ansible_collections' / collection['name'].replace('.', '/') / 'MANIFEST.json'
-        if json.loads(path.read_text())['collection_info']['version'] != collection['version']:
-            sys.exit(1)
-except (OSError, ValueError, KeyError, importlib.metadata.PackageNotFoundError, ImportError):
+    from portfolio_cli.collection_integrity import check_collections
+    check_collections(root)
+except (OSError, ValueError, KeyError, TypeError, importlib.metadata.PackageNotFoundError, ImportError):
     sys.exit(1)

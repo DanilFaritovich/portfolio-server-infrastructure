@@ -118,7 +118,7 @@ def convergence_command(argv, env, pass_fds=(), *, swap_only=False):
     """Stream interactive output; retain only numeric recap counts, never a log."""
     smoke = None if swap_only else yaml.safe_load((ROOT / 'playbooks/verify-docker.yml').read_text())[0]['name']
     playbooks = ('setup-swap.yml',) if swap_only else (
-        'setup-swap.yml', 'docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml')
+        'setup-swap.yml', 'docker-host.yml', 'harden.yml', 'secure-ssh.yml', 'setup-operations.yml', 'setup-deployment-prerequisites.yml')
     required = {yaml.safe_load((ROOT / 'playbooks' / name).read_text())[0]['name'] for name in
                 playbooks}
     noops = {message: yaml.safe_load((ROOT / 'playbooks' / (mode + '.yml')).read_text())[0]['name']
@@ -1234,6 +1234,8 @@ class Stand:
 
     def test(self):
         self.load()
+        require(e2e_images.select(self.distro)['version'] == '24.04',
+                'The full eight-stage scenario requires Ubuntu 24.04 AMD64; existing fixtures are not migrated.')
         self.check_inventory(self.inventory)
         self.ready(running=True)
         require(sys.stdin.isatty(), 'E2E test is interactive; no automatic confirmations.')
@@ -1241,15 +1243,15 @@ class Stand:
         env['AGENT_LOAD'] = 'ask'
         frontier = os.environ.get('E2E_FROM', '')
         if not frontier:
-            frontier = input('E2E_FROM (bootstrap/swap/docker/hardening/human/ssh/operations/verify; no default): ').strip()
-        require(frontier in ('bootstrap', 'swap', 'docker', 'hardening', 'human', 'ssh', 'operations', 'verify'), 'Invalid E2E_FROM.')
+            frontier = input('E2E_FROM (bootstrap/swap/docker/hardening/human/ssh/operations/deployment-prerequisites/verify; no default): ').strip()
+        require(frontier in ('bootstrap', 'swap', 'docker', 'hardening', 'human', 'ssh', 'operations', 'deployment-prerequisites', 'verify'), 'Invalid E2E_FROM.')
         print('E2E plan: initialize from ' + frontier + '; verify all stages; repeat convergence from swap '
               'and require provisioning changed=0; reboot this owned guest; verify again and prove a new boot ID. '
               'Then use setup-swap/verify-swap for 512 -> 1024 -> 0 -> 512 MiB, repeating changed=0 in each state. '
               'Reboot once more while disabled and verify file retention: two reboots total. '
               'No reset/delete or host installation. Retain guest console recovery.')
         print('Human key path: ' + env['HUMAN_KEY'] + '; admin account: e2e_admin; sudo: unrestricted NOPASSWD.')
-        modes = ['setup-swap', 'docker-host', 'harden', 'add-user', 'secure-ssh', 'setup-operations', 'reboot-host']
+        modes = ['setup-swap', 'docker-host', 'harden', 'add-user', 'secure-ssh', 'setup-operations', 'setup-deployment-prerequisites', 'reboot-host']
         if frontier == 'bootstrap':
             modes.insert(0, 'bootstrap-user')
         public = Path(env['HUMAN_PUBLIC_KEY'])

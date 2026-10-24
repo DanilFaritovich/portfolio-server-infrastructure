@@ -68,7 +68,7 @@ class InitializationTests(unittest.TestCase):
     def test_full_pipeline_orders_mutations_inspection_and_verifiers(self):
         self.run_init()
         self.assertEqual(self.calls(), ['bootstrap-user', 'setup-swap', 'docker-host', 'inspect-hardening', 'harden',
-                                       'add-user', 'verify-user', 'secure-ssh', 'setup-operations'])
+                                       'add-user', 'verify-user', 'secure-ssh', 'setup-operations', 'setup-deployment-prerequisites'])
         self.assertEqual(self.events()[-1]['status'], 'completed')
         self.assertIn('Applications remain separate', self.output.getvalue())
 
@@ -89,7 +89,7 @@ class InitializationTests(unittest.TestCase):
             else:
                 self.assertEqual([row['status'] for row in rows], ['applying', 'completed'])
                 self.assertEqual([row['elapsed_seconds'] for row in rows], [0, 3])
-        self.assertEqual(events[-1]['elapsed_seconds'], 23)
+        self.assertEqual(events[-1]['elapsed_seconds'], 26)
 
     def test_verification_failure_records_phase_and_elapsed_time_without_error_text(self):
         seconds = [0]
@@ -123,7 +123,7 @@ class InitializationTests(unittest.TestCase):
             rows = [row for row in events if row['stage'] == stage]
             self.assertEqual([row['status'] for row in rows], ['verifying', 'verified_skip'])
             self.assertEqual([row['elapsed_seconds'] for row in rows], [0, 2])
-        self.assertEqual(events[-1]['elapsed_seconds'], 14)
+        self.assertEqual(events[-1]['elapsed_seconds'], 16)
 
     def test_safe_cause_reaches_cli_terminal_but_never_log(self):
         reason = 'Managed key-only SSH access failed.'
@@ -186,8 +186,8 @@ class InitializationTests(unittest.TestCase):
         self.stage.side_effect = lambda mode, *_: (None if mode in ('secure-ssh', 'setup-operations')
                                                  else self.verified_result(mode))
         self.run_init()
-        self.assertEqual(self.calls()[-4:], ['secure-ssh', 'verify-ssh-security',
-                                            'setup-operations', 'verify-operations'])
+        self.assertEqual(self.calls()[-5:], ['secure-ssh', 'verify-ssh-security',
+                                            'setup-operations', 'verify-operations', 'setup-deployment-prerequisites'])
 
     def test_noop_verifier_failure_stops_later_stages(self):
         for failed in ('verify-ssh-security', 'verify-operations'):
@@ -231,7 +231,7 @@ class InitializationTests(unittest.TestCase):
 
     def test_each_failure_or_interruption_stops_all_later_calls(self):
         modes = ['bootstrap-user', 'setup-swap', 'docker-host', 'inspect-hardening', 'harden',
-                 'add-user', 'verify-user', 'secure-ssh', 'setup-operations']
+                 'add-user', 'verify-user', 'secure-ssh', 'setup-operations', 'setup-deployment-prerequisites']
         for failure in (ValueError, KeyboardInterrupt):
             for position, mode in enumerate(modes):
                 with self.subTest(failure=failure, mode=mode):
@@ -302,7 +302,7 @@ class InitializationTests(unittest.TestCase):
         with patch.dict(os.environ, INIT_FROM=''):
             self.answer.side_effect = ['operations', 'yes']
             self.run_init()
-        self.assertEqual(self.calls()[-1:], ['setup-operations'])
+        self.assertEqual(self.calls()[-2:], ['setup-operations', 'setup-deployment-prerequisites'])
         with patch.object(init, 'human_access', side_effect=ValueError('recovery declined')) as human:
             with self.assertRaises(ValueError):
                 with patch.object(init, 'init_stage', self.real_init_stage):

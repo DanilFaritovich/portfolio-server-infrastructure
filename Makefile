@@ -173,6 +173,7 @@ lint-ansible:
 	@ANSIBLE_INVENTORY="$(CURDIR)/inventories/production.example.yml" $(VENV)/bin/ansible-lint --offline playbooks roles
 
 syntax-check:
+	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/setup-deployment-prerequisites.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/setup-swap.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/verify-swap.yml
 	@$(VENV)/bin/ansible-playbook --syntax-check -i inventories/production.example.yml playbooks/apt-policy.yml
@@ -198,5 +199,16 @@ test-access:
 # LIVE: managed access preflight, owned swap only, independent postflight.
 .PHONY: setup-swap verify-swap
 setup-swap verify-swap:
+	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"
+
+# LOCAL-only network preparation/validation; ephemeral verified binary, no inventory or VPS access.
+.PHONY: prepare-deployment-prerequisites setup-deployment-prerequisites verify-deployment-prerequisites
+prepare-deployment-prerequisites:
+	@test -x $(VENV)/bin/python || { echo "Run make deps first." >&2; exit 1; }
+	@$(VENV)/bin/python scripts/access.py $@
+
+# LIVE: setup requires default-deny plan consent; verification streams read-only probes.
+setup-deployment-prerequisites verify-deployment-prerequisites:
 	@test -x $(VENV)/bin/python || { echo "Run make setup first." >&2; exit 1; }
 	@$(VENV)/bin/python scripts/access.py $@ --inventory "$$INVENTORY" --key "$$AUTOMATION_KEY"

@@ -171,7 +171,7 @@ def dispatch(args, selected):
     assert json.dumps(plans.plan_snapshot(selected), sort_keys=True) == expected
     stages = {'generate-user-key': ['generate-user-key'],
               'init-server': ['bootstrap-user', 'docker-host', 'harden', 'add-user',
-                              'secure-ssh', 'setup-operations'],
+                              'secure-ssh', 'setup-operations', 'setup-deployment-prerequisites'],
               'reboot-host': ['reboot-host']}
     for stage in stages.get(args.mode, [args.mode]):
         assert plans.planned_action(stage)
@@ -207,7 +207,7 @@ with contextlib.ExitStack() as stack:
 ''')
         probe.chmod(0o700)
         self.modes = ['generate-user-key', 'bootstrap-user', 'docker-host', 'harden',
-                      'add-user', 'secure-ssh', 'setup-operations', 'reboot-host']
+                      'add-user', 'secure-ssh', 'setup-operations', 'setup-deployment-prerequisites', 'reboot-host']
 
     def make_child(self, mode, *, target=None, overrides=None, change=None, user_inputs=None):
         env = self.stand.child_env(user_inputs)
