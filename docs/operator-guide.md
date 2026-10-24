@@ -18,6 +18,8 @@ installation reconciles the pinned requirements, and existing collections and
 compatible actionlint are reused. Setup needs network access to dependency
 sources; it never contacts a VPS.
 
+The ansible.posix 2.0.0 collection now comes from its immutable official Git commit, not the Galaxy download service. Native `ansible-galaxy ... --offline --no-deps` still fetches that Git commit on a cold install, but cannot query Galaxy. Git is required on the controller. `collections.lock.json` pins the SHA256 tree of all 218 published files, collection metadata and the exact internal test-runner links; setup verifies installed/cache contents before use. An existing exact Galaxy installation is compatible. Altered or incomplete contents stop without automatic cleanup; inspect the local dependency tree before retrying. CI caches only the selected collection and uv download data with dependency-bound keys, never treats a cache hit as verification, and never skips tests. Fresh runners still need GitHub/Python registry availability.
+
 Collection versions are pinned in `collections.yml` and installed explicitly by
 setup/deps. This filename avoids ansible-lint's automatic requirements discovery;
 `make check` keeps `--offline` and still reports missing collections. Make places

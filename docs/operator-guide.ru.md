@@ -21,6 +21,8 @@ sources, но никогда не подключается к VPS. В станд
 `ansible_user` выбирает рабочего пользователя, а `ansible_private_key_file` — путь к его ключу. Сохраните структуру
 `bootstrap` с одним хостом; не записывайте пароли или содержимое ключей в inventory.
 
+Коллекция ansible.posix 2.0.0 теперь берётся из неизменяемого официального Git commit, а не из download-сервиса Galaxy. Штатный `ansible-galaxy ... --offline --no-deps` при холодной установке всё ещё загружает этот Git commit, но не обращается к Galaxy. На контроллере нужен Git. `collections.lock.json` закрепляет SHA256 полного набора 218 опубликованных файлов, metadata и точных внутренних ссылок test runner; setup проверяет installed/cache contents до использования. Точная прежняя установка из Galaxy совместима. Изменённое или неполное содержимое останавливает работу без автоматической очистки; до повтора изучите локальные зависимости. CI кеширует только выбранную коллекцию и uv downloads с ключами от dependency inputs, проверяет кеш и не пропускает тесты. Свежему runner по-прежнему нужна доступность GitHub/Python registry.
+
 Версии collections закреплены в `collections.yml`; setup/deps устанавливают их явно.
 Это имя исключает автоматическое обнаружение requirements в ansible-lint;
 `make check` сохраняет `--offline` и сообщает об отсутствующих collections. Make

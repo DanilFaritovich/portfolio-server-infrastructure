@@ -38,6 +38,8 @@ It is intended for operators who can review SSH and sudo permissions and recover
 
 Controller/tool pins are defined in [requirements-dev.txt](requirements-dev.txt), [collections.yml](collections.yml) and [setup scripts](scripts/setup.sh). Server release limits and recorded platform results are listed under [compatibility](#compatibility); CI runs on Ubuntu 24.04.
 
+Ansible collection acquisition uses the immutable official Git commit in `collections.yml`, with full-tree SHA256 validation from `collections.lock.json`. CI caches verified collection contents and uv download data; Galaxy outages do not affect collection installation. Cold setup still requires GitHub/Python registry access.
+
 ## Architecture
 
 The controller is your local computer; the managed host is the Ubuntu server. The CLI owns local keys, trust, confirmations and sequencing. Ansible roles apply server configuration; independent SSH and server inspectors verify it.

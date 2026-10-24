@@ -453,3 +453,24 @@ stages and VM lifecycle/standalone scenarios retain their previous OS contracts.
 The full scenario refuses 22.04 before changes without migrating existing fixtures.
 Infrastructure ends after this prerequisite; Deployment Manager and application
 release/authentication/container/proxy workflows remain outside this repository.
+
+## Collection acquisition and CI cache trust
+
+Local setup still owns dependency installation. `collections.yml` selects the
+same ansible.posix 2.0.0 from its official repository at immutable commit
+`4c6898ee6ef4e945f72ef3752203ed767a6e0e7f`; native Ansible Git installation uses
+`--offline --no-deps` to exclude Galaxy index/download availability, while Git
+itself requires HTTPS access on a cold install. Git is a controller prerequisite.
+The source commit's 218 published files were independently compared with Galaxy
+release file hashes; the installed source build has the same complete content.
+
+`collections.lock.json` anchors the sorted path/SHA256 tree, collection metadata
+and ten exact internal test-runner symlinks. `collection_integrity` verifies this
+lock after installation and during readiness, before checks can use the collection.
+It rejects extra/missing/changed files, unapproved links and unsafe collection file
+metadata without importing cached code or repairing the cache. Native generated
+manifest ordering can differ while file contents and metadata remain identical.
+GitHub Actions caches only uv download data and that exact collection directory,
+with keys bound to OS/architecture and dependency/lock inputs; there are no broad
+restore keys or cached virtualenvs. A cache hit never bypasses integrity validation.
+Fresh setup still needs GitHub/Python registry access; make check remains offline.

@@ -22,7 +22,7 @@ class SetupTests(unittest.TestCase):
         self.bin.mkdir()
         (self.root / 'scripts').mkdir()
         (self.root / 'inventories').mkdir()
-        for name in ('setup.sh', 'install-uv.sh', 'install-actionlint.sh', 'access.py', 'setup-ready.py'):
+        for name in ('setup.sh', 'install-uv.sh', 'install-actionlint.sh', 'access.py', 'setup-ready.py', 'check-collections.py'):
             shutil.copy(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         shutil.copytree(
             ROOT / 'scripts' / 'portfolio_cli',
@@ -30,12 +30,12 @@ class SetupTests(unittest.TestCase):
             ignore=shutil.ignore_patterns('__pycache__', '*.pyc'),
         )
         shutil.copy(ROOT / 'inventories/production.example.yml', self.root / 'inventories/production.example.yml')
-        for name in ('requirements-dev.txt', 'collections.yml'):
+        for name in ('requirements-dev.txt', 'collections.yml', 'collections.lock.json'):
             shutil.copy(ROOT / name, self.root / name)
         self.log = self.root / 'calls'
         self.env = dict(os.environ, PATH=str(self.bin), CALL_LOG=str(self.log),
                         FIXTURE_ROOT=str(self.root), FIXTURE_PYTHON=sys.executable)
-        for name in ('sh', 'make', 'tar', 'gzip', 'mkdir', 'mktemp', 'chmod', 'mv', 'rm', 'head', 'cp', 'cat'):
+        for name in ('sh', 'make', 'git', 'tar', 'gzip', 'mkdir', 'mktemp', 'chmod', 'mv', 'rm', 'head', 'cp', 'cat'):
             (self.bin / name).symlink_to(shutil.which(name))
         for name in ('ssh', 'ssh-keygen', 'ssh-keyscan', 'scp', 'sftp'):
             self.executable(self.bin / name, 'exit 99')
@@ -74,6 +74,7 @@ case "$1 $2" in
 esac'''
         self.env['UV_VERSION'] = self.version
         self.executable(self.root / 'python-stub', '''printf 'python %s\n' "$*" >> "$CALL_LOG"
+if [ "$1" = scripts/check-collections.py ]; then [ "${COLLECTION_INTEGRITY_FAIL:-0}" != 1 ]; exit; fi
 if [ "$1" = -c ]; then [ "${PYTHON_BAD:-0}" != 1 ]; exit; fi
 exec "$FIXTURE_PYTHON" "$@"''')
         self.executable(self.root / 'galaxy-stub', 'printf "galaxy %s\n" "$*" >> "$CALL_LOG"')
@@ -149,6 +150,13 @@ exec "$FIXTURE_PYTHON" "$@"''')
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertIn('run: make deps-ci', workflow)
         self.assertIn('run: make ci', workflow)
+
+    def test_collection_integrity_failure_stops_before_inventory_creation(self):
+        self.env['COLLECTION_INTEGRITY_FAIL'] = '1'
+        result = self.run_setup()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--offline --no-deps', self.calls())
+        self.assertFalse((self.root / 'inventories/production.yml').exists())
 
     def test_ci_environment_does_not_authorize_interactive_modes(self):
         self.env.update(CI='true', GITHUB_ACTIONS='true')

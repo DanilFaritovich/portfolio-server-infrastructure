@@ -3,3 +3,6 @@
 collections:
   - name: ansible.posix
     version: "2.0.0"
+    type: git
+    # Official 2.0.0 commit; avoids Galaxy availability without changing published files.
+    source: git+https://github.com/ansible-collections/ansible.posix.git,4c6898ee6ef4e945f72ef3752203ed767a6e0e7f

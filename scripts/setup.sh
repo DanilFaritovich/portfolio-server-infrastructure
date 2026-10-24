@@ -18,7 +18,7 @@ if [ "$mode" = deps-ci ]; then
     mode=deps
 fi
 
-for tool in sh make cat curl tar gzip sha256sum uname mkdir mktemp chmod mv rm head ssh ssh-keygen ssh-keyscan scp sftp; do
+for tool in sh make git cat curl tar gzip sha256sum uname mkdir mktemp chmod mv rm head ssh ssh-keygen ssh-keyscan scp sftp; do
     command -v "$tool" >/dev/null 2>&1 || fail "missing $tool; install this system prerequisite and retry."
 done
 # Plan before creating tool directories, downloading or synchronizing packages.
@@ -36,12 +36,12 @@ if [ "$ready" = true ] && { [ "$mode" = deps ] || [ -e "$inventory" ]; }; then
     echo 'Local tooling/inventory already prepared; no changes required.'
     exit 0
 fi
-plan_snapshot=$(sha256sum requirements-dev.txt collections.yml scripts/setup.sh scripts/setup-ready.py scripts/install-uv.sh scripts/install-actionlint.sh)
+plan_snapshot=$(sha256sum requirements-dev.txt collections.yml collections.lock.json scripts/check-collections.py scripts/portfolio_cli/collection_integrity.py scripts/setup.sh scripts/setup-ready.py scripts/install-uv.sh scripts/install-actionlint.sh)
 echo 'Plan:'
 if [ "$ready" != true ]; then
     echo '  - Download checksum-verified pinned uv/actionlint if absent into .tools/bin.'
     echo '  - Install managed Python 3.12 if absent in .tools/python; create .venv if absent.'
-    echo '  - Synchronize the following pinned Python tools and Ansible collections from registries:'
+    echo '  - Synchronize the following pinned Python tools from registries and the locked official Ansible collection Git commit:'
     cat requirements-dev.txt collections.yml
     echo '  - Write project-local .cache/uv and .ansible; network access required.'
 fi
@@ -56,7 +56,7 @@ else
     IFS= read -r answer || fail 'plan declined (end of input); no changes requested.'
     case "$answer" in y|Y|yes|YES) ;; *) fail 'plan declined; no changes requested.' ;; esac
 fi
-[ "$plan_snapshot" = "$(sha256sum requirements-dev.txt collections.yml scripts/setup.sh scripts/setup-ready.py scripts/install-uv.sh scripts/install-actionlint.sh)" ] || fail 'plan inputs changed; STOP.'
+[ "$plan_snapshot" = "$(sha256sum requirements-dev.txt collections.yml collections.lock.json scripts/check-collections.py scripts/portfolio_cli/collection_integrity.py scripts/setup.sh scripts/setup-ready.py scripts/install-uv.sh scripts/install-actionlint.sh)" ] || fail 'plan inputs changed; STOP.'
 umask 077
 export ANSIBLE_HOME="$project_dir/.ansible"
 export UV_PYTHON_INSTALL_DIR="$project_dir/.tools/python"
@@ -84,7 +84,8 @@ else
     "$uv" --no-config venv --python "$runtime" .venv
 fi
 "$uv" --no-config pip install --python "$project_dir/.venv/bin/python" -r requirements-dev.txt
-.venv/bin/ansible-galaxy collection install -r collections.yml -p .ansible/collections
+.venv/bin/ansible-galaxy collection install -r collections.yml -p .ansible/collections --offline --no-deps
+.venv/bin/python scripts/check-collections.py
 sh scripts/install-actionlint.sh
 fi
 
